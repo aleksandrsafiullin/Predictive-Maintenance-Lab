@@ -1,0 +1,75 @@
+{
+  "datasets": {
+    "filters": {
+      "dataset_id": "filters",
+      "obtained_at": "2026-09-10T10:38:05Z",
+      "source": {
+        "kind": "kagglehub",
+        "path": "/Users/aks/.cache/kagglehub/datasets/prognosticshse/preventive-to-predicitve-maintenance/versions/8",
+        "url": "https://www.kaggle.com/datasets/prognosticshse/preventive-to-predicitve-maintenance",
+        "version_dir": "8"
+      },
+      "license": "CC BY 4.0",
+      "files": [
+        {
+          "relpath": "Data.mat",
+          "bytes": 748953,
+          "sha256": "bd07571ec8ec58aca1788fb80166f1a25b61b506eba8ec270408b8ab6735ccac"
+        },
+        {
+          "relpath": "Particle size distribution_ISO_12103_1_A2_Fine.mat",
+          "bytes": 1459,
+          "sha256": "60e7b338a33e00bc08edadc20b452db2d67ebb5f5105f755067cfca92df7ec3a"
+        },
+        {
+          "relpath": "Particle size distribution_ISO_12103_1_A3_Medium.mat",
+          "bytes": 1462,
+          "sha256": "284cfa6787ef9e6106b7000d20668b09d20aba0186bc2ca46558907cad35f1a8"
+        },
+        {
+          "relpath": "Particle size distribution_ISO_12103_1_A4_Coarse.mat",
+          "bytes": 1478,
+          "sha256": "4c18ef4b959027330a15f838ffaa9d44a66d4f01c13aa6af7de1d6f575f08a9e"
+        },
+        {
+          "relpath": "Preventive to Predictive Maintenance dataset.pdf",
+          "bytes": 1149367,
+          "sha256": "e74f2a258df8095ebb64c1748f76b901c0b66fb914a1f0f23d48357024bb32f4"
+        },
+        {
+          "relpath": "Test_Data_CSV.csv",
+          "bytes": 3586739,
+          "sha256": "cde50e84bca525c734844fa38bcf9501d7d7e4f23d4c7e3bb0383001f75fc22b"
+        },
+        {
+          "relpath": "Train_Data_CSV.csv",
+          "bytes": 3341435,
+          "sha256": "f9646e89fad0bdbd7df4788275170ab5d4b32f54ff5c12a6feda48a0a7c25771"
+        },
+        {
+          "relpath": "Train_Data_Uncensored.mat",
+          "bytes": 527363,
+          "sha256": "c3e3f0581d95c72613a5ec098a7bab4c3af4f8dc49c4631923842488743b2e4e"
+        }
+      ]
+    },
+    "bearings": {
+      "dataset_id": "bearings",
+      "obtained_at": "2026-09-10T10:48:33Z",
+      "source": {
+        "kind": "huggingface_author_zip_mirror",
+        "author_page": "https://biaowang.tech/xjtu-sy-bearing-datasets/",
+        "url": "https://huggingface.co/datasets/DavidNguyen/XJTU-SY_Bearing_Datasets/resolve/main/XJTU-SY_Bearing_Datasets.zip",
+        "note": "Official Google Drive from biaowang.tech was not used for the completed download; this is XJTU-SY_Bearing_Datasets.zip matching the author package (15 bearings, 9216 CSV fragments)."
+      },
+      "use": "validation of prognostics algorithms; citation requested by author",
+      "files": [
+        {
+          "relpath": "XJTU-SY_Bearing_Datasets.zip",
+          "bytes": 5447931446,
+          "sha256": "3cc815649a315ac7da202980c489f33db44ca2db0317bbe3bcb9dcf415375e10"
+        }
+      ]
+    }
+  }
+}

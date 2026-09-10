@@ -1,0 +1,52 @@
+dataset_id: filters
+display_name: Filters
+source_name: HSE Preventive to Predictive Maintenance
+source_url: https://www.kaggle.com/datasets/prognosticshse/preventive-to-predicitve-maintenance
+kaggle_slug: prognosticshse/preventive-to-predicitve-maintenance
+citation: >-
+  Hagmeyer, S., Mauthe, F., & Zeiler, P. (2021). Creation of Publicly Available
+  Data Sets for Prognostics and Diagnostics Addressing Data Scenarios Relevant
+  to Industrial Applications. International Journal of Prognostics and Health
+  Management, 12(2). DOI: 10.36001/ijphm.2021.v12i2.3087
+license: CC BY 4.0
+
+mode: filters_censored
+pressure_limit_pa: 600.0
+# PDF does not name the Time column unit. CSV dt=0.1; Sampling is documented in Hz.
+# Maintenance-interval lengths scale with 1/dust_feed around 33–179. Seconds would
+# make a "replacement interval" of ~45 s; hours contradict dust-volume scale.
+# Internal time is seconds after Time_original * 60 (minutes → seconds).
+original_time_unit: minutes
+time_to_seconds: 60.0
+pressure_unit: Pa
+dust_feed_unit: mm3/s
+
+split:
+  val_fraction: 0.20
+  seed: 42
+  stratify_events: true
+
+model:
+  architecture: gru
+  history_length: 20
+  hidden_size: 64
+  recurrent_layers: 1
+  dropout: 0.1
+  batch_size: 32
+  optimizer: adamw
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  max_epochs: 30
+  early_stopping_patience: 5
+  grad_clip: 1.0
+  seed: 42
+  num_workers: 0
+
+alerts:
+  confirmation_count: 3
+  reset_factor: 1.2
+  horizon_fraction_of_median_train: 0.10
+
+gap:
+  max_dt_factor: 3.0
+  do_not_window_across_gap: true

@@ -1,0 +1,83 @@
+dataset_id: bearings
+display_name: Bearings
+source_name: XJTU-SY
+source_url: https://biaowang.tech/xjtu-sy-bearing-datasets/
+citation: >-
+  Biao Wang, Yaguo Lei, Naipeng Li, Ningbo Li, “A Hybrid Prognostics Approach
+  for Estimating Remaining Useful Life of Rolling Element Bearings”,
+  IEEE Transactions on Reliability, vol. 69, no. 1, pp. 401-412, 2020.
+
+sampling_rate_hz: 25600
+samples_per_fragment: 32768
+fragment_interval_s: 60
+recording_duration_s: 1.28
+channels: [horizontal, vertical]
+endpoint_definition: last_recorded_sample
+
+regimes:
+  "35Hz12kN":
+    regime_id: "35Hz12kN"
+    rpm: 2100
+    load_kn: 12.0
+    freq_hz: 35.0
+  "37.5Hz11kN":
+    regime_id: "37.5Hz11kN"
+    rpm: 2250
+    load_kn: 11.0
+    freq_hz: 37.5
+  "40Hz10kN":
+    regime_id: "40Hz10kN"
+    rpm: 2400
+    load_kn: 10.0
+    freq_hz: 40.0
+
+features:
+  time_domain: [rms, std, abs_peak, peak_to_peak, crest_factor, kurtosis]
+  spectral_band_edges_hz: [0.0, 3200.0, 6400.0, 9600.0, 12800.0]
+  log1p_features:
+    - horizontal_rms
+    - horizontal_std
+    - horizontal_abs_peak
+    - horizontal_peak_to_peak
+    - vertical_rms
+    - vertical_std
+    - vertical_abs_peak
+    - vertical_peak_to_peak
+    - horizontal_band_0
+    - horizontal_band_1
+    - horizontal_band_2
+    - horizontal_band_3
+    - vertical_band_0
+    - vertical_band_1
+    - vertical_band_2
+    - vertical_band_3
+
+split:
+  train_instances: [1, 2, 3]
+  val_instances: [4]
+  test_instances: [5]
+
+model:
+  architecture: gru
+  history_length: 20
+  hidden_size: 64
+  recurrent_layers: 1
+  dropout: 0.1
+  batch_size: 32
+  optimizer: adamw
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  max_epochs: 30
+  early_stopping_patience: 5
+  grad_clip: 1.0
+  seed: 42
+  num_workers: 0
+
+alerts:
+  confirmation_count: 3
+  reset_factor: 1.2
+  horizon_fraction_of_median_train: 0.10
+
+gap:
+  missing_file_is_gap: true
+  do_not_window_across_gap: true
