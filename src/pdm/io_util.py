@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -19,6 +19,28 @@ def sha256_file(path: Path, chunk: int = 1024 * 1024) -> str:
                 break
             h.update(block)
     return h.hexdigest()
+
+
+def sha256_short(digest: str, n: int = 12) -> str:
+    """Truncate a hex digest for display / directory names."""
+    return digest[:n]
+
+
+def checkpoint_hash(path: Path | None = None, state_dict: Mapping[str, Any] | None = None) -> str:
+    """SHA-256 of `best.pt` (or any ckpt) bytes, else of state_dict keys+shapes."""
+    if path is not None:
+        p = Path(path)
+        if p.exists() and p.is_file():
+            return sha256_file(p)
+    if state_dict is not None:
+        payload = []
+        for key in sorted(state_dict):
+            val = state_dict[key]
+            shape = tuple(int(x) for x in val.shape) if hasattr(val, "shape") else None
+            dtype = str(getattr(val, "dtype", type(val).__name__))
+            payload.append({"k": key, "shape": shape, "dtype": dtype})
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    raise FileNotFoundError("checkpoint_hash requires an existing file path or a state_dict")
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:

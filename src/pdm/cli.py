@@ -5,13 +5,12 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 from pdm import __version__
 from pdm.device import resolve_device
 from pdm.io_util import atomic_write_json
 from pdm.paths import data_processed, data_raw, project_root, runs_root, worker_dir
-from pdm.worker import job_path, pid_path, request_stop, status_path, worker_alive
+from pdm.worker import job_path, pid_path, request_stop, worker_alive
 
 
 def _python() -> str:
@@ -31,7 +30,6 @@ def doctor() -> dict:
     import torch
     import yaml
 
-    from pdm.losses import weibull_nll
     from pdm.models import PDMNet
 
     info = resolve_device("auto")
@@ -132,8 +130,40 @@ def main(argv: list[str] | None = None) -> int:
     p_ev = sub.add_parser("evaluate")
     p_ev.add_argument("--dataset", required=True, choices=["bearings", "filters"])
     p_ev.add_argument("--run-id", required=True)
-    p_ev.add_argument("--horizon-s", type=float, default=None)
-    p_ev.add_argument("--k", type=int, default=3)
+    p_ev.add_argument(
+        "--horizon-s",
+        type=float,
+        default=None,
+        help="H_trigger in seconds (alias of warning_horizon_s). Default: frozen policy or 10% of median train duration.",
+    )
+    p_ev.add_argument(
+        "--k",
+        type=int,
+        default=None,
+        help="Confirmation count K. Default: frozen policy or config alerts.confirmation_count.",
+    )
+    p_ev.add_argument(
+        "--min-action-lead-s",
+        type=float,
+        default=None,
+        help="minimum_action_lead_time in seconds. Default: frozen policy or fraction of H_trigger.",
+    )
+    p_ev.add_argument(
+        "--max-useful-horizon-s",
+        type=float,
+        default=None,
+        help="Optional too_early cap. Omit to use frozen policy / config (0 disables).",
+    )
+    p_ev.add_argument(
+        "--force",
+        action="store_true",
+        help="Evaluate even if dataset/split fingerprints do not match the run snapshot (not used by the UI)",
+    )
+    p_ev.add_argument(
+        "--list",
+        action="store_true",
+        help="List evaluations for --run-id without creating a new evaluation",
+    )
 
     sub.add_parser("app")
     sub.add_parser("stop")
@@ -179,8 +209,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "evaluate":
         from pdm.evaluate import evaluate_run
+        from pdm.experiments import list_evaluations, run_dir
 
-        rec = evaluate_run(args.dataset, args.run_id, warning_horizon_s=args.horizon_s, confirmation_count=args.k)
+        if args.list:
+            print(json.dumps(list_evaluations(run_dir(args.dataset, args.run_id)), indent=2, default=str))
+            return 0
+        rec = evaluate_run(
+            args.dataset,
+            args.run_id,
+            warning_horizon_s=args.horizon_s,
+            confirmation_count=args.k,
+            minimum_action_lead_time=args.min_action_lead_s,
+            max_useful_horizon_s=args.max_useful_horizon_s,
+            force=bool(args.force),
+        )
         print(json.dumps(rec, indent=2, default=str))
         return 0
     if args.cmd == "stop":

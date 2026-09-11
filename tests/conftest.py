@@ -75,15 +75,19 @@ def tiny_filter_tables():
     """Labeled synthetic fixture, not the HSE dataset."""
     feat_rows = []
     unit_rows = []
+    # Synthetic dust labels for encoding tests — not HSE MATLAB fields.
+    dust_a3 = "ISO 12103-1, A3 Medium Test Dust"
+    dust_a2 = "ISO 12103-1, A2 Fine Test Dust"
     # 8 train-like + 2 test-like units
     specs = []
     for i in range(1, 9):
         event = i <= 2
         n = 40
-        specs.append((f"Filter_{i}", n, event, "author_train", None))
-    specs.append(("Filter_101", 30, False, "author_test", 12.0))
-    specs.append(("Filter_102", 25, False, "author_test", 8.0))
-    for uid, n, event, split, official_rul_min in specs:
+        dust = dust_a2 if i % 2 == 0 else dust_a3
+        specs.append((f"Filter_{i}", n, event, "author_train", None, dust))
+    specs.append(("Filter_101", 30, False, "author_test", 12.0, dust_a3))
+    specs.append(("Filter_102", 25, False, "author_test", 8.0, dust_a2))
+    for uid, n, event, split, official_rul_min, dust in specs:
         t = np.arange(1, n + 1, dtype=float) * 0.1  # minutes
         dp = np.linspace(10, 650 if event else 400, n)
         for j in range(n):
@@ -101,29 +105,29 @@ def tiny_filter_tables():
                     "delta_pressure": float(dp[j] - dp[j - 1]) if j else 0.0,
                     "flow_rate": 80.0,
                     "dust_feed": 100.0,
-                    "dust": "ISO 12103-1, A3 Medium Test Dust",
+                    "dust": dust,
                     "gap_before": False,
                     "author_split": split,
                 }
             )
         ts = t * 60.0
         obs_end = float(ts[-1])
-        if event:
+        if event and split == "author_train":
             et = float(ts[np.argmax(dp > 600)])
-        elif official_rul_min is not None:
-            et = obs_end + official_rul_min * 60.0
         else:
             et = float("nan")
         unit_rows.append(
             {
                 "dataset_id": "filters",
                 "unit_id": uid,
+                "author_data_no": int(uid.split("_")[1]),
                 "author_split": split,
                 "event_observed": int(event and split == "author_train"),
                 "event_time_s": et,
                 "observation_end_s": obs_end,
                 "official_rul_at_prefix_end_s": None if official_rul_min is None else official_rul_min * 60.0,
-                "dust": "ISO 12103-1, A3 Medium Test Dust",
+                "official_rul_at_prefix_end_original": official_rul_min,
+                "dust": dust,
                 "regime_id": "A3",
             }
         )

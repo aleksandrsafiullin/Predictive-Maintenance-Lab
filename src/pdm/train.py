@@ -14,14 +14,25 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from pdm.config import load_dataset_config, model_defaults
-from pdm.data.prepare import load_processed
+from pdm.data.prepare import dataset_fingerprint_for_run, load_processed
 from pdm.device import resolve_device
-from pdm.io_util import append_line, atomic_write_json, dump_yaml
+from pdm.io_util import (
+    append_line,
+    atomic_write_json,
+    checkpoint_hash,
+    dump_yaml,
+    load_yaml,
+    read_json,
+)
 from pdm.losses import smooth_l1, weibull_nll
 from pdm.models import PDMNet
 from pdm.paths import dataset_runs, project_root
-from pdm.preprocessing import Preprocessor, fit_preprocessor
+from pdm.preprocessing import Preprocessor, categorical_maps_fingerprint, fit_preprocessor
+from pdm.splits import resolve_split_hash, split_hash
 from pdm.windows import build_windows
+
+# Deprecated alias so `from pdm.train import split_fingerprint` still works.
+split_fingerprint = split_hash
 
 LogFn = Callable[[str], None]
 StopFn = Callable[[], bool]
@@ -50,8 +61,7 @@ class UnitWindowDataset(Dataset):
             for uid, g in features.groupby("unit_id")
         }
         for uid, g in feat_sorted.items():
-            arr = g[feature_names].to_numpy(dtype=np.float32)
-            self.arrays[str(uid)] = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            self.arrays[str(uid)] = g[feature_names].to_numpy(dtype=np.float32)
         for _, w in windows.iterrows():
             uid = str(w["unit_id"])
             duration = float(w.get("duration_s", w.get("target_rul_s", np.nan)))
@@ -116,6 +126,19 @@ def set_seeds(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+SMOKE_MAX_WINDOWS_PER_UNIT = 32
+SMOKE_MAX_EPOCHS = 5
+HIST_COLS = [
+    "epoch",
+    "train_loss",
+    "val_loss",
+    "train_metric",
+    "val_metric",
+    "val_mae_events",
+    "n_val_event_units",
+]
+
+
 def new_run_id(dataset_id: str, architecture: str, smoke: bool) -> str:
     stamp = time.strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:6]
@@ -123,18 +146,169 @@ def new_run_id(dataset_id: str, architecture: str, smoke: bool) -> str:
     return f"{prefix}{dataset_id}_{architecture}_{stamp}_{short}"
 
 
-def split_fingerprint(split: dict) -> str:
-    payload = json.dumps(
-        {k: split.get(k) for k in ("train", "validation", "test", "protocol")},
-        sort_keys=True,
-    )
-    import hashlib
+def resolve_max_windows_per_unit(
+    value: object | None,
+    *,
+    smoke: bool,
+    smoke_cap: int = SMOKE_MAX_WINDOWS_PER_UNIT,
+) -> int | None:
+    """None/omitted → smoke cap when smoke, else unlimited. Explicit 0 → unlimited."""
+    if value is None or value == "":
+        return int(smoke_cap) if smoke else None
+    n = int(value)
+    if n <= 0:
+        return None
+    return n
 
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+def _coerce_saved_windows(value: object | None) -> int | None:
+    """Saved cap as stored: 0 / empty / null → unlimited. Does not apply a smoke preset."""
+    if value is None or value == "":
+        return None
+    n = int(value)
+    return None if n <= 0 else n
 
 
-def compatibility_dict(cfg_model: dict, prep: Preprocessor, split: dict, dataset_id: str, head: str) -> dict[str, Any]:
+def load_saved_train_settings(run_path: Path, run_id: str = "") -> dict[str, Any] | None:
+    """Read smoke / windows / epochs from an existing run. None if the dir is empty."""
+    run_path = Path(run_path)
+    cfg_path = run_path / "config.yaml"
+    status_path = run_path / "status.json"
+    saved: dict[str, Any] = {}
+    if cfg_path.exists():
+        raw = load_yaml(cfg_path)
+        if "smoke" in raw:
+            saved["smoke"] = bool(raw["smoke"])
+        if "max_windows_per_unit" in raw:
+            saved["max_windows_per_unit"] = _coerce_saved_windows(raw.get("max_windows_per_unit"))
+        model = raw.get("model") or {}
+        if model.get("max_epochs") is not None:
+            saved["max_epochs"] = int(model["max_epochs"])
+    if status_path.exists() and ("smoke" not in saved or "max_windows_per_unit" not in saved or "max_epochs" not in saved):
+        try:
+            st = read_json(status_path)
+        except Exception:
+            st = {}
+        if "smoke" not in saved and "smoke" in st:
+            saved["smoke"] = bool(st["smoke"])
+        if "max_windows_per_unit" not in saved and "max_windows_per_unit" in st:
+            saved["max_windows_per_unit"] = _coerce_saved_windows(st.get("max_windows_per_unit"))
+        if "max_epochs" not in saved and st.get("max_epochs") is not None:
+            saved["max_epochs"] = int(st["max_epochs"])
+    if not saved and not (run_path / "last.pt").exists() and not cfg_path.exists() and not status_path.exists():
+        return None
+    if "smoke" not in saved:
+        saved["smoke"] = str(run_id or run_path.name).startswith("smoke_")
+    if "max_windows_per_unit" not in saved:
+        saved["max_windows_per_unit"] = resolve_max_windows_per_unit(None, smoke=bool(saved["smoke"]))
+    return saved
+
+
+def resolve_run_train_args(
+    *,
+    resume_settings: dict[str, Any] | None,
+    smoke: bool,
+    max_windows_per_unit: object | None,
+    max_epochs: int | None,
+    smoke_cap: int = SMOKE_MAX_WINDOWS_PER_UNIT,
+    smoke_epochs: int = SMOKE_MAX_EPOCHS,
+    dataset_max_epochs: int = 30,
+) -> dict[str, Any]:
+    """Final smoke / windows / epochs. A resume snapshot beats form or CLI defaults."""
+    if resume_settings is not None:
+        smoke_r = bool(resume_settings.get("smoke", False))
+        if "max_windows_per_unit" in resume_settings:
+            mw = _coerce_saved_windows(resume_settings.get("max_windows_per_unit"))
+        else:
+            mw = resolve_max_windows_per_unit(None, smoke=smoke_r, smoke_cap=smoke_cap)
+        if resume_settings.get("max_epochs") is not None:
+            epochs = int(resume_settings["max_epochs"])
+        else:
+            epochs = int(dataset_max_epochs if max_epochs is None else max_epochs)
+            if smoke_r:
+                epochs = min(epochs, int(smoke_epochs))
+        return {"smoke": smoke_r, "max_windows_per_unit": mw, "max_epochs": epochs}
+    epochs = int(dataset_max_epochs if max_epochs is None else max_epochs)
+    if smoke:
+        epochs = min(epochs, int(smoke_epochs))
+    mw = resolve_max_windows_per_unit(max_windows_per_unit, smoke=smoke, smoke_cap=smoke_cap)
+    return {"smoke": bool(smoke), "max_windows_per_unit": mw, "max_epochs": epochs}
+
+
+def next_max_windows_on_mode_change(
+    *,
+    prev_smoke: bool | None,
+    smoke: bool,
+    current_cap: int,
+    smoke_cap: int = SMOKE_MAX_WINDOWS_PER_UNIT,
+) -> int:
+    """Drop the smoke preset when turning Full unless the user overrode it."""
+    current = int(current_cap)
+    cap = int(smoke_cap)
+    if prev_smoke is None:
+        return cap if smoke else 0
+    if bool(prev_smoke) == bool(smoke):
+        return current
+    old_preset = cap if prev_smoke else 0
+    if current == old_preset:
+        return cap if smoke else 0
+    return current
+
+
+def training_mode_label(smoke: object, run_id: str = "") -> str:
+    if smoke is True:
+        return "Smoke"
+    if smoke is False:
+        return "Full"
+    if isinstance(smoke, str):
+        low = smoke.strip().lower()
+        if low in {"true", "smoke"}:
+            return "Smoke"
+        if low in {"false", "full"}:
+            return "Full"
+    return "Smoke" if str(run_id).startswith("smoke_") else "Full"
+
+
+def selection_metric_spec(dataset_id: str) -> dict[str, str]:
+    if dataset_id == "bearings":
+        return {"name": "val MAE", "unit": "seconds", "label": "val MAE (seconds)"}
+    return {"name": "val NLL", "unit": "NLL", "label": "val NLL"}
+
+
+def windows_per_unit_summary(dataset: UnitWindowDataset) -> dict[str, float | int]:
+    counts: dict[str, int] = defaultdict(int)
+    for item in dataset.index:
+        counts[str(item[0])] += 1
+    vals = list(counts.values())
+    if not vals:
+        return {"n_units": 0, "n_windows": 0, "min": 0, "max": 0, "mean": 0.0}
     return {
+        "n_units": len(vals),
+        "n_windows": int(sum(vals)),
+        "min": int(min(vals)),
+        "max": int(max(vals)),
+        "mean": float(np.mean(vals)),
+    }
+
+
+def _history_columns(path: Path) -> list[str]:
+    if not path.exists() or path.stat().st_size == 0:
+        path.write_text(",".join(HIST_COLS) + "\n", encoding="utf-8")
+        return list(HIST_COLS)
+    header = path.read_text(encoding="utf-8").splitlines()[0]
+    cols = [c.strip() for c in header.split(",") if c.strip()]
+    return cols or list(HIST_COLS)
+
+
+def compatibility_dict(
+    cfg_model: dict,
+    prep: Preprocessor,
+    split: dict,
+    dataset_id: str,
+    head: str,
+    fingerprint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
         "dataset_id": dataset_id,
         "architecture": cfg_model["architecture"],
         "history_length": int(cfg_model["history_length"]),
@@ -143,8 +317,15 @@ def compatibility_dict(cfg_model: dict, prep: Preprocessor, split: dict, dataset
         "head": head,
         "feature_names": list(prep.feature_names),
         "time_scale_s": prep.time_scale_s,
-        "split_fingerprint": split_fingerprint(split),
+        "split_hash": split_hash(split),
+        "feature_pipeline_version": prep.feature_pipeline_version,
+        "categorical_maps_fingerprint": categorical_maps_fingerprint(prep.categorical_maps),
     }
+    fp = fingerprint or {}
+    for k in ("dataset_version", "features_hash", "units_hash"):
+        if fp.get(k) is not None:
+            out[k] = fp[k]
+    return out
 
 
 def checkpoints_compatible(saved: dict, current: dict) -> bool:
@@ -157,12 +338,16 @@ def checkpoints_compatible(saved: dict, current: dict) -> bool:
         "head",
         "feature_names",
         "time_scale_s",
-        "split_fingerprint",
+        "feature_pipeline_version",
+        "categorical_maps_fingerprint",
     ]
     for k in keys:
         if saved.get(k) != current.get(k):
             return False
-    return True
+    for k in ("dataset_version", "features_hash", "units_hash"):
+        if k in saved and k in current and saved.get(k) != current.get(k):
+            return False
+    return resolve_split_hash(saved) == resolve_split_hash(current)
 
 
 def run_training(
@@ -187,17 +372,35 @@ def run_training(
     cfg = load_dataset_config(dataset_id)
     mcfg = model_defaults(cfg)
     mcfg["architecture"] = architecture.lower()
-    if max_epochs is not None:
-        mcfg["max_epochs"] = int(max_epochs)
     if history_length is not None:
         mcfg["history_length"] = int(history_length)
     if seed is not None:
         mcfg["seed"] = int(seed)
+    smoke_cap = int(mcfg.get("smoke_max_windows_per_unit", SMOKE_MAX_WINDOWS_PER_UNIT))
+    smoke_epochs = int(mcfg.get("smoke_max_epochs", SMOKE_MAX_EPOCHS))
+    resume_settings = None
+    if resume_run_id:
+        resume_settings = load_saved_train_settings(dataset_runs(dataset_id) / resume_run_id, resume_run_id)
+    launch = resolve_run_train_args(
+        resume_settings=resume_settings,
+        smoke=smoke,
+        max_windows_per_unit=max_windows_per_unit,
+        max_epochs=max_epochs,
+        smoke_cap=smoke_cap,
+        smoke_epochs=smoke_epochs,
+        dataset_max_epochs=int(mcfg["max_epochs"]),
+    )
+    smoke = bool(launch["smoke"])
+    max_windows_per_unit = launch["max_windows_per_unit"]
+    mcfg["max_epochs"] = int(launch["max_epochs"])
     if smoke:
-        mcfg["max_epochs"] = min(int(mcfg["max_epochs"]), 5)
-        if max_windows_per_unit is None:
-            max_windows_per_unit = 48
         _log("Smoke test — not a quality benchmark")
+    if resume_settings is not None:
+        _log(
+            f"Resume keeps saved {training_mode_label(smoke)} "
+            f"max_epochs={mcfg['max_epochs']} "
+            f"max_windows_per_unit={max_windows_per_unit if max_windows_per_unit is not None else 'all'}"
+        )
 
     processed = load_processed(dataset_id)
     features = processed["features"]
@@ -226,7 +429,14 @@ def run_training(
         if not last_path.exists():
             raise FileNotFoundError(f"No last.pt to resume: {last_path}")
         blob = torch.load(last_path, map_location="cpu", weights_only=False)
-        current = compatibility_dict(mcfg, prep, split, dataset_id, head)
+        current = compatibility_dict(
+            mcfg,
+            prep,
+            split,
+            dataset_id,
+            head,
+            fingerprint=dataset_fingerprint_for_run(processed, split),
+        )
         if not checkpoints_compatible(blob.get("compat") or {}, current):
             raise RuntimeError(
                 "Checkpoint is not compatible with current dataset/split/features/architecture. "
@@ -263,6 +473,14 @@ def run_training(
         max_windows_per_unit=None,
         seed=int(mcfg["seed"]) + 1,
     )
+    train_wpu = windows_per_unit_summary(train_ds)
+    val_wpu = windows_per_unit_summary(val_ds)
+    n_train_windows = int(train_wpu["n_windows"])
+    n_val_windows = int(val_wpu["n_windows"])
+    _log(
+        f"windows train={n_train_windows} val={n_val_windows} "
+        f"max_windows_per_unit={max_windows_per_unit if max_windows_per_unit is not None else 'all'}"
+    )
     n_draws = max(len(train_ds), 1)
     sampler = UnitBalancedSampler(train_ds, n_draws=n_draws, seed=int(mcfg["seed"]))
     train_loader = DataLoader(
@@ -272,6 +490,14 @@ def run_training(
         num_workers=int(mcfg["num_workers"]),
         collate_fn=_collate,
     )
+    # Fixed-mask diagnostics: every kept window once, then equal-weight units.
+    train_diag_loader = DataLoader(
+        train_ds,
+        batch_size=int(mcfg["batch_size"]),
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_collate,
+    )
     val_loader = DataLoader(
         val_ds,
         batch_size=int(mcfg["batch_size"]),
@@ -279,6 +505,7 @@ def run_training(
         num_workers=0,
         collate_fn=_collate,
     )
+    sel_spec = selection_metric_spec(dataset_id)
 
     model = PDMNet(
         input_size=len(prep.feature_names),
@@ -299,8 +526,32 @@ def run_training(
         opt.load_state_dict(blob["optimizer_state_dict"])
 
     env = _environment(device_info)
-    dump_yaml(rdir / "config.yaml", {"dataset_id": dataset_id, "model": mcfg, "smoke": smoke, "head": head})
+    run_cfg: dict[str, Any] = {
+        "dataset_id": dataset_id,
+        "model": mcfg,
+        "smoke": smoke,
+        "mode": training_mode_label(smoke),
+        "head": head,
+        "max_windows_per_unit": max_windows_per_unit,
+        "n_train_windows": n_train_windows,
+        "n_val_windows": n_val_windows,
+        "train_windows_per_unit": train_wpu,
+        "val_windows_per_unit": val_wpu,
+        "selection_metric": sel_spec,
+    }
+    if dataset_id == "filters":
+        run_cfg["gap"] = {
+            "gap_multiplier": prep.gap_multiplier,
+            "sampling_interval_s": prep.sampling_interval_s,
+        }
+    dump_yaml(rdir / "config.yaml", run_cfg)
     atomic_write_json(rdir / "split.json", split)
+    run_fp = dataset_fingerprint_for_run(processed, split)
+    fp_path = rdir / "dataset_fingerprint.json"
+    if not fp_path.exists():
+        atomic_write_json(fp_path, run_fp)
+    else:
+        run_fp = json.loads(fp_path.read_text(encoding="utf-8"))
     atomic_write_json(rdir / "feature_schema.json", {"feature_names": prep.feature_names, "order": prep.feature_names})
     atomic_write_json(rdir / "preprocessing.json", prep.to_dict())
     atomic_write_json(rdir / "environment.json", env)
@@ -309,8 +560,7 @@ def run_training(
         atomic_write_json(rdir / "data_manifest.json", json.loads(manifest_src.read_text()))
     log_path = rdir / "train.log"
     hist_path = rdir / "training_history.csv"
-    if not hist_path.exists():
-        hist_path.write_text("epoch,train_loss,val_loss,val_metric,val_mae_events,n_val_event_units\n", encoding="utf-8")
+    hist_cols = _history_columns(hist_path)
 
     def emit(status: str, **extra):
         payload = {
@@ -320,7 +570,16 @@ def run_training(
             "architecture": mcfg["architecture"],
             "head": head,
             "smoke": smoke,
+            "mode": training_mode_label(smoke),
             "device": device_info.name,
+            "n_train_windows": n_train_windows,
+            "n_val_windows": n_val_windows,
+            "max_windows_per_unit": max_windows_per_unit,
+            "train_windows_per_unit": train_wpu,
+            "val_windows_per_unit": val_wpu,
+            "selection_metric_name": sel_spec["name"],
+            "selection_metric_unit": sel_spec["unit"],
+            "selection_metric_label": sel_spec["label"],
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             **extra,
         }
@@ -340,25 +599,65 @@ def run_training(
                 _log(f"Stop requested at epoch {epoch}")
                 break
             tr_loss = _run_epoch(model, opt, train_loader, dataset_id, device, mcfg, train=True)
-            val_stats = _validate(model, val_loader, dataset_id, device, units, split)
+            train_stats = _eval_unit_weighted(model, train_diag_loader, dataset_id, device)
+            val_stats = _eval_unit_weighted(model, val_loader, dataset_id, device)
             val_metric = val_stats["selection_metric"]
+            train_metric = train_stats["selection_metric"]
             improved = val_metric < best_metric - 1e-8
             if improved:
                 best_metric = val_metric
                 best_epoch = epoch
                 bad = 0
-                _save_ckpt(rdir / "best.pt", model, opt, epoch, best_epoch, best_metric, mcfg, prep, split, dataset_id, head, smoke)
+                _save_ckpt(
+                    rdir / "best.pt",
+                    model,
+                    opt,
+                    epoch,
+                    best_epoch,
+                    best_metric,
+                    mcfg,
+                    prep,
+                    split,
+                    dataset_id,
+                    head,
+                    smoke,
+                    fingerprint=run_fp,
+                )
             else:
                 bad += 1
-            _save_ckpt(rdir / "last.pt", model, opt, epoch, best_epoch, best_metric, mcfg, prep, split, dataset_id, head, smoke)
-            line = (
-                f"{epoch},{tr_loss:.6f},{val_stats['val_loss']:.6f},{val_metric:.6f},"
-                f"{val_stats.get('val_mae_events')},{val_stats.get('n_val_event_units')}"
+            _save_ckpt(
+                rdir / "last.pt",
+                model,
+                opt,
+                epoch,
+                best_epoch,
+                best_metric,
+                mcfg,
+                prep,
+                split,
+                dataset_id,
+                head,
+                smoke,
+                fingerprint=run_fp,
             )
-            append_line(hist_path, line)
+            _sync_run_checkpoint_hash(rdir)
+            hist_row = {
+                "epoch": epoch,
+                "train_loss": f"{tr_loss:.6f}",
+                "val_loss": f"{val_stats['val_loss']:.6f}",
+                "train_metric": f"{train_metric:.6f}",
+                "val_metric": f"{val_metric:.6f}",
+                "val_mae_events": val_stats.get("val_mae_events"),
+                "n_val_event_units": val_stats.get("n_val_event_units"),
+            }
+            append_line(
+                hist_path,
+                ",".join("" if hist_row.get(c) is None else str(hist_row.get(c, "")) for c in hist_cols),
+            )
             msg = (
                 f"epoch {epoch}/{mcfg['max_epochs']} train_loss={tr_loss:.4f} "
-                f"val_loss={val_stats['val_loss']:.4f} val_metric={val_metric:.4f} best_epoch={best_epoch}"
+                f"val_loss={val_stats['val_loss']:.4f} train_metric={train_metric:.4f} "
+                f"val_metric={val_metric:.4f} ({sel_spec['label']}) best_epoch={best_epoch}"
             )
             _log(msg)
             append_line(log_path, msg)
@@ -368,12 +667,31 @@ def run_training(
                 max_epochs=int(mcfg["max_epochs"]),
                 train_loss=tr_loss,
                 val_loss=val_stats["val_loss"],
+                train_metric=train_metric,
                 val_metric=val_metric,
                 best_epoch=best_epoch,
                 best_metric=best_metric,
                 message=msg,
             )
-            atomic_write_json(rdir / "validation_metrics.json", {"best_epoch": best_epoch, "best_metric": best_metric, "last": val_stats})
+            atomic_write_json(
+                rdir / "validation_metrics.json",
+                {
+                    "best_epoch": best_epoch,
+                    "best_metric": best_metric,
+                    "selection_metric_name": sel_spec["name"],
+                    "selection_metric_unit": sel_spec["unit"],
+                    "selection_metric_label": sel_spec["label"],
+                    "last": val_stats,
+                    "last_train": train_stats,
+                    "n_train_windows": n_train_windows,
+                    "n_val_windows": n_val_windows,
+                    "max_windows_per_unit": max_windows_per_unit,
+                    "train_windows_per_unit": train_wpu,
+                    "val_windows_per_unit": val_wpu,
+                    "smoke": smoke,
+                    "mode": training_mode_label(smoke),
+                },
+            )
             if bad >= patience:
                 _log(f"Early stopping at epoch {epoch}, best_epoch={best_epoch}")
                 break
@@ -412,7 +730,7 @@ def _run_epoch(model, opt, loader, dataset_id, device, mcfg, train: bool) -> flo
 
 
 @torch.no_grad()
-def _validate(model, loader, dataset_id, device, units, split) -> dict[str, Any]:
+def _eval_unit_weighted(model, loader, dataset_id, device) -> dict[str, Any]:
     model.eval()
     losses = []
     by_unit_err: dict[str, list[float]] = defaultdict(list)
@@ -457,12 +775,40 @@ def _validate(model, loader, dataset_id, device, units, split) -> dict[str, Any]
     }
 
 
-def _save_ckpt(path, model, opt, epoch, best_epoch, best_metric, mcfg, prep, split, dataset_id, head, smoke):
+def _sync_run_checkpoint_hash(rdir: Path) -> None:
+    ckpt = rdir / "best.pt"
+    if not ckpt.exists():
+        ckpt = rdir / "last.pt"
+    if not ckpt.exists():
+        return
+    fp_path = rdir / "dataset_fingerprint.json"
+    if not fp_path.exists():
+        return
+    fp = json.loads(fp_path.read_text(encoding="utf-8"))
+    fp["checkpoint_hash"] = checkpoint_hash(ckpt)
+    atomic_write_json(fp_path, fp)
+
+
+def _save_ckpt(
+    path,
+    model,
+    opt,
+    epoch,
+    best_epoch,
+    best_metric,
+    mcfg,
+    prep,
+    split,
+    dataset_id,
+    head,
+    smoke,
+    fingerprint=None,
+):
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": opt.state_dict(),
-            "compat": compatibility_dict(mcfg, prep, split, dataset_id, head),
+            "compat": compatibility_dict(mcfg, prep, split, dataset_id, head, fingerprint=fingerprint),
             "meta": {
                 "epoch": epoch,
                 "best_epoch": best_epoch,
@@ -490,6 +836,7 @@ def load_trained_model(run_path: Path, device: str = "cpu", which: str = "best")
         ckpt_file = run_path / "last.pt"
     blob = torch.load(ckpt_file, map_location=device, weights_only=False)
     meta = blob["meta"]
+    _verify_loaded_checkpoint(run_path, ckpt_file, blob)
     prep = Preprocessor.from_dict(json.loads((run_path / "preprocessing.json").read_text()))
     model = PDMNet(
         input_size=int(meta["input_size"]),
@@ -504,6 +851,30 @@ def load_trained_model(run_path: Path, device: str = "cpu", which: str = "best")
     model.to(device)
     model.eval()
     return model, prep, meta
+
+
+def _verify_loaded_checkpoint(run_path: Path, ckpt_file: Path, blob: dict) -> None:
+    """Abort if best.pt bytes or split identity drifted from the run snapshot."""
+    from pdm.evaluate import IncompatibleDataError
+    from pdm.io_util import read_json
+
+    fp_path = run_path / "dataset_fingerprint.json"
+    if fp_path.exists() and ckpt_file.name.startswith("best"):
+        stored = read_json(fp_path).get("checkpoint_hash")
+        if stored and stored != checkpoint_hash(ckpt_file):
+            raise IncompatibleDataError(
+                ["checkpoint_hash"],
+                detail="best.pt does not match the run fingerprint",
+            )
+    split_path = run_path / "split.json"
+    if split_path.exists():
+        snap_hash = split_hash(read_json(split_path))
+        compat_hash = resolve_split_hash(blob.get("compat") or {})
+        if compat_hash and compat_hash != snap_hash:
+            raise IncompatibleDataError(
+                ["split_hash"],
+                detail="checkpoint compat split_hash does not match run split.json",
+            )
 
 
 def _environment(device_info) -> dict[str, Any]:

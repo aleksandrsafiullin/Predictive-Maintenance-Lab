@@ -1,0 +1,30 @@
+---
+description: GRU/LSTM heads, losses, training, evaluation, baselines
+globs: src/pdm/models.py,src/pdm/losses.py,src/pdm/train.py,src/pdm/evaluate.py,src/pdm/predict.py,src/pdm/baselines.py,src/pdm/device.py,src/pdm/experiments.py
+alwaysApply: false
+---
+
+# Models and training
+
+`PDMNet`: `[B, history, F] →` unidirectional GRU|LSTM → last hidden → head. No other architectures.
+
+**Bearings head `rul`:** Softplus → non-negative RUL (normalized). Loss `SmoothL1Loss`. Best epoch = unit-equal val MAE. Metrics in physical seconds.
+
+**Filters head `weibull`:** `lambda>0`, `k>0`. Right-censored NLL in `losses.weibull_nll`. Point forecast = Weibull **median** remaining life (`weibull_median_rul`). Do not MSE on planned-replacement time. Best epoch = unit-equal val NLL. Val MAE only on observed events, with their count.
+
+```text
+r = duration_s / time_scale_s
+loss = -event * log_f(r) - (1-event) * log_S(r)
+```
+
+`time_scale_s` from train only. Keep NLL numerically stable (clamp, no NaN/Inf).
+
+**Training**
+- `device=auto`: CUDA → MPS → CPU; log fallback reason
+- Sample units then windows (long runs must not dominate)
+- Save `best.pt` + `last.pt`, config, split, versions. Smoke runs: `Smoke test — not a quality benchmark`
+- Resume only from `last` when dataset, split, features, scaler, architecture match
+- Infer with `model.eval()` + `no_grad`; reload must match within numeric tolerance
+- Do not mix dataset checkpoints
+
+**Baselines (keep even if NN loses):** bearings `Age-only` (train-regime median duration − age); filters linear Δp trend to 600 Pa, else `No finite trend estimate` — never a fake huge RUL.

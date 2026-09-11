@@ -14,6 +14,10 @@ recording_duration_s: 1.28
 channels: [horizontal, vertical]
 endpoint_definition: last_recorded_sample
 
+# Frozen near-event windows (seconds). Do not retune from test MAE.
+evaluation:
+  near_event_zones_s: [3600, 1800, 600]
+
 regimes:
   "35Hz12kN":
     regime_id: "35Hz12kN"
@@ -72,11 +76,16 @@ model:
   grad_clip: 1.0
   seed: 42
   num_workers: 0
+  smoke_max_epochs: 5
+  smoke_max_windows_per_unit: 32
 
 alerts:
   confirmation_count: 3
   reset_factor: 1.2
   horizon_fraction_of_median_train: 0.10
+  # H_trigger aliases warning_horizon_s; default = rounded 10% of median train duration.
+  minimum_action_lead_time_fraction: 0.5
+  # max_useful_horizon_s: optional; omit or null = no too_early cap
 
 gap:
   missing_file_is_gap: true

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import traceback
 from pathlib import Path
 
@@ -101,6 +100,9 @@ def run_job(job: dict) -> None:
                 payload["kind"] = "train"
                 write_status(payload)
 
+            mw = job.get("max_windows_per_unit")
+            if mw == "":
+                mw = None
             run_training(
                 job["dataset_id"],
                 architecture=job.get("architecture", "gru"),
@@ -112,20 +114,39 @@ def run_job(job: dict) -> None:
                 log=log,
                 should_stop=stopped,
                 status_cb=status_cb,
-                max_windows_per_unit=job.get("max_windows_per_unit"),
+                max_windows_per_unit=mw,
             )
-        elif kind == "evaluate":
+        elif kind in {"evaluate", "replay_predict"}:
             from pdm.evaluate import evaluate_run
 
-            write_status({"status": "training", "dataset_id": job["dataset_id"], "kind": "evaluate", "run_id": job["run_id"]})
+            write_status(
+                {
+                    "status": "training",
+                    "dataset_id": job["dataset_id"],
+                    "kind": kind,
+                    "run_id": job["run_id"],
+                }
+            )
             metrics = evaluate_run(
                 job["dataset_id"],
                 job["run_id"],
-                warning_horizon_s=job.get("warning_horizon_s"),
-                confirmation_count=job.get("confirmation_count", 3),
+                warning_horizon_s=job.get("H_trigger", job.get("warning_horizon_s")),
+                confirmation_count=job.get("confirmation_count"),
+                minimum_action_lead_time=job.get("minimum_action_lead_time"),
+                max_useful_horizon_s=job.get("max_useful_horizon_s"),
                 device=job.get("device", "auto"),
             )
-            write_status({"status": "completed", "kind": "evaluate", "dataset_id": job["dataset_id"], "run_id": job["run_id"], "metrics_keys": list(metrics)})
+            write_status(
+                {
+                    "status": "completed",
+                    "kind": kind,
+                    "dataset_id": job["dataset_id"],
+                    "run_id": job["run_id"],
+                    "eval_id": metrics.get("eval_id"),
+                    "eval_dir": metrics.get("eval_dir"),
+                    "metrics_keys": list(metrics),
+                }
+            )
         elif kind == "download":
             from pdm.data.download import download_dataset
 

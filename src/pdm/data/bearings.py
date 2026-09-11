@@ -11,7 +11,7 @@ import pandas as pd
 
 from pdm.data.archive import iter_zip_csv_names, validate_zip_member
 from pdm.features import spectral_band_energy, time_domain_features
-from pdm.paths import dataset_processed, dataset_raw
+from pdm.paths import dataset_raw
 
 ProgressFn = Callable[[str, dict[str, Any]], None]
 
@@ -314,6 +314,7 @@ def build_bearing_units(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
             {
                 "dataset_id": "bearings",
                 "unit_id": unit_id,
+                "origin_unit_id": unit_id,
                 "regime_id": last["regime_id"],
                 "instance": int(last["instance"]),
                 "n_measurements": int(len(g)),

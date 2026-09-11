@@ -11,13 +11,27 @@ citation: >-
 license: CC BY 4.0
 
 mode: filters_censored
+# Evaluation (RUL): primary metric is the last sensor row of each author test
+# prefix vs official_rul_at_prefix_end_s (eval-only; never a model input).
+# All prefix points are a secondary backtest. Censored validation keeps NLL
+# on all val units and MAE on observed 600 Pa events with their count.
+# filters_full_history is not implemented. inspect probes Train_Data_Uncensored.mat
+# (missing | unreadable | readable_needs_protocol) but never trains on it.
+# Do not set mode to filters_full_history and do not invent MATLAB table fields.
 pressure_limit_pa: 600.0
-# PDF does not name the Time column unit. CSV dt=0.1; Sampling is documented in Hz.
-# Maintenance-interval lengths scale with 1/dust_feed around 33–179. Seconds would
-# make a "replacement interval" of ~45 s; hours contradict dust-volume scale.
-# Internal time is seconds after Time_original * 60 (minutes → seconds).
-original_time_unit: minutes
+# Time/RUL unit compatibility is UNCONFIRMED. The source PDF does not name the
+# Time column unit. CSV dt≈0.1; Sampling is documented in Hz.
+# Frozen working assumption (not calibrated wall-clock minutes): treat original
+# Time as minutes and convert with time_to_seconds=60 → timestamp_s.
+# Seconds as the native unit would make a "replacement interval" of ~45 s;
+# hours contradict dust-volume scale. CRAN degradr labels RUL as hours
+# (conflict; not adopted). See reports/implementation_report.md
+# (Filters / HSE; §7 Limitations). Do not promise alerts in real minutes.
+# Changing time_to_seconds requires a new data version, window rebuild,
+# retrain, and re-evaluation. Do not change this coefficient in-place.
+original_time_unit: minutes  # assumed, unverified
 time_to_seconds: 60.0
+time_scale_verified: false
 pressure_unit: Pa
 dust_feed_unit: mm3/s
 
@@ -41,12 +55,27 @@ model:
   grad_clip: 1.0
   seed: 42
   num_workers: 0
+  smoke_max_epochs: 5
+  smoke_max_windows_per_unit: 32
 
 alerts:
   confirmation_count: 3
   reset_factor: 1.2
   horizon_fraction_of_median_train: 0.10
+  # H_trigger aliases warning_horizon_s; default = rounded 10% of median train duration.
+  minimum_action_lead_time_fraction: 0.5
+  # max_useful_horizon_s: optional; omit or null = no too_early cap
 
 gap:
-  max_dt_factor: 3.0
+  # Inference (replay/predict): on prefix rows 0..t,
+  #   gap[i] = delta_t_s[i] > gap_multiplier * median(delta_t_s[1:i])
+  # Future timestamps never enter the median. Row 0 is never a gap.
+  # When the prefix has no past Δt (i < 2) or that median is non-positive,
+  # compare against sampling_interval_s.
+  # sampling_interval_s = CSV Time step 0.1 (assumed minutes) * time_to_seconds 60.
+  # Internal 6 s interval on the assumed scale — not a verified wall-clock period.
+  # Documented from CSV spacing, not a MATLAB field. Do not change time_to_seconds.
+  # Prepared parquet may still store full-file median(Δt) gaps for offline build_windows.
+  gap_multiplier: 3.0
+  sampling_interval_s: 6.0
   do_not_window_across_gap: true

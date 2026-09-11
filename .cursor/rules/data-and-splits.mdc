@@ -1,0 +1,32 @@
+---
+description: Dataset loaders, splits, features, and leakage rules
+globs: src/pdm/data/**,src/pdm/splits.py,src/pdm/preprocessing.py,src/pdm/windows.py,src/pdm/features.py,src/pdm/config.py,configs/**
+alwaysApply: false
+---
+
+# Data, splits, features
+
+Inspect real files before assuming columns. Loaders are dataset-specific (`bearings.py`, `filters.py`) — no generic importer.
+
+**Bearings / XJTU-SY** (`configs/bearings.yaml`)
+- Sort CSV by **numeric** file index, not lexicographic
+- `timestamp_s = file_index * 60`; a missing file does **not** shift later times
+- Split 9/3/3: per regime, instances 1–3 train, 4 val, 5 test
+- Features from the finished fragment only (RMS/std/peak/kurtosis + fixed spectral bands)
+- Target: `RUL_s(t) = event_time_s - timestamp_s`; `endpoint_definition=last_recorded_sample`
+
+**Filters / HSE** (`configs/filters.yaml`)
+- Mode `filters_censored`. Author 50 test units stay untouched
+- Author train: unit-level ~80/20, seed 42, stratify observed 600 Pa events
+- Namespace IDs: `Train_*` / `Test_*` (`Data_No` reused across files)
+- Time: original column treated as minutes → `timestamp_s *= 60` (documented inference)
+- Censored end ≠ failure. Do not assign a point RUL to `event=0`
+- Official test `RUL` is evaluation-only (last row per unit), never a model input
+
+**Leakage**
+- Fit scaler / impute / `time_scale_s` / feature selection on **train units only**; persist with the run
+- No test-unit lifetime norm, no future `backfill`, no two-sided smooth, no windows across gaps
+- `unit_id` is not a feature. Failure time, full duration, % life, test-file length, split label are not inputs
+- Shuffle windows across units for batches; never shuffle timesteps inside a window
+
+After data/split/preprocess edits, extend `tests/test_spec_invariants.py`.

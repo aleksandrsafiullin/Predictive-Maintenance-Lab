@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-import json
+import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+import pandas as pd
 
 from pdm.io_util import read_json
 from pdm.paths import dataset_runs, runs_root
+
+EVALUATIONS_DIRNAME = "evaluations"
+LEGACY_PREDICTIONS_NAME = "predictions.csv"
+LEGACY_METRICS_NAME = "test_metrics.json"
+LEGACY_ALERTS_NAME = "alerts.csv"
 
 
 def list_runs(dataset_id: str | None = None) -> list[dict[str, Any]]:
@@ -19,7 +26,6 @@ def list_runs(dataset_id: str | None = None) -> list[dict[str, Any]]:
             if not run_dir.is_dir():
                 continue
             status_path = run_dir / "status.json"
-            cfg_path = run_dir / "config.yaml"
             row: dict[str, Any] = {
                 "dataset_id": ds,
                 "run_id": run_dir.name,
@@ -35,6 +41,8 @@ def list_runs(dataset_id: str | None = None) -> list[dict[str, Any]]:
             else:
                 row["status"] = "unknown"
             row.setdefault("run_id", run_dir.name)
+            row["n_evaluations"] = _count_evaluations(run_dir)
+            row["has_legacy_predictions"] = (run_dir / LEGACY_PREDICTIONS_NAME).exists()
             rows.append(row)
     rows.sort(key=lambda r: r.get("updated_at") or r.get("run_id") or "", reverse=True)
     return rows
@@ -47,3 +55,413 @@ def run_dir(dataset_id: str, run_id: str) -> Path:
 def load_run_status(dataset_id: str, run_id: str) -> dict[str, Any]:
     p = run_dir(dataset_id, run_id) / "status.json"
     return read_json(p) if p.exists() else {}
+
+
+def load_run_snapshot(run_path: Path) -> dict[str, Any]:
+    """Load `split.json` + `dataset_fingerprint.json` from a run directory."""
+    split_p = run_path / "split.json"
+    if not split_p.exists():
+        raise FileNotFoundError(f"Run snapshot missing split.json: {split_p}")
+    fp_p = run_path / "dataset_fingerprint.json"
+    return {
+        "dir": run_path,
+        "split": read_json(split_p),
+        "fingerprint": read_json(fp_p) if fp_p.exists() else {},
+        "has_fingerprint": fp_p.exists(),
+        "best_pt": run_path / "best.pt",
+        "last_pt": run_path / "last.pt",
+    }
+
+
+def evaluations_dir(run_path: Path) -> Path:
+    return Path(run_path) / EVALUATIONS_DIRNAME
+
+
+def _count_evaluations(run_path: Path) -> int:
+    root = evaluations_dir(run_path)
+    if not root.exists():
+        return 0
+    return sum(1 for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def list_evaluations(run_path: Path) -> list[dict[str, Any]]:
+    """Immutable eval dirs under `runs/<run_id>/evaluations/`, newest first."""
+    root = evaluations_dir(run_path)
+    rows: list[dict[str, Any]] = []
+    if not root.exists():
+        return rows
+    for path in root.iterdir():
+        if not path.is_dir() or path.name.startswith("."):
+            continue
+        row: dict[str, Any] = {
+            "eval_id": path.name,
+            "path": str(path),
+            "has_predictions": (path / "predictions.csv").exists(),
+            "has_alerts": (path / "alerts.csv").exists(),
+            "has_metrics": (path / "metrics.json").exists(),
+            "legacy": False,
+        }
+        cfg_path = path / "evaluation_config.json"
+        if cfg_path.exists():
+            try:
+                cfg = read_json(cfg_path)
+                for key in ("metrics_version", "checkpoint_hash", "split_hash"):
+                    if key in cfg:
+                        row[key] = cfg[key]
+            except Exception:
+                pass
+        rows.append(row)
+    rows.sort(key=lambda r: r.get("eval_id") or "", reverse=True)
+    return rows
+
+
+def _artifacts_from_eval_dir(eval_dir: Path) -> dict[str, Any]:
+    def _optional(name: str) -> Path | None:
+        p = eval_dir / name
+        return p if p.exists() else None
+
+    return {
+        "eval_id": eval_dir.name,
+        "eval_dir": eval_dir,
+        "legacy": False,
+        "predictions": _optional("predictions.csv"),
+        "alerts": _optional("alerts.csv"),
+        "metrics": _optional("metrics.json"),
+        "metrics_by_unit": _optional("metrics_by_unit.csv"),
+        "evaluation_config": _optional("evaluation_config.json"),
+    }
+
+
+def resolve_evaluation_artifacts(run_path: Path, eval_id: str | None = None) -> dict[str, Any]:
+    """Prefer `evaluations/<eval_id>/`. Legacy root files are read-only fallback only."""
+    run_path = Path(run_path)
+    if eval_id:
+        dest = evaluations_dir(run_path) / eval_id
+        if dest.is_dir():
+            return _artifacts_from_eval_dir(dest)
+        return {
+            "eval_id": eval_id,
+            "eval_dir": None,
+            "legacy": False,
+            "predictions": None,
+            "alerts": None,
+            "metrics": None,
+            "metrics_by_unit": None,
+            "evaluation_config": None,
+        }
+    rows = list_evaluations(run_path)
+    if rows:
+        return _artifacts_from_eval_dir(Path(rows[0]["path"]))
+    pred = run_path / LEGACY_PREDICTIONS_NAME
+    alerts = run_path / LEGACY_ALERTS_NAME
+    metrics = run_path / LEGACY_METRICS_NAME
+    return {
+        "eval_id": None,
+        "eval_dir": None,
+        "legacy": True,
+        "predictions": pred if pred.exists() else None,
+        "alerts": alerts if alerts.exists() else None,
+        "metrics": metrics if metrics.exists() else None,
+        "metrics_by_unit": None,
+        "evaluation_config": None,
+    }
+
+
+PRIMARY_METRIC_LABELS = {
+    "equal_weight_unit_mae": "Equal-weight unit MAE",
+    "prefix_end_mae": "Prefix-end MAE",
+}
+
+_ALERT_CLASS_LABELS = {
+    "timely": "Timely",
+    "too_early": "Too early",
+    "late": "Late",
+    "miss": "Miss",
+    "insufficient_coverage": "Insufficient coverage",
+    "mixed": "Mixed",
+}
+
+
+def read_evaluation_metrics(artifacts: Mapping[str, Any]) -> dict[str, Any] | None:
+    path = artifacts.get("metrics")
+    if path is None:
+        return None
+    try:
+        data = read_json(path)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def read_metrics_by_unit(artifacts: Mapping[str, Any]) -> pd.DataFrame | None:
+    path = artifacts.get("metrics_by_unit")
+    if path is None:
+        return None
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return None
+
+
+def _finite(val: Any) -> float | None:
+    try:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return None
+        x = float(val)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def format_mae_s(val: Any, dataset_id: str) -> str:
+    x = _finite(val)
+    if x is None:
+        return "—"
+    if dataset_id == "bearings":
+        return f"{x:.1f} s ({x / 60.0:.2f} min)"
+    return f"{x:.1f} s"
+
+
+def format_duration_s(val: Any) -> str:
+    x = _finite(val)
+    if x is None:
+        return "—"
+    return f"{x:.1f} s"
+
+
+def _pct(val: Any) -> str:
+    x = _finite(val)
+    if x is None:
+        return "—"
+    return f"{100.0 * x:.1f}%"
+
+
+def _yes_no(val: Any) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "—"
+    if val is True or val == 1 or str(val).strip().lower() in {"true", "yes", "1"}:
+        return "Yes"
+    if val is False or val == 0 or str(val).strip().lower() in {"false", "no", "0"}:
+        return "No"
+    return str(val)
+
+
+def _alert_class_label(val: Any) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "—"
+    key = str(val).strip()
+    if not key or key.lower() == "nan":
+        return "—"
+    return _ALERT_CLASS_LABELS.get(key, key.replace("_", " "))
+
+
+def _baseline_compare_block(metrics: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The stored `compare_baseline` dict inside metrics.json (bearings or filters)."""
+    if not metrics:
+        return None
+    base = metrics.get("baseline")
+    if not isinstance(base, dict):
+        return None
+    if "baseline_coverage_fraction" in base:
+        return base
+    for key in ("prefix_end", "prefix_backtest"):
+        inner = base.get(key)
+        if isinstance(inner, dict) and "baseline_coverage_fraction" in inner:
+            return inner
+    return None
+
+
+def baseline_coverage_from_metrics(metrics: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    block = _baseline_compare_block(metrics)
+    if block is None:
+        return None
+    base = metrics.get("baseline") if metrics else None
+    name = base.get("name") if isinstance(base, dict) else None
+    nn_all = block.get("neural_net_all_points") or {}
+    nn_overlap = block.get("neural_net_baseline_overlap") or {}
+    base_overlap = block.get("baseline_overlap") or {}
+    return {
+        "name": name or "baseline",
+        "coverage_fraction": _finite(block.get("baseline_coverage_fraction")),
+        "coverage_points": _finite(block.get("baseline_coverage_points")),
+        "n_reference_points": _finite(block.get("n_reference_points")),
+        "neural_net_mae": _finite(nn_all.get("mae") if isinstance(nn_all, dict) else None),
+        "neural_net_overlap_mae": _finite(nn_overlap.get("mae") if isinstance(nn_overlap, dict) else None),
+        "baseline_mae": _finite(base_overlap.get("mae") if isinstance(base_overlap, dict) else None),
+        "scope": "prefix_end" if isinstance(base, dict) and "prefix_end" in base else "all_scored",
+    }
+
+
+def baseline_coverage_callout(metrics: Mapping[str, Any] | None) -> str | None:
+    cov = baseline_coverage_from_metrics(metrics)
+    if cov is None:
+        return None
+    n_cov = cov["coverage_points"]
+    n_ref = cov["n_reference_points"]
+    pts = (
+        f"{int(n_cov)}/{int(n_ref)}"
+        if n_cov is not None and n_ref is not None
+        else "unknown coverage"
+    )
+    name = str(cov["name"])
+    scope = "prefix-end points" if cov["scope"] == "prefix_end" else "scored points"
+    text = (
+        f"{name} baseline has a finite RUL on {pts} {scope} "
+        f"({_pct(cov['coverage_fraction'])}). Compare MAE only on that overlap; "
+        "do not treat sparse baseline hits as a full-set score against the neural net."
+    )
+    if cov["baseline_mae"] is not None and cov["neural_net_overlap_mae"] is not None:
+        text += (
+            f" Overlap MAE: baseline {format_duration_s(cov['baseline_mae'])}, "
+            f"neural net {format_duration_s(cov['neural_net_overlap_mae'])}."
+        )
+    return text
+
+
+def evaluation_notes(metrics: Mapping[str, Any] | None, dataset_id: str) -> list[str]:
+    notes: list[str] = []
+    if not metrics:
+        return notes
+    if metrics.get("note"):
+        notes.append(str(metrics["note"]))
+    if dataset_id == "bearings":
+        n = metrics.get("n_test_units")
+        n_txt = f"{int(n)} test units" if _finite(n) is not None else "test units"
+        notes.append(
+            f"Each of the {n_txt} is a row (XJTU-SY protocol: 3 held-out bearings, "
+            "instance 5 per regime). Endpoint rows (NaN actual RUL) are excluded from MAE. "
+            "Near-event zones are frozen in config, not fit on test."
+        )
+    elif dataset_id == "filters":
+        notes.append(
+            "Primary MAE is at the last sensor row of each author test prefix. "
+            "Actual RUL there is official_rul_at_prefix_end_s (evaluation-only, never a model input) — "
+            "not a sensor-observed 600 Pa crossing. All prefix points are a secondary backtest."
+        )
+        src = metrics.get("official_rul_source")
+        if src:
+            notes.append(str(src))
+    alerts = metrics.get("alerts") if isinstance(metrics.get("alerts"), dict) else {}
+    denom = (alerts or {}).get("denominator_note")
+    if denom:
+        notes.append(str(denom))
+    return notes
+
+
+def evaluation_metric_cards(metrics: Mapping[str, Any] | None, dataset_id: str) -> list[dict[str, str]]:
+    if not metrics:
+        return []
+    cards: list[dict[str, str]] = []
+    key = metrics.get("primary_metric")
+    if key:
+        label = PRIMARY_METRIC_LABELS.get(str(key), str(key).replace("_", " "))
+        cards.append({"label": label, "value": format_mae_s(metrics.get(key), dataset_id)})
+    if dataset_id == "bearings":
+        if metrics.get("pooled_mae") is not None:
+            cards.append({"label": "Pooled MAE", "value": format_mae_s(metrics.get("pooled_mae"), dataset_id)})
+        if metrics.get("mean_overestimation") is not None:
+            cards.append(
+                {
+                    "label": "Mean overestimation",
+                    "value": format_mae_s(metrics.get("mean_overestimation"), dataset_id),
+                }
+            )
+    elif dataset_id == "filters":
+        val = metrics.get("validation") if isinstance(metrics.get("validation"), dict) else {}
+        nll = (val or {}).get("nll_all_units")
+        if nll is not None:
+            x = _finite(nll)
+            cards.append({"label": "Validation NLL (all units)", "value": "—" if x is None else f"{x:.4g}"})
+        mae_ev = (val or {}).get("mae_observed_events")
+        if mae_ev is not None:
+            n_ev = (val or {}).get("n_observed_event_units")
+            suffix = f" (n={int(n_ev)})" if _finite(n_ev) is not None else ""
+            cards.append(
+                {
+                    "label": "Validation MAE (observed events)",
+                    "value": format_mae_s(mae_ev, dataset_id) + suffix,
+                }
+            )
+    alerts = metrics.get("alerts") if isinstance(metrics.get("alerts"), dict) else {}
+    if alerts:
+        timely = alerts.get("n_units_timely", alerts.get("timely"))
+        miss = alerts.get("miss")
+        insuf = alerts.get("insufficient_coverage")
+        if timely is not None or miss is not None or insuf is not None:
+            bits = []
+            if timely is not None:
+                bits.append(f"timely {int(timely)}" if _finite(timely) is not None else f"timely {timely}")
+            if miss is not None:
+                bits.append(f"miss {int(miss)}" if _finite(miss) is not None else f"miss {miss}")
+            if insuf is not None:
+                bits.append(
+                    f"insufficient coverage {int(insuf)}" if _finite(insuf) is not None else f"insufficient {insuf}"
+                )
+            cards.append({"label": "Alert classes", "value": ", ".join(bits) if bits else "—"})
+    return cards
+
+
+def near_event_zone_frame(metrics: Mapping[str, Any] | None) -> pd.DataFrame | None:
+    if not metrics:
+        return None
+    zones = metrics.get("equal_weight_unit_mae_by_zone")
+    if not isinstance(zones, dict) or not zones:
+        return None
+    order = metrics.get("near_event_zones_s") or list(zones.keys())
+    rows = []
+    for z in order:
+        if isinstance(z, (int, float)) and float(z).is_integer():
+            key = str(int(z))
+        else:
+            key = str(z)
+        val = zones.get(key, zones.get(str(z)))
+        rows.append({"Zone (s)": key, "Equal-weight unit MAE (s)": val})
+    return pd.DataFrame(rows)
+
+
+def metrics_by_unit_display_frame(
+    by_unit: pd.DataFrame | None,
+    *,
+    dataset_id: str,
+    test_ids: list[str] | None = None,
+) -> pd.DataFrame:
+    """English per-unit table. Bearings include every test unit even if a CSV row is missing."""
+    src = by_unit.copy() if by_unit is not None else pd.DataFrame()
+    if not src.empty and "unit_id" in src.columns:
+        src["unit_id"] = src["unit_id"].astype(str)
+    elif src.empty:
+        src = pd.DataFrame(columns=["unit_id"])
+    if test_ids:
+        ordered = pd.DataFrame({"unit_id": [str(u) for u in test_ids]})
+        src = ordered.merge(src, on="unit_id", how="left")
+    out = pd.DataFrame()
+    if "unit_id" in src.columns:
+        out["Unit"] = src["unit_id"].astype(str)
+    else:
+        out["Unit"] = []
+    if "mae" in src.columns:
+        mae = src["mae"]
+    elif "prefix_end_abs_error" in src.columns:
+        mae = src["prefix_end_abs_error"]
+    else:
+        mae = None
+    if mae is not None:
+        out["MAE (s)"] = mae
+    if "nll" in src.columns:
+        out["NLL"] = src["nll"]
+    if dataset_id == "filters":
+        if "prefix_end_actual_rul_s" in src.columns:
+            out["Official RUL at prefix end (s)"] = src["prefix_end_actual_rul_s"]
+        if "prefix_end_predicted_rul_s" in src.columns:
+            out["Predicted RUL at prefix end (s)"] = src["prefix_end_predicted_rul_s"]
+        if "backtest_mae" in src.columns:
+            out["Prefix backtest MAE (s)"] = src["backtest_mae"]
+    if "alert_outcome" in src.columns:
+        out["Alert class"] = [_alert_class_label(v) for v in src["alert_outcome"]]
+    if "lead_time_s" in src.columns:
+        out["Lead time (s)"] = src["lead_time_s"]
+    if "has_sufficient_coverage" in src.columns:
+        out["Sufficient coverage"] = [_yes_no(v) for v in src["has_sufficient_coverage"]]
+    if "baseline_coverage_fraction" in src.columns:
+        out["Baseline coverage"] = [_pct(v) for v in src["baseline_coverage_fraction"]]
+    return out

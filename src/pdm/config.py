@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from pathlib import Path
 from typing import Any
 
 from pdm.io_util import load_yaml
@@ -43,4 +42,6 @@ def model_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     m.setdefault("grad_clip", 1.0)
     m.setdefault("seed", 42)
     m.setdefault("num_workers", 0)
+    m.setdefault("smoke_max_epochs", 5)
+    m.setdefault("smoke_max_windows_per_unit", 32)
     return m

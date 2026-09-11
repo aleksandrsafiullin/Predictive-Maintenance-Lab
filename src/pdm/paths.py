@@ -41,5 +41,17 @@ def dataset_processed(dataset_id: str) -> Path:
     return data_processed() / dataset_id
 
 
+def dataset_processed_versions(dataset_id: str) -> Path:
+    return dataset_processed(dataset_id) / "versions"
+
+
+def dataset_processed_version(dataset_id: str, dataset_version: str) -> Path:
+    return dataset_processed_versions(dataset_id) / dataset_version
+
+
+def processed_manifest_path(dataset_id: str) -> Path:
+    return dataset_processed(dataset_id) / "manifest.json"
+
+
 def dataset_runs(dataset_id: str) -> Path:
     return runs_root() / dataset_id

@@ -1,0 +1,33 @@
+---
+description: Predictive Maintenance Lab stack, layout, and verification commands
+alwaysApply: true
+---
+
+# Predictive Maintenance Lab — Core
+
+Local GRU/LSTM prototype: bearings RUL (XJTU-SY) and filter time-to-600 Pa (HSE, censored). Package lives in `src/pdm/`. UI English. Spec: `Cursor_Predictive_Maintenance_MVP_Spec.md`.
+
+**Stack:** Python ≥3.11 (tested 3.12) · PyTorch · Streamlit · Plotly · numpy/pandas/scipy · scikit-learn · pyarrow · PyYAML · pytest · ruff
+
+**Out of MVP:** FastAPI/React, Docker, MLflow, TensorFlow, Transformers, OpenAI SDK, extra NN architectures, live SCADA.
+
+**Layout:**
+- `src/pdm/` — CLI, train/eval, Streamlit `app.py`, worker, models, replay
+- `src/pdm/data/` — XJTU-SY + HSE loaders, download, prepare
+- `configs/{bearings,filters}.yaml` — dataset defaults
+- `tests/` — spec invariants + Streamlit AppTest
+- `data/`, `runs/`, `.venv/` — never commit
+
+**Principles:**
+- Always `.venv` Python: `.venv/bin/python -m pdm …`
+- No leakage: train-only scalers; whole-unit splits; predictor never sees future rows or reference RUL
+- Architectures: **GRU or LSTM only**; separate weights/scalers per dataset; never load a bearings checkpoint into filters
+- Heavy jobs in `pdm.worker` (one at a time); UI binds `127.0.0.1:8501`
+- Real data only. Do not invent MAT/CSV fields. `filters_full_history` is disabled (MATLAB table unreadable)
+
+**Verify before claiming done:**
+```bash
+.venv/bin/python -m pytest tests -q
+.venv/bin/python -m ruff check src tests
+```
+UI changes: Streamlit `AppTest` in `tests/test_worker_and_app.py` or exercise `http://127.0.0.1:8501`. `--smoke` runs are not quality claims.

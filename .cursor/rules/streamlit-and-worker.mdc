@@ -1,0 +1,26 @@
+---
+description: Streamlit screens, worker process, replay isolation, alerts
+globs: src/pdm/app.py,src/pdm/worker.py,src/pdm/cli.py,src/pdm/replay.py,src/pdm/alerts.py,src/pdm/io_util.py,.streamlit/**
+alwaysApply: false
+---
+
+# Streamlit UI, worker, replay
+
+Three screens in `app.py`: **Data**, **Train**, **Test & Replay**. English copy. Stock Streamlit theme + Plotly. Bind `127.0.0.1:8501`; telemetry off (`.streamlit/config.toml`).
+
+**Worker:** prepare/train via `spawn_worker` → `python -m pdm.worker`. One heavy job. Status atomic JSON under `runs/_worker/`. UI polls (`st.fragment`); page rerun must not spawn a second job. `Stop` sets `stop.flag` only — do not kill unrelated PIDs.
+
+Statuses: `not_ready`, `preparing`, `ready`, `training`, `completed`, `stopped`, `failed`. No data → say so, do not fake results.
+
+**Replay isolation** (`replay.py`):
+```text
+ReplaySource (rows ≤ t) → Predictor → AlertEngine
+Evaluator joins actual RUL afterwards; never as model input
+```
+`Show ground truth` must not change predictions. Issued forecasts are append-only. `Reset` starts a new replay.
+
+**Alerts (`AlertEngine`):** warn when predicted RUL ≤ H for K consecutive steps; reset when RUL > 1.2H for K steps. Early windows: `Collecting history` (no future padding).
+
+**Plots:** separate axes — do not overlay pressure and RUL. Bearings: RMS. Filters: Δp with 600 Pa line. CSV export of predictions/alerts required.
+
+CLI: `doctor`, `download`, `inspect`, `prepare`, `train`, `evaluate`, `app`, `stop`.

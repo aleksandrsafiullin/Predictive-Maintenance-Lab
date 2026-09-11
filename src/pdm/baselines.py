@@ -9,6 +9,24 @@ import pandas as pd
 from pdm.features import causal_linear_slope
 
 
+def finite_mask(values: Any) -> np.ndarray:
+    """True where a RUL series is a finite float (baseline miss → False)."""
+    arr = np.asarray(pd.to_numeric(pd.Series(values), errors="coerce"), dtype=np.float64)
+    return np.isfinite(arr)
+
+
+def coverage_stats(values: Any, *, n_reference: int | None = None) -> dict[str, Any]:
+    """Fraction of a reference set with a finite estimate. Never invents a RUL."""
+    mask = finite_mask(values)
+    n_finite = int(mask.sum())
+    n_ref = int(n_reference if n_reference is not None else mask.size)
+    return {
+        "n_finite": n_finite,
+        "n_reference": n_ref,
+        "coverage_fraction": (n_finite / n_ref) if n_ref else 0.0,
+    }
+
+
 def age_only_baseline_rul(
     operating_age_s: float,
     regime_id: str | None,
@@ -35,7 +53,6 @@ def filter_trend_baseline(
     """Linear fit on the available past window; time to 600 Pa if slope > 0."""
     slope = causal_linear_slope(np.asarray(timestamps_s), np.asarray(pressures))
     last_p = float(pressures[-1])
-    last_t = float(timestamps_s[-1])
     if slope is None or slope <= 0 or not math.isfinite(slope):
         return {
             "predicted_rul_s": None,
