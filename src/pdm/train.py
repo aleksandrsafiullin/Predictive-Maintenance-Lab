@@ -23,13 +23,20 @@ from pdm.io_util import (
     dump_yaml,
     load_yaml,
     read_json,
+    sha256_file,
 )
 from pdm.losses import smooth_l1, weibull_nll
 from pdm.models import PDMNet
 from pdm.paths import dataset_runs, project_root
-from pdm.preprocessing import Preprocessor, categorical_maps_fingerprint, fit_preprocessor
+from pdm.preprocessing import (
+    Preprocessor,
+    apply_preprocessor,
+    categorical_maps_fingerprint,
+    fit_preprocessor,
+    preprocessor_resume_mismatches,
+)
 from pdm.splits import resolve_split_hash, split_hash
-from pdm.windows import build_windows
+from pdm.windows import build_windows, filter_gap_params
 
 # Deprecated alias so `from pdm.train import split_fingerprint` still works.
 split_fingerprint = split_hash
@@ -86,27 +93,46 @@ class UnitWindowDataset(Dataset):
             "duration": torch.tensor(duration, dtype=torch.float32),
             "event": torch.tensor(event, dtype=torch.float32),
             "unit_id": uid,
+            "window_index": int(i),
         }
 
 
 class UnitBalancedSampler(Sampler[int]):
     def __init__(self, dataset: UnitWindowDataset, n_draws: int, seed: int) -> None:
-        self.n_draws = n_draws
-        self.seed = seed
+        self.n_draws = int(n_draws)
+        self.seed = int(seed)
+        self.epoch: int | None = None
         self.by_unit: dict[str, list[int]] = defaultdict(list)
         for i, item in enumerate(dataset.index):
             self.by_unit[item[0]].append(i)
         self.units = list(self.by_unit.keys())
 
+    def set_epoch(self, epoch: int) -> None:
+        """Bind the 1-based training epoch. Resume uses last.pt epoch + 1, never 0."""
+        self.epoch = int(epoch)
+
     def __len__(self) -> int:
         return self.n_draws
 
     def __iter__(self):
-        rng = np.random.RandomState(self.seed)
+        if self.epoch is None:
+            raise RuntimeError("UnitBalancedSampler.set_epoch(epoch) must be called before iterating")
+        # seed+0 is not epoch 1; training epochs are 1-based.
+        rng = np.random.RandomState(int(self.seed) + int(self.epoch))
+        n_units = len(self.units)
         for _ in range(self.n_draws):
-            u = self.units[int(rng.randint(0, len(self.units)))]
+            u = self.units[int(rng.randint(0, n_units))]
             opts = self.by_unit[u]
             yield int(opts[int(rng.randint(0, len(opts)))])
+
+    @staticmethod
+    def draw_stats(n_eligible: int, drawn: list[int]) -> dict[str, int]:
+        """Per-epoch replacement diagnostics from an already-yielded index stream."""
+        return {
+            "n_eligible_windows": int(n_eligible),
+            "n_gradient_draws": int(len(drawn)),
+            "n_unique_sampled_windows": int(len(set(drawn))),
+        }
 
 
 def _collate(batch):
@@ -117,6 +143,7 @@ def _collate(batch):
         "duration": torch.stack([b["duration"] for b in batch]),
         "event": torch.stack([b["event"] for b in batch]),
         "unit_id": [b["unit_id"] for b in batch],
+        "window_index": [int(b["window_index"]) for b in batch],
     }
 
 
@@ -136,6 +163,9 @@ HIST_COLS = [
     "val_metric",
     "val_mae_events",
     "n_val_event_units",
+    "n_eligible_windows",
+    "n_gradient_draws",
+    "n_unique_sampled_windows",
 ]
 
 
@@ -350,6 +380,61 @@ def checkpoints_compatible(saved: dict, current: dict) -> bool:
     return resolve_split_hash(saved) == resolve_split_hash(current)
 
 
+def _load_saved_run_task_config(rdir: Path) -> dict[str, Any] | None:
+    """Experiment snapshot first, else run `config.yaml`. None if the run is legacy."""
+    from pdm.evaluate import load_experiment_snapshot
+
+    snap = load_experiment_snapshot(rdir)
+    if snap:
+        nested = snap.get("config")
+        if isinstance(nested, dict):
+            merged = dict(nested)
+            for key, value in snap.items():
+                if key != "config":
+                    merged[key] = value
+            return merged
+        return dict(snap)
+    cfg_path = Path(rdir) / "config.yaml"
+    if cfg_path.exists():
+        return load_yaml(cfg_path)
+    return None
+
+
+def resume_task_mismatches(
+    live_cfg: dict[str, Any],
+    live_mcfg: dict[str, Any],
+    saved_cfg: dict[str, Any],
+) -> list[str]:
+    """Live YAML/CLI vs saved snapshot for gap / history_length / architecture."""
+    differing: list[str] = []
+    saved_model = dict(saved_cfg.get("model") or {})
+    saved_arch = str(saved_model.get("architecture") or "").strip().lower()
+    live_arch = str(live_mcfg.get("architecture") or "").strip().lower()
+    if saved_arch and live_arch and saved_arch != live_arch:
+        differing.append("architecture")
+    if saved_model.get("history_length") is not None and live_mcfg.get("history_length") is not None:
+        if int(saved_model["history_length"]) != int(live_mcfg["history_length"]):
+            differing.append("history_length")
+    saved_gap = dict(saved_cfg.get("gap") or {})
+    live_gap = dict(live_cfg.get("gap") or {})
+    if any(k in saved_gap or k in live_gap for k in ("gap_multiplier", "sampling_interval_s")):
+        live_k, live_s = filter_gap_params(live_cfg)
+        saved_k, saved_s = filter_gap_params(saved_cfg)
+        if not np.isclose(float(live_k), float(saved_k), rtol=0.0, atol=1e-9):
+            differing.append("gap_multiplier")
+        if not np.isclose(float(live_s), float(saved_s), rtol=0.0, atol=1e-9):
+            differing.append("sampling_interval_s")
+    return differing
+
+
+def _apply_saved_model_to_mcfg(mcfg: dict[str, Any], saved_cfg: dict[str, Any]) -> None:
+    saved_model = dict(saved_cfg.get("model") or {})
+    if saved_model.get("architecture"):
+        mcfg["architecture"] = str(saved_model["architecture"]).lower()
+    if saved_model.get("history_length") is not None:
+        mcfg["history_length"] = int(saved_model["history_length"])
+
+
 def run_training(
     dataset_id: str,
     *,
@@ -403,20 +488,65 @@ def run_training(
         )
 
     processed = load_processed(dataset_id)
+    from pdm.evaluate import IncompatibleDataError, assert_gap_rule_current
+
+    assert_gap_rule_current(processed.get("fingerprint"))
     features = processed["features"]
     units = processed["units"]
     split = processed["split"]
     head = "rul" if dataset_id == "bearings" else "weibull"
+
+    if resume_run_id:
+        rdir_resume = dataset_runs(dataset_id) / resume_run_id
+        saved_task = _load_saved_run_task_config(rdir_resume)
+        if saved_task:
+            task_diff = resume_task_mismatches(cfg, mcfg, saved_task)
+            if task_diff:
+                raise IncompatibleDataError(
+                    task_diff,
+                    detail=(
+                        "Live YAML/CLI gap, history_length, or architecture disagrees with the "
+                        "run snapshot; not rebuilding windows from live YAML"
+                    ),
+                )
+            cfg = saved_task
+            _apply_saved_model_to_mcfg(mcfg, saved_task)
+            mcfg["max_epochs"] = int(launch["max_epochs"])
+
     hist = int(mcfg["history_length"])
     set_seeds(int(mcfg["seed"]))
 
-    windows = build_windows(features, units, hist, dataset_id)
+    gap_kw: dict[str, float] = {}
+    if dataset_id == "filters":
+        k, samp = filter_gap_params(cfg)
+        gap_kw = {"gap_multiplier": k, "sampling_interval_s": samp}
+    windows = build_windows(features, units, hist, dataset_id, **gap_kw)
     train_w = windows[windows["unit_id"].isin(split["train"])]
     val_w = windows[windows["unit_id"].isin(split["validation"])]
     if train_w.empty:
         raise RuntimeError("No training windows. Reduce history_length or prepare data.")
 
-    prep, feat_t = fit_preprocessor(dataset_id, features, units, split, cfg, train_w)
+    rewrite_preprocessing = True
+    saved_prep_path = dataset_runs(dataset_id) / resume_run_id / "preprocessing.json" if resume_run_id else None
+    if saved_prep_path is not None and saved_prep_path.exists():
+        saved_prep = Preprocessor.from_dict(read_json(saved_prep_path))
+        live_prep, _live_feat = fit_preprocessor(dataset_id, features, units, split, cfg, train_w)
+        mismatches = preprocessor_resume_mismatches(saved_prep, live_prep)
+        if mismatches:
+            raise IncompatibleDataError(
+                mismatches,
+                detail=(
+                    "Saved preprocessing.json disagrees with a live fit from current YAML/data "
+                    "on scaler/maps/time_scale_s/feature_pipeline_version; not replacing"
+                ),
+            )
+        prep = saved_prep
+        feat_t = apply_preprocessor(prep, features, dataset_id=dataset_id)
+        rewrite_preprocessing = False
+        current_prep = live_prep
+    else:
+        prep, feat_t = fit_preprocessor(dataset_id, features, units, split, cfg, train_w)
+        current_prep = prep
     device_info = resolve_device(device_pref)
     device = device_info.torch_device
     if device_info.fallback_reason:
@@ -431,7 +561,7 @@ def run_training(
         blob = torch.load(last_path, map_location="cpu", weights_only=False)
         current = compatibility_dict(
             mcfg,
-            prep,
+            current_prep,
             split,
             dataset_id,
             head,
@@ -544,7 +674,8 @@ def run_training(
             "gap_multiplier": prep.gap_multiplier,
             "sampling_interval_s": prep.sampling_interval_s,
         }
-    dump_yaml(rdir / "config.yaml", run_cfg)
+    if not resume_run_id or not (rdir / "config.yaml").exists():
+        dump_yaml(rdir / "config.yaml", run_cfg)
     atomic_write_json(rdir / "split.json", split)
     run_fp = dataset_fingerprint_for_run(processed, split)
     fp_path = rdir / "dataset_fingerprint.json"
@@ -553,7 +684,10 @@ def run_training(
     else:
         run_fp = json.loads(fp_path.read_text(encoding="utf-8"))
     atomic_write_json(rdir / "feature_schema.json", {"feature_names": prep.feature_names, "order": prep.feature_names})
-    atomic_write_json(rdir / "preprocessing.json", prep.to_dict())
+    if rewrite_preprocessing:
+        atomic_write_json(rdir / "preprocessing.json", prep.to_dict())
+    if not resume_run_id:
+        atomic_write_json(rdir / "experiment_snapshot.json", _experiment_snapshot(cfg, mcfg, prep, rdir, dataset_id))
     atomic_write_json(rdir / "environment.json", env)
     manifest_src = project_root() / "data" / "manifest.json"
     if manifest_src.exists():
@@ -598,7 +732,22 @@ def run_training(
                 last_status = "stopped"
                 _log(f"Stop requested at epoch {epoch}")
                 break
-            tr_loss = _run_epoch(model, opt, train_loader, dataset_id, device, mcfg, train=True)
+            sampler.set_epoch(epoch)
+            sampled_idx: list[int] = []
+            tr_loss = _run_epoch(
+                model,
+                opt,
+                train_loader,
+                dataset_id,
+                device,
+                mcfg,
+                train=True,
+                sampled_indices=sampled_idx,
+            )
+            samp_diag = UnitBalancedSampler.draw_stats(len(train_ds), sampled_idx)
+            n_eligible_windows = int(samp_diag["n_eligible_windows"])
+            n_gradient_draws = int(samp_diag["n_gradient_draws"])
+            n_unique_sampled_windows = int(samp_diag["n_unique_sampled_windows"])
             train_stats = _eval_unit_weighted(model, train_diag_loader, dataset_id, device)
             val_stats = _eval_unit_weighted(model, val_loader, dataset_id, device)
             val_metric = val_stats["selection_metric"]
@@ -649,6 +798,9 @@ def run_training(
                 "val_metric": f"{val_metric:.6f}",
                 "val_mae_events": val_stats.get("val_mae_events"),
                 "n_val_event_units": val_stats.get("n_val_event_units"),
+                "n_eligible_windows": n_eligible_windows,
+                "n_gradient_draws": n_gradient_draws,
+                "n_unique_sampled_windows": n_unique_sampled_windows,
             }
             append_line(
                 hist_path,
@@ -657,7 +809,9 @@ def run_training(
             msg = (
                 f"epoch {epoch}/{mcfg['max_epochs']} train_loss={tr_loss:.4f} "
                 f"val_loss={val_stats['val_loss']:.4f} train_metric={train_metric:.4f} "
-                f"val_metric={val_metric:.4f} ({sel_spec['label']}) best_epoch={best_epoch}"
+                f"val_metric={val_metric:.4f} ({sel_spec['label']}) best_epoch={best_epoch} "
+                f"sampled_unique={n_unique_sampled_windows}/{n_eligible_windows} "
+                f"draws={n_gradient_draws}"
             )
             _log(msg)
             append_line(log_path, msg)
@@ -671,6 +825,9 @@ def run_training(
                 val_metric=val_metric,
                 best_epoch=best_epoch,
                 best_metric=best_metric,
+                n_eligible_windows=n_eligible_windows,
+                n_gradient_draws=n_gradient_draws,
+                n_unique_sampled_windows=n_unique_sampled_windows,
                 message=msg,
             )
             atomic_write_json(
@@ -706,10 +863,21 @@ def run_training(
     return {"run_id": run_id, "dir": str(rdir), "status": last_status, "best_epoch": best_epoch, "best_metric": best_metric}
 
 
-def _run_epoch(model, opt, loader, dataset_id, device, mcfg, train: bool) -> float:
+def _run_epoch(
+    model,
+    opt,
+    loader,
+    dataset_id,
+    device,
+    mcfg,
+    train: bool,
+    sampled_indices: list[int] | None = None,
+) -> float:
     model.train(train)
     losses = []
     for batch in loader:
+        if sampled_indices is not None:
+            sampled_indices.extend(int(i) for i in batch["window_index"])
         x = batch["x"].to(device)
         if train:
             opt.zero_grad(set_to_none=True)
@@ -830,13 +998,21 @@ def _save_ckpt(
     )
 
 
-def load_trained_model(run_path: Path, device: str = "cpu", which: str = "best") -> tuple[PDMNet, Preprocessor, dict]:
+def load_trained_model(
+    run_path: Path,
+    device: str = "cpu",
+    which: str = "best",
+    *,
+    verify_checkpoint_hash: bool = True,
+) -> tuple[PDMNet, Preprocessor, dict]:
     ckpt_file = run_path / f"{which}.pt"
     if not ckpt_file.exists():
         ckpt_file = run_path / "last.pt"
     blob = torch.load(ckpt_file, map_location=device, weights_only=False)
     meta = blob["meta"]
-    _verify_loaded_checkpoint(run_path, ckpt_file, blob)
+    _verify_loaded_checkpoint(
+        run_path, ckpt_file, blob, verify_checkpoint_hash=verify_checkpoint_hash
+    )
     prep = Preprocessor.from_dict(json.loads((run_path / "preprocessing.json").read_text()))
     model = PDMNet(
         input_size=int(meta["input_size"]),
@@ -853,13 +1029,19 @@ def load_trained_model(run_path: Path, device: str = "cpu", which: str = "best")
     return model, prep, meta
 
 
-def _verify_loaded_checkpoint(run_path: Path, ckpt_file: Path, blob: dict) -> None:
+def _verify_loaded_checkpoint(
+    run_path: Path,
+    ckpt_file: Path,
+    blob: dict,
+    *,
+    verify_checkpoint_hash: bool = True,
+) -> None:
     """Abort if best.pt bytes or split identity drifted from the run snapshot."""
     from pdm.evaluate import IncompatibleDataError
     from pdm.io_util import read_json
 
     fp_path = run_path / "dataset_fingerprint.json"
-    if fp_path.exists() and ckpt_file.name.startswith("best"):
+    if verify_checkpoint_hash and fp_path.exists() and ckpt_file.name.startswith("best"):
         stored = read_json(fp_path).get("checkpoint_hash")
         if stored and stored != checkpoint_hash(ckpt_file):
             raise IncompatibleDataError(
@@ -875,6 +1057,58 @@ def _verify_loaded_checkpoint(run_path: Path, ckpt_file: Path, blob: dict) -> No
                 ["split_hash"],
                 detail="checkpoint compat split_hash does not match run split.json",
             )
+
+
+def _source_commit() -> str | None:
+    """Best-effort `git rev-parse HEAD`. Never writes git config; null if unavailable."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(project_root()),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    sha = (proc.stdout or "").strip()
+    return sha or None
+
+
+def _experiment_snapshot(
+    cfg: dict[str, Any],
+    mcfg: dict[str, Any],
+    prep: Preprocessor,
+    rdir: Path,
+    dataset_id: str,
+) -> dict[str, Any]:
+    from copy import deepcopy
+
+    from pdm.evaluate import METRICS_VERSION
+    from pdm.preprocessing import FEATURE_PIPELINE_VERSION
+    from pdm.windows import GAP_RULE_VERSION
+
+    snap = deepcopy(cfg)
+    snap["dataset_id"] = dataset_id
+    snap["model"] = dict(mcfg)
+    if dataset_id == "filters":
+        gap = dict(cfg.get("gap") or {})
+        if prep.gap_multiplier is not None:
+            gap["gap_multiplier"] = prep.gap_multiplier
+        if prep.sampling_interval_s is not None:
+            gap["sampling_interval_s"] = prep.sampling_interval_s
+        snap["gap"] = gap
+    snap["preprocessing_hash"] = sha256_file(rdir / "preprocessing.json")
+    snap["source_commit"] = _source_commit()
+    snap["metrics_version"] = METRICS_VERSION
+    snap["gap_rule_version"] = GAP_RULE_VERSION
+    snap["feature_pipeline_version"] = prep.feature_pipeline_version or FEATURE_PIPELINE_VERSION
+    return snap
 
 
 def _environment(device_info) -> dict[str, Any]:
@@ -894,4 +1128,5 @@ def _environment(device_info) -> dict[str, Any]:
         "sklearn": sklearn.__version__,
         "device": device_info.name,
         "fallback_reason": device_info.fallback_reason,
+        "source_commit": _source_commit(),
     }

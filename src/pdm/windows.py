@@ -72,6 +72,7 @@ def raw_numeric_columns(dataset_id: str | None) -> tuple[str, ...]:
 # Filter Δt gaps. sampling_interval_s = CSV Time step 0.1 (assumed minutes) * time_to_seconds 60.
 FILTER_GAP_MULTIPLIER = 3.0
 FILTER_SAMPLING_INTERVAL_S = 6.0
+GAP_RULE_VERSION = "causal_v1"
 
 
 def _dataset_id_from_prefix(prefix: pd.DataFrame) -> str | None:
@@ -143,12 +144,13 @@ def gap_before_from_delta_t(
 ) -> np.ndarray:
     """Boolean ``gap_before`` from Δt.
 
-    Causal (inference): ``gap[i] = dt[i] > k * median(dt[1:i])``. Empty or
-    non-positive past median falls back to ``sampling_interval_s``. Row 0 is
-    never a gap. Future Δt never enter the threshold at i.
+    Causal (prepare parquet, ``build_windows``, inference): ``gap[i] =
+    dt[i] > k * median(dt[1:i])``. Empty or non-positive past median falls
+    back to ``sampling_interval_s``. Row 0 is never a gap. Future Δt never
+    enter the threshold at i.
 
-    Full-file (``causal=False``, prepared parquet / ``build_windows``): one
-    median over ``dt[1:]`` for every row.
+    Full-file (``causal=False``): one median over ``dt[1:]`` for every row.
+    Diagnostics only — must not decide train / val / eval / replay eligibility.
     """
     dt = np.asarray(delta_t_s, dtype=np.float64).reshape(-1)
     n = int(dt.size)
@@ -206,6 +208,67 @@ def recompute_filter_gap_before(
     return out
 
 
+def window_timestamp_reason(timestamps: np.ndarray) -> str:
+    """``valid_history_window`` reason, or ``\"\"`` if finite and strictly increasing."""
+    ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+    if ts.size == 0 or not np.isfinite(ts).all():
+        return "non_finite_timestamps"
+    if ts.size >= 2 and not np.all(np.diff(ts) > 0):
+        return "timestamps_not_strictly_increasing"
+    return ""
+
+
+def diagnostic_fullfile_gap_marker_count(
+    features: pd.DataFrame,
+    *,
+    gap_multiplier: float = FILTER_GAP_MULTIPLIER,
+    sampling_interval_s: float = FILTER_SAMPLING_INTERVAL_S,
+) -> int:
+    """Full-file-median gap markers. Diagnostics only; never eligibility."""
+    if features.empty or "timestamp_s" not in features.columns:
+        return 0
+    n = 0
+    for _, g in features.groupby("unit_id", sort=False):
+        ts = g.sort_values("timestamp_s")["timestamp_s"].to_numpy(dtype=np.float64)
+        dt = np.zeros(ts.size, dtype=np.float64)
+        if ts.size > 1:
+            dt[1:] = np.diff(ts)
+        n += int(
+            gap_before_from_delta_t(
+                dt,
+                gap_multiplier=gap_multiplier,
+                sampling_interval_s=sampling_interval_s,
+                causal=False,
+            ).sum()
+        )
+    return n
+
+
+def _unit_gap_flags(
+    g: pd.DataFrame,
+    dataset_id: str | None,
+    *,
+    gap_multiplier: float | None = None,
+    sampling_interval_s: float | None = None,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """Sorted unit rows and eligibility ``gap_before``.
+
+    Filters recompute causal flags from timestamps (stored parquet is ignored).
+    Bearings keep file-index ``gap_before``; no filter-style Δt median.
+    """
+    out = g.sort_values("timestamp_s").reset_index(drop=True)
+    if dataset_id == "filters":
+        out = recompute_filter_gap_before(
+            out,
+            gap_multiplier=gap_multiplier,
+            sampling_interval_s=sampling_interval_s,
+            causal=True,
+        ).reset_index(drop=True)
+    n = len(out)
+    gap = out["gap_before"].to_numpy() if "gap_before" in out.columns else np.zeros(n, dtype=bool)
+    return out, np.asarray(gap, dtype=bool)
+
+
 def valid_history_window(
     prefix: pd.DataFrame,
     history_length: int,
@@ -241,26 +304,22 @@ def valid_history_window(
 
     g = prefix.sort_values("timestamp_s").reset_index(drop=True)
     ds = dataset_id or _dataset_id_from_prefix(g)
-    if ds == "filters":
-        g = recompute_filter_gap_before(
-            g,
-            gap_multiplier=gap_multiplier,
-            sampling_interval_s=sampling_interval_s,
-            causal=True,
-        ).reset_index(drop=True)
+    g, gap = _unit_gap_flags(
+        g,
+        ds,
+        gap_multiplier=gap_multiplier,
+        sampling_interval_s=sampling_interval_s,
+    )
     n = len(g)
     start = n - history_length
     end = n - 1
     window = g.iloc[start : end + 1]
-    gap = g["gap_before"].to_numpy() if "gap_before" in g.columns else np.zeros(n, dtype=bool)
     if np.asarray(gap[start + 1 : end + 1]).any():
         return False, "gap_in_window"
 
-    ts = window["timestamp_s"].to_numpy(dtype=np.float64)
-    if not np.isfinite(ts).all():
-        return False, "non_finite_timestamps"
-    if ts.size >= 2 and not np.all(np.diff(ts) > 0):
-        return False, "timestamps_not_strictly_increasing"
+    ts_reason = window_timestamp_reason(window["timestamp_s"].to_numpy(dtype=np.float64))
+    if ts_reason:
+        return False, ts_reason
 
     cols = list(required_columns) if required_columns is not None else list(
         raw_numeric_columns(dataset_id or _dataset_id_from_prefix(g))
@@ -276,6 +335,9 @@ def build_windows(
     units: pd.DataFrame,
     history_length: int,
     dataset_id: str,
+    *,
+    gap_multiplier: float | None = None,
+    sampling_interval_s: float | None = None,
 ) -> pd.DataFrame:
     """Fixed-length windows. No future padding. No crossing units or time gaps."""
     if history_length < 1:
@@ -283,17 +345,23 @@ def build_windows(
     unit_meta = units.set_index("unit_id")
     records: list[dict[str, Any]] = []
     for unit_id, g in features.groupby("unit_id", sort=False):
-        g = g.sort_values("timestamp_s").reset_index(drop=True)
+        g, gap = _unit_gap_flags(
+            g,
+            dataset_id,
+            gap_multiplier=gap_multiplier,
+            sampling_interval_s=sampling_interval_s,
+        )
         meta = unit_meta.loc[unit_id]
         event_time = meta.get("event_time_s")
         observed_end = float(meta["observation_end_s"])
         event_observed = int(meta.get("event_observed", 0))
         n = len(g)
-        gap = g["gap_before"].to_numpy() if "gap_before" in g.columns else np.zeros(n, dtype=bool)
         ts = g["timestamp_s"].to_numpy(dtype=np.float64)
         for end in range(history_length - 1, n):
             start = end - history_length + 1
             if gap[start + 1 : end + 1].any():
+                continue
+            if window_timestamp_reason(ts[start : end + 1]):
                 continue
             t = float(ts[end])
             rec: dict[str, Any] = {
@@ -341,6 +409,7 @@ def _empty_split_window_counts() -> dict[str, int]:
         "excluded_gap": 0,
         "excluded_post_event": 0,
         "excluded_insufficient_length": 0,
+        "excluded_timestamps": 0,
     }
 
 
@@ -350,13 +419,17 @@ def count_window_eligibility(
     history_length: int,
     dataset_id: str,
     split: dict[str, Any] | None = None,
+    *,
+    gap_multiplier: float | None = None,
+    sampling_interval_s: float | None = None,
 ) -> dict[str, Any]:
     """Classify every measurement as an eligible window end or an exclusion.
 
     Reasons follow ``build_windows`` skip order: insufficient length, gap in
-    the window interior, then post-event (``t >= event_time_s`` when observed
-    or bearings; ``t >= observation_end_s`` when censored). Does not allocate
-    window tensors. Counts are for ``history_length`` at prepare time.
+    the window interior, non-finite / non-unique / non-monotonic timestamps,
+    then post-event (``t >= event_time_s`` when observed or bearings;
+    ``t >= observation_end_s`` when censored). Does not allocate window
+    tensors. Counts are for ``history_length`` at prepare time.
     """
     if history_length < 1:
         raise ValueError("history_length must be >= 1")
@@ -369,23 +442,39 @@ def count_window_eligibility(
         for uid in ids:
             part_of[uid] = part
 
-    totals = {"eligible": 0, "gap": 0, "post_event": 0, "insufficient_length": 0}
+    totals = {
+        "eligible": 0,
+        "gap": 0,
+        "post_event": 0,
+        "insufficient_length": 0,
+        "timestamps": 0,
+    }
     n_candidates = 0
     if features.empty or units.empty:
         return _window_count_payload(history_length, n_candidates, totals, by_split)
 
     unit_meta = units.set_index("unit_id")
     for unit_id, g in features.groupby("unit_id", sort=False):
-        g = g.sort_values("timestamp_s").reset_index(drop=True)
+        g, gap = _unit_gap_flags(
+            g,
+            dataset_id,
+            gap_multiplier=gap_multiplier,
+            sampling_interval_s=sampling_interval_s,
+        )
         meta = unit_meta.loc[unit_id]
         n = len(g)
         n_candidates += n
-        gap = g["gap_before"].to_numpy() if "gap_before" in g.columns else np.zeros(n, dtype=bool)
         ts = g["timestamp_s"].to_numpy(dtype=np.float64)
         event_time = meta.get("event_time_s")
         observed_end = float(meta["observation_end_s"])
         event_observed = int(meta.get("event_observed", 0))
-        local = {"eligible": 0, "gap": 0, "post_event": 0, "insufficient_length": 0}
+        local = {
+            "eligible": 0,
+            "gap": 0,
+            "post_event": 0,
+            "insufficient_length": 0,
+            "timestamps": 0,
+        }
         for end in range(n):
             if end < history_length - 1:
                 local["insufficient_length"] += 1
@@ -393,6 +482,9 @@ def count_window_eligibility(
             start = end - history_length + 1
             if np.asarray(gap[start + 1 : end + 1]).any():
                 local["gap"] += 1
+                continue
+            if window_timestamp_reason(ts[start : end + 1]):
+                local["timestamps"] += 1
                 continue
             t = float(ts[end])
             if dataset_id == "bearings" or event_observed:
@@ -416,6 +508,7 @@ def count_window_eligibility(
         rec["excluded_gap"] += local["gap"]
         rec["excluded_post_event"] += local["post_event"]
         rec["excluded_insufficient_length"] += local["insufficient_length"]
+        rec["excluded_timestamps"] += local["timestamps"]
     return _window_count_payload(history_length, n_candidates, totals, by_split)
 
 
@@ -429,6 +522,7 @@ def _window_count_payload(
         "gap": int(totals["gap"]),
         "post_event": int(totals["post_event"]),
         "insufficient_length": int(totals["insufficient_length"]),
+        "timestamps": int(totals["timestamps"]),
     }
     return {
         "history_length": int(history_length),

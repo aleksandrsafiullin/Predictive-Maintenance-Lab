@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import pandas as pd
 
@@ -20,7 +21,10 @@ def _optional_horizon(value: Any) -> float | None:
 
 
 ALERT_POLICY_FILENAME = "alert_policy.json"
+ALERT_POLICIES_DIRNAME = "alert_policies"
 ALERT_POLICY_SCHEMA_VERSION = "v1"
+MISSING_FROZEN_POLICY_MESSAGE = "Freeze from Validation first"
+_PROVENANCE_KEYS = ("split", "unit_ids", "checkpoint_hash", "frozen_at")
 ALERT_OUTCOMES = ("timely", "too_early", "late", "miss", "insufficient_coverage")
 ALERT_EPISODE_COLUMNS = (
     "run_id",
@@ -188,6 +192,70 @@ def _row_predicted_rul(row: Mapping[str, Any]) -> float | None:
     return v if _finite(v) else None
 
 
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return None
+    return text
+
+
+def _truthy_flag(value: Any) -> bool:
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"", "nan", "none", "false", "0", "no"}:
+            return False
+        return s in {"true", "1", "yes"}
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return bool(value)
+
+
+def _collecting_from_row(
+    rec: Mapping[str, Any],
+    rul: float | None,
+    *,
+    has_pred_status: bool,
+) -> bool:
+    if has_pred_status:
+        status = _optional_str(rec.get("prediction_status"))
+        if status is not None:
+            return status == "Collecting history"
+    return rul is None
+
+
+def _observed_limit_from_row(
+    rec: Mapping[str, Any],
+    *,
+    has_observed_col: bool,
+    has_dp: bool,
+    pressure_limit_pa: float | None,
+) -> bool:
+    if has_observed_col:
+        return _truthy_flag(rec.get("observed_limit_reached"))
+    if not has_dp or pressure_limit_pa is None:
+        return False
+    try:
+        dp = float(rec["differential_pressure"])
+    except (TypeError, ValueError, KeyError):
+        return False
+    return _finite(dp) and dp > float(pressure_limit_pa)
+
+
 def _empty_alert_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
     return (
         pd.DataFrame(columns=list(ALERT_EPISODE_COLUMNS)),
@@ -200,11 +268,15 @@ def alerts_from_predictions(
     policy: Mapping[str, Any] | AlertPolicy,
     *,
     run_id: str | None = None,
+    pressure_limit_pa: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Re-run `AlertEngine` on frozen `predicted_rul_s`. Does not call the model.
 
-    Non-finite RUL is treated as collecting/gap warmup so a warning cannot survive
-    a hole in predictions without K new confirms. Confirmed time is the K-th step.
+    Prefer persisted `observed_limit_reached`. Else derive from Δp using the
+    caller-supplied `pressure_limit_pa` (run snapshot / dataset config). Do not
+    substitute a hardcoded Pa threshold. Collecting follows
+    `prediction_status == "Collecting history"` (or missing finite RUL when that
+    column is absent). Confirmed time is the K-th step.
     """
     if pred is None:
         return _empty_alert_frames()
@@ -216,6 +288,7 @@ def alerts_from_predictions(
     h = _h_trigger(d)
     k = int(d.get("confirmation_count", 3))
     reset = float(d.get("reset_factor", 1.2))
+    limit = None if pressure_limit_pa is None else float(pressure_limit_pa)
     default_run = run_id
     if default_run is None and "run_id" in frame.columns and len(frame):
         raw_run = frame["run_id"].iloc[0]
@@ -224,7 +297,8 @@ def alerts_from_predictions(
 
     episodes: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
-    has_status = "alert_status" in frame.columns
+    has_pred_status = "prediction_status" in frame.columns
+    has_observed = "observed_limit_reached" in frame.columns
     has_dp = "differential_pressure" in frame.columns
     for uid, group in frame.groupby("unit_id", sort=False):
         g = group.sort_values("timestamp_s", kind="mergesort")
@@ -232,14 +306,13 @@ def alerts_from_predictions(
         engine.reset_unit(str(uid))
         for rec in g.to_dict(orient="records"):
             rul = _row_predicted_rul(rec)
-            status = str(rec.get("alert_status") or "") if has_status else ""
-            collecting = status == "Collecting history" or rul is None
-            observed_limit = status == "Observed limit reached"
-            if not observed_limit and has_dp:
-                try:
-                    observed_limit = float(rec["differential_pressure"]) > 600.0
-                except (TypeError, ValueError):
-                    observed_limit = False
+            collecting = _collecting_from_row(rec, rul, has_pred_status=has_pred_status)
+            observed_limit = _observed_limit_from_row(
+                rec,
+                has_observed_col=has_observed,
+                has_dp=has_dp,
+                pressure_limit_pa=limit,
+            )
             rid = rec.get("run_id", default_run)
             model_id = None
             if rid is not None and not (isinstance(rid, float) and not _finite(rid)):
@@ -305,18 +378,71 @@ def _min_lead(policy: Mapping[str, Any]) -> float:
     return float(v)
 
 
+def last_admissible_confirmation_time_s(
+    event_time_s: float,
+    policy: Mapping[str, Any] | AlertPolicy,
+) -> float | None:
+    """Inclusive last time a confirmed alert can still be timely.
+
+    When ``minimum_action_lead_time > 0``: ``event_time_s - min_lead``.
+    ``H_trigger`` is not this bound. When min_lead is 0, timely confirm requires
+    ``t < event_time``; there is no inclusive last-admissible instant (None).
+    """
+    min_lead = _min_lead(_policy_mapping(policy))
+    if min_lead > 0.0:
+        return float(event_time_s) - min_lead
+    return None
+
+
 def coverage_horizon_s(policy: Mapping[str, Any] | AlertPolicy) -> float:
-    """Lookback that must be observed to score miss vs insufficient_coverage."""
-    d = _policy_mapping(policy)
-    return max(_h_trigger(d), _min_lead(d))
+    """Lookback equal to ``minimum_action_lead_time``, not ``max(H_trigger, lead)``.
+
+    Prefer ``last_admissible_confirmation_time_s``. ``H_trigger`` remains the
+    AlertEngine trigger threshold only.
+    """
+    return _min_lead(_policy_mapping(policy))
 
 
 def has_sufficient_coverage(
     observation_end_s: float,
     event_time_s: float,
     policy: Mapping[str, Any] | AlertPolicy,
+    *,
+    timestamps_s: Iterable[float] | None = None,
 ) -> bool:
-    return float(observation_end_s) >= float(event_time_s) - coverage_horizon_s(policy)
+    """Whether unit observation covers the last admissible confirmation time.
+
+    v1 scores ``observation_end_s`` against that bound (and step timestamps only
+    when ``minimum_action_lead_time == 0``). ``H_trigger`` is not the coverage
+    bound.
+
+    Data coverage is separate from prediction availability: missing sensors are
+    not ``Collecting history``. A v1-covered interval with no timely alert is
+    still a miss even if the model never emitted a finite RUL.
+
+    Known v1 caveats (not scored): K-step confirmation, interior gaps inside the
+    admissible window, and warmup / collecting-history stretches.
+
+    min_lead > 0: sufficient iff ``observation_end_s >= event - min_lead``
+    (inclusive). min_lead == 0: timely confirm requires ``t < event``; sufficient
+    iff at least one timestamp is strictly before the event. Obs_end-only
+    fallback: ``observation_end_s < event_time_s``.
+    """
+    d = _policy_mapping(policy)
+    et = float(event_time_s)
+    last = last_admissible_confirmation_time_s(et, d)
+    if last is not None:
+        return float(observation_end_s) >= last
+    if timestamps_s is not None:
+        for raw in timestamps_s:
+            try:
+                t = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if _finite(t) and t < et:
+                return True
+        return False
+    return float(observation_end_s) < et
 
 
 def classify_alert_outcome(
@@ -325,6 +451,7 @@ def classify_alert_outcome(
     observation_end_s: float,
     policy: Mapping[str, Any] | AlertPolicy,
     confirmed_alert_time_s: float | None = None,
+    timestamps_s: Iterable[float] | None = None,
 ) -> str | None:
     """Classify one confirmed episode (or no alert) against a frozen policy.
 
@@ -335,8 +462,19 @@ def classify_alert_outcome(
     - timely iff lead_time >= minimum_action_lead_time and alert_time < event_time
     - too_early: alert before event and lead_time > max_useful_horizon_s (if set)
     - late: alert at/after event, or before event with lead_time < minimum_action_lead_time
-    - miss: no alert and the pre-event window was observed
-    - insufficient_coverage: no alert and observation_end < event - coverage_horizon
+    - miss: no alert and v1 coverage is sufficient. A covered interval with no
+      timely alert is still a miss even if the model never emitted a finite RUL.
+    - insufficient_coverage: no alert and observation does not reach the last
+      admissible confirmation time (see ``has_sufficient_coverage``).
+
+    ``H_trigger`` is the AlertEngine threshold only; it is not the coverage bound.
+    Data coverage is separate from prediction availability; missing sensors are
+    not ``Collecting history``.
+
+    Known v1 caveats (not scored): K-step confirmation, interior gaps inside the
+    admissible window, and warmup / collecting-history stretches. Coverage uses
+    unit ``observation_end_s`` (and step timestamps only when
+    ``minimum_action_lead_time == 0``).
 
     Returns None when there is no finite event to score.
     """
@@ -359,9 +497,50 @@ def classify_alert_outcome(
             return "timely"
         return "late"
 
-    if has_sufficient_coverage(float(observation_end_s), et, d):
+    if has_sufficient_coverage(
+        float(observation_end_s), et, d, timestamps_s=timestamps_s
+    ):
         return "miss"
     return "insufficient_coverage"
+
+
+def _coerce_unit_ids(value: Any) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(u) for u in value)
+
+
+def merge_alert_policy_provenance(
+    payload: Mapping[str, Any],
+    source: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Re-attach provenance after `to_dict()`. Hash stays H/K/lead only."""
+    out = dict(payload)
+    blob = dict(source or {})
+    for key in _PROVENANCE_KEYS:
+        if key not in blob:
+            continue
+        val = blob[key]
+        if val is None:
+            continue
+        if key == "unit_ids":
+            ids = _coerce_unit_ids(val)
+            if ids is None:
+                continue
+            out[key] = list(ids)
+        else:
+            text = str(val).strip()
+            if text:
+                out[key] = text
+    return out
+
+
+def _reject_validation_ui_for_test_split(source: str, split: Any) -> None:
+    split_name = None if split is None else str(split).strip()
+    if str(source) == "validation_ui" and split_name == "test":
+        raise ValueError("source='validation_ui' cannot be recorded for split='test'")
 
 
 @dataclass(frozen=True)
@@ -373,6 +552,10 @@ class AlertPolicy:
     max_useful_horizon_s: float | None = None
     schema_version: str = ALERT_POLICY_SCHEMA_VERSION
     source: str = "config"
+    split: str | None = None
+    unit_ids: tuple[str, ...] | None = None
+    checkpoint_hash: str | None = None
+    frozen_at: str | None = None
 
     @property
     def warning_horizon_s(self) -> float:
@@ -391,7 +574,15 @@ class AlertPolicy:
             "source": str(self.source),
         }
         payload["policy_hash"] = alert_policy_hash(payload)
-        return payload
+        return merge_alert_policy_provenance(
+            payload,
+            {
+                "split": self.split,
+                "unit_ids": None if self.unit_ids is None else list(self.unit_ids),
+                "checkpoint_hash": self.checkpoint_hash,
+                "frozen_at": self.frozen_at,
+            },
+        )
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> AlertPolicy:
@@ -400,6 +591,7 @@ class AlertPolicy:
         if lead is None:
             lead = default_minimum_action_lead_time(h, data)
         max_u = data.get("max_useful_horizon_s")
+        split_raw = _optional_str(data.get("split"))
         return cls(
             H_trigger=h,
             minimum_action_lead_time=float(lead),
@@ -408,6 +600,10 @@ class AlertPolicy:
             max_useful_horizon_s=_optional_horizon(max_u),
             schema_version=str(data.get("schema_version") or ALERT_POLICY_SCHEMA_VERSION),
             source=str(data.get("source") or "config"),
+            split=split_raw,
+            unit_ids=_coerce_unit_ids(data.get("unit_ids")),
+            checkpoint_hash=_optional_str(data.get("checkpoint_hash")),
+            frozen_at=_optional_str(data.get("frozen_at")),
         )
 
 
@@ -456,13 +652,17 @@ def alert_policy_hash(policy: Mapping[str, Any] | AlertPolicy) -> str:
 def alert_policy_eval_block(policy: Mapping[str, Any] | AlertPolicy) -> dict[str, Any]:
     """Fields 15b copies into `evaluation_config.json` (nested under `alert_policy`)."""
     fields = canonical_alert_policy_fields(policy)
+    d = _policy_mapping(policy)
     h = float(fields["H_trigger"])
-    return {
+    block: dict[str, Any] = {
         **fields,
         "warning_horizon_s": h,
         "K": int(fields["confirmation_count"]),
         "policy_hash": alert_policy_hash(fields),
     }
+    if d.get("source"):
+        block["source"] = str(d["source"])
+    return block
 
 
 def copy_alert_policy_into_evaluation_config(
@@ -498,6 +698,10 @@ def build_alert_policy(
     alerts_cfg: Mapping[str, Any] | None = None,
     source: str = "config",
     fill_max_useful_from_cfg: bool = True,
+    split: str | None = None,
+    unit_ids: Iterable[str] | None = None,
+    checkpoint_hash: str | None = None,
+    frozen_at: str | None = None,
 ) -> dict[str, Any]:
     h = float(H_trigger)
     lead = (
@@ -508,6 +712,7 @@ def build_alert_policy(
     # Explicit None (frozen JSON null) must not be replaced by YAML.
     if fill_max_useful_from_cfg and max_useful_horizon_s is None and alerts_cfg is not None:
         max_useful_horizon_s = default_max_useful_horizon_s(h, alerts_cfg)
+    _reject_validation_ui_for_test_split(source, split)
     return AlertPolicy(
         H_trigger=h,
         minimum_action_lead_time=lead,
@@ -515,6 +720,10 @@ def build_alert_policy(
         reset_factor=float(reset_factor),
         max_useful_horizon_s=_optional_horizon(max_useful_horizon_s),
         source=source,
+        split=None if split is None else str(split).strip() or None,
+        unit_ids=_coerce_unit_ids(unit_ids),
+        checkpoint_hash=_optional_str(checkpoint_hash),
+        frozen_at=_optional_str(frozen_at),
     ).to_dict()
 
 
@@ -526,7 +735,41 @@ def load_alert_policy(run_dir: Path) -> dict[str, Any] | None:
     path = alert_policy_path(run_dir)
     if not path.exists():
         return None
-    return AlertPolicy.from_mapping(read_json(path)).to_dict()
+    raw = read_json(path)
+    payload = AlertPolicy.from_mapping(raw).to_dict()
+    return merge_alert_policy_provenance(payload, raw if isinstance(raw, Mapping) else {})
+
+
+def require_frozen_alert_policy(run_dir: Path) -> dict[str, Any]:
+    loaded = load_alert_policy(run_dir)
+    if loaded is None:
+        raise FileNotFoundError(
+            f"No {ALERT_POLICY_FILENAME} under {run_dir}. {MISSING_FROZEN_POLICY_MESSAGE}"
+        )
+    return loaded
+
+
+def _archive_stamp(frozen_at: str | None) -> str:
+    if not frozen_at:
+        return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return "".join(ch if ch.isalnum() or ch in "-T" else "" for ch in str(frozen_at))
+
+
+def archive_alert_policy(run_dir: Path, path: Path | None = None) -> Path:
+    """Copy current `alert_policy.json` into `alert_policies/` before replace."""
+    src = Path(path) if path is not None else alert_policy_path(run_dir)
+    raw = read_json(src) if src.exists() else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    stamp = _archive_stamp(raw.get("frozen_at") if isinstance(raw, dict) else None)
+    digest = str(raw.get("policy_hash") or alert_policy_hash(raw))[:8]
+    dest_dir = Path(run_dir) / ALERT_POLICIES_DIRNAME
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{stamp}_{digest}.json"
+    if dest.exists():
+        dest = dest_dir / f"{stamp}_{digest}_{datetime.now(timezone.utc).strftime('%H%M%S%f')}.json"
+    shutil.copy2(src, dest)
+    return dest
 
 
 def save_alert_policy(
@@ -536,12 +779,19 @@ def save_alert_policy(
     overwrite: bool = True,
 ) -> dict[str, Any]:
     path = alert_policy_path(run_dir)
+    mapping = _policy_mapping(policy)
+    _reject_validation_ui_for_test_split(
+        str(mapping.get("source") or "config"), mapping.get("split")
+    )
     if path.exists() and not overwrite:
         loaded = load_alert_policy(run_dir)
         if loaded is None:
             raise FileNotFoundError(path)
         return loaded
-    payload = AlertPolicy.from_mapping(_policy_mapping(policy)).to_dict()
+    if path.exists() and overwrite:
+        archive_alert_policy(run_dir, path)
+    payload = AlertPolicy.from_mapping(mapping).to_dict()
+    payload = merge_alert_policy_provenance(payload, mapping)
     payload["frozen_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload["policy_hash"] = alert_policy_hash(payload)
     atomic_write_json(path, payload)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from pdm.evaluate import METRICS_VERSION
 from pdm.worker import read_status, worker_alive
 
 
@@ -424,22 +425,32 @@ def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables
     eval_id = "20260101T000000Z_abcd1234"
     edir = rdir / "evaluations" / eval_id
     edir.mkdir(parents=True)
+    val_uid = split["validation"][0]
     test_uid = split["test"][0]
     (edir / "predictions.csv").write_text(
         "run_id,unit_id,timestamp_s,predicted_rul_s\n"
-        f"{run_id},{test_uid},60.0,100.0\n"
-        f"{run_id},{test_uid},120.0,90.0\n",
+        f"{run_id},{val_uid},60.0,100.0\n"
+        f"{run_id},{val_uid},120.0,90.0\n",
         encoding="utf-8",
     )
     atomic_write_json(
         edir / "evaluation_config.json",
-        {"eval_id": eval_id, "run_id": run_id, "metrics_version": "v0"},
+        {
+            "eval_id": eval_id,
+            "run_id": run_id,
+            "metrics_version": METRICS_VERSION,
+            "evaluate_mask": {
+                "split": "validation",
+                "unit_ids": list(split["validation"]),
+                "blind_benchmark": False,
+            },
+        },
     )
     (edir / "metrics.json").write_text(
         json.dumps(
             {
                 "eval_id": eval_id,
-                "metrics_version": "v0",
+                "metrics_version": METRICS_VERSION,
                 "primary_metric": "equal_weight_unit_mae",
                 "equal_weight_unit_mae": 120.0,
                 "pooled_mae": 130.0,
@@ -474,7 +485,7 @@ def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables
     )
     (edir / "metrics_by_unit.csv").write_text(
         "unit_id,mae,rmse,alert_outcome,lead_time_s,has_sufficient_coverage,baseline_coverage_fraction\n"
-        f"{test_uid},120.0,140.0,timely,600.0,True,1.0\n",
+        f"{val_uid},120.0,140.0,timely,600.0,True,1.0\n",
         encoding="utf-8",
     )
     (edir / "alerts.csv").write_text("unit_id\n", encoding="utf-8")
@@ -493,6 +504,8 @@ def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables
         "split": split,
         "report": bundle["report"],
         "test_ids": list(split["test"]),
+        "validation_ids": list(split["validation"]),
+        "run_fingerprint": {"checkpoint_hash": "ckpt_freeze_test"},
     }
 
     monkeypatch.setattr("pdm.data.prepare.processed_ready", lambda ds: ds == "bearings")
@@ -508,6 +521,8 @@ def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables
     at.sidebar.radio[1].set_value("Test & Replay")
     at.run()
     assert not at.exception
+    mode = next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options))
+    assert mode.value == "Validation"
     eval_box = next(s for s in at.selectbox if "Evaluation" in s.label)
     assert eval_id in list(eval_box.options)
     captions = "\n".join(str(w.value) for w in at.caption)
@@ -526,6 +541,12 @@ def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables
     assert "H_trigger" in policy
     assert "minimum_action_lead_time" in policy
     assert policy["warning_horizon_s"] == policy["H_trigger"]
+    assert policy["source"] == "validation_ui"
+    assert policy["split"] == "validation"
+    assert policy["unit_ids"] == list(split["validation"])
+    assert policy.get("policy_hash")
+    assert policy.get("frozen_at")
+    assert policy.get("checkpoint_hash") == "ckpt_freeze_test"
 
     markdown = "\n".join(str(w.value) for w in at.markdown)
     assert eval_id in markdown
@@ -533,7 +554,9 @@ def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables
     assert "Equal-weight unit MAE" in metric_by_label
     frames = [w.value for w in at.dataframe]
     unit_tbl = next(df for df in frames if "Unit" in df.columns and "MAE (s)" in df.columns)
-    assert test_uid in set(unit_tbl["Unit"].astype(str))
+    listed = set(unit_tbl["Unit"].astype(str))
+    assert val_uid in listed
+    assert test_uid not in listed
     assert "Alert class" in unit_tbl.columns
     assert "Lead time (s)" in unit_tbl.columns
     assert "Sufficient coverage" in unit_tbl.columns
@@ -572,7 +595,7 @@ def test_evaluation_unit_table_lists_all_test_units():
     table = metrics_by_unit_display_frame(
         by,
         dataset_id="bearings",
-        test_ids=["Bearing1_3", "Bearing2_5", "Bearing3_5"],
+        unit_ids=["Bearing1_3", "Bearing2_5", "Bearing3_5"],
     )
     assert list(table["Unit"]) == ["Bearing1_3", "Bearing2_5", "Bearing3_5"]
     assert "MAE (s)" in table.columns
@@ -591,7 +614,7 @@ def test_evaluation_unit_table_lists_all_test_units():
             "has_sufficient_coverage": [False],
         }
     )
-    ftable = metrics_by_unit_display_frame(filt, dataset_id="filters", test_ids=["Test_1", "Test_2"])
+    ftable = metrics_by_unit_display_frame(filt, dataset_id="filters", unit_ids=["Test_1", "Test_2"])
     assert list(ftable["Unit"]) == ["Test_1", "Test_2"]
     assert "Official RUL at prefix end (s)" in ftable.columns
     assert "Predicted RUL at prefix end (s)" in ftable.columns
@@ -648,7 +671,7 @@ def test_app_filters_evaluation_shows_prefix_end_official_rul(
     )
     atomic_write_json(
         edir / "evaluation_config.json",
-        {"eval_id": eval_id, "run_id": run_id, "metrics_version": "v0"},
+        {"eval_id": eval_id, "run_id": run_id, "metrics_version": METRICS_VERSION},
     )
     (edir / "metrics.json").write_text(
         json.dumps(
@@ -720,6 +743,11 @@ def test_app_filters_evaluation_shows_prefix_end_official_rul(
     at.sidebar.radio[1].set_value("Test & Replay")
     at.run()
     assert not at.exception
+    next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options)).set_value(
+        "Research"
+    )
+    at.run()
+    assert not at.exception
     metric_by_label = {m.label: m.value for m in at.metric}
     assert "Prefix-end MAE" in metric_by_label
     assert "Validation NLL (all units)" in metric_by_label
@@ -781,6 +809,9 @@ def test_app_replay_screen_loads_without_eval(monkeypatch, tmp_path, tiny_bearin
     assert not at.exception
     errors = "\n".join(str(w.value) for w in at.error)
     assert "predictions.csv" in errors or "Evaluate test set" in errors
+    infos = "\n".join(str(w.value) for w in at.info)
+    assert "Run Evaluate validation set." in infos
+    assert "Run Evaluate test set." not in infos
     play = next(b for b in at.button if b.label == "Play")
     assert play.disabled
     captions = "\n".join(str(w.value) for w in at.caption)
@@ -822,7 +853,7 @@ def _launch_bearing_replay(monkeypatch, tmp_path, tiny_bearing_tables, *, run_id
         (edir / "alerts.csv").write_text(alert_text, encoding="utf-8")
         atomic_write_json(
             edir / "evaluation_config.json",
-            {"eval_id": eval_id, "run_id": run_id, "metrics_version": "v0"},
+            {"eval_id": eval_id, "run_id": run_id, "metrics_version": METRICS_VERSION},
         )
         pred_path = edir / "predictions.csv"
     else:
@@ -868,6 +899,11 @@ def test_app_replay_legacy_predictions_unlock_play(monkeypatch, tmp_path, tiny_b
     at.sidebar.radio[1].set_value("Test & Replay")
     at.run()
     assert not at.exception
+    next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options)).set_value(
+        "Research"
+    )
+    at.run()
+    assert not at.exception
     play = next(b for b in at.button if b.label == "Play")
     assert not play.disabled
     captions = "\n".join(str(w.value) for w in at.caption)
@@ -893,6 +929,11 @@ def test_replay_play_advances_without_clicks(monkeypatch, tmp_path, tiny_bearing
     at.run()
     assert not at.exception
     at.sidebar.radio[1].set_value("Test & Replay")
+    at.run()
+    assert not at.exception
+    next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options)).set_value(
+        "Research"
+    )
     at.run()
     assert not at.exception
     play = next(b for b in at.button if b.label == "Play")
@@ -922,3 +963,542 @@ def test_replay_play_advances_without_clicks(monkeypatch, tmp_path, tiny_bearing
     assert not at.exception
     assert at.session_state["playing"] is False
     assert int(at.session_state["replay_step"]) == frozen
+
+
+_HK_JOB_KEYS = (
+    "H_trigger",
+    "warning_horizon_s",
+    "confirmation_count",
+    "minimum_action_lead_time",
+    "max_useful_horizon_s",
+)
+
+
+def _set_replay_mode(at, mode: str):
+    radio = next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options))
+    radio.set_value(mode)
+    at.run()
+    assert not at.exception
+    return at
+
+
+def _open_replay_screen(at, *, mode: str | None = None):
+    at.sidebar.radio[1].set_value("Test & Replay")
+    at.run()
+    assert not at.exception
+    if mode and mode != "Validation":
+        _set_replay_mode(at, mode)
+    return at
+
+
+def _bearing_replay_harness(monkeypatch, tmp_path, tiny_bearing_tables, *, run_id, captured=None):
+    from pdm.splits import bearings_split
+
+    features, units = tiny_bearing_tables
+    split = bearings_split(units)
+    bundle = _fake_processed_bundle("bearings", features, units, split)
+    rdir = tmp_path / run_id
+    rdir.mkdir(parents=True, exist_ok=True)
+    fake_row = {
+        "dataset_id": "bearings",
+        "run_id": run_id,
+        "path": str(rdir),
+        "has_best": True,
+        "has_last": True,
+        "status": "completed",
+        "n_evaluations": 0,
+    }
+    bound = {
+        "features": features,
+        "units": units,
+        "split": split,
+        "report": bundle["report"],
+        "test_ids": list(split["test"]),
+        "validation_ids": list(split["validation"]),
+        "run_fingerprint": {"checkpoint_hash": "ckpt_modes"},
+    }
+    monkeypatch.setattr("pdm.data.prepare.processed_ready", lambda ds: ds == "bearings")
+    monkeypatch.setattr("pdm.data.prepare.load_processed", lambda ds: bundle)
+    monkeypatch.setattr("pdm.experiments.list_runs", lambda ds=None: [fake_row])
+    monkeypatch.setattr("pdm.experiments.run_dir", lambda ds, rid: rdir)
+    monkeypatch.setattr("pdm.replay.bind_replay_to_run", lambda *a, **k: bound)
+    monkeypatch.setattr("pdm.worker.worker_alive", lambda: False)
+    if captured is not None:
+        monkeypatch.setattr("pdm.cli.spawn_worker", lambda job: captured.update(job) or captured)
+    return rdir, split
+
+
+def _write_simple_eval(
+    rdir,
+    eval_id,
+    *,
+    run_id,
+    split_name,
+    unit_ids,
+    blind,
+    pred_uid,
+    alerts_body: str | None = None,
+    alert_policy: dict | None = None,
+):
+    from pdm.io_util import atomic_write_json
+
+    edir = rdir / "evaluations" / eval_id
+    edir.mkdir(parents=True)
+    (edir / "predictions.csv").write_text(
+        "run_id,unit_id,timestamp_s,predicted_rul_s\n"
+        f"{run_id},{pred_uid},60.0,100.0\n"
+        f"{run_id},{pred_uid},120.0,90.0\n",
+        encoding="utf-8",
+    )
+    cfg = {
+        "eval_id": eval_id,
+        "run_id": run_id,
+        "metrics_version": METRICS_VERSION,
+        "evaluate_mask": {
+            "split": split_name,
+            "unit_ids": [str(u) for u in unit_ids],
+            "blind_benchmark": bool(blind),
+        },
+    }
+    if alert_policy is not None:
+        cfg["alert_policy"] = dict(alert_policy)
+    atomic_write_json(edir / "evaluation_config.json", cfg)
+    (edir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "eval_id": eval_id,
+                "metrics_version": METRICS_VERSION,
+                "primary_metric": "equal_weight_unit_mae",
+                "equal_weight_unit_mae": 1.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (edir / "metrics_by_unit.csv").write_text(
+        "unit_id,mae,rmse,alert_outcome,lead_time_s,has_sufficient_coverage,baseline_coverage_fraction\n"
+        f"{pred_uid},1.0,1.0,timely,600.0,True,1.0\n",
+        encoding="utf-8",
+    )
+    (edir / "alerts.csv").write_text(alerts_body or "unit_id\n", encoding="utf-8")
+    return edir
+
+
+def test_evaluations_for_mode_filters_legacy_and_blind():
+    from pdm.experiments import evaluation_mask_view, evaluations_for_mode
+
+    val = {
+        "eval_id": "val",
+        "evaluate_mask": {"split": "validation", "blind_benchmark": False, "unit_ids": ["V"]},
+    }
+    research = {"eval_id": "research", "evaluate_mask": evaluation_mask_view(None)}
+    blind = {
+        "eval_id": "blind",
+        "evaluate_mask": {"split": "test", "blind_benchmark": True, "unit_ids": ["T"]},
+    }
+    rows = [val, research, blind]
+    assert [e["eval_id"] for e in evaluations_for_mode(rows, "Validation")] == ["val"]
+    assert [e["eval_id"] for e in evaluations_for_mode(rows, "Test")] == ["blind"]
+    assert [e["eval_id"] for e in evaluations_for_mode(rows, "Research")] == ["research", "blind"]
+
+
+def test_app_replay_test_mode_freeze_does_not_write(monkeypatch, tmp_path, tiny_bearing_tables):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+
+    rdir, _split = _bearing_replay_harness(
+        monkeypatch, tmp_path, tiny_bearing_tables, run_id="bearings_gru_test_no_freeze"
+    )
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at, mode="Test")
+    freeze = next(b for b in at.button if "Freeze alert policy" in b.label)
+    assert freeze.disabled
+    assert not (rdir / "alert_policy.json").exists()
+
+
+def test_app_replay_validation_evaluate_job_research_no_policy_write(
+    monkeypatch, tmp_path, tiny_bearing_tables
+):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+
+    captured: dict = {}
+    rdir, _split = _bearing_replay_harness(
+        monkeypatch,
+        tmp_path,
+        tiny_bearing_tables,
+        run_id="bearings_gru_val_eval",
+        captured=captured,
+    )
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at)
+    eval_btn = next(b for b in at.button if "Evaluate validation set" in b.label)
+    eval_btn.click()
+    at.run()
+    assert not at.exception
+    assert captured.get("kind") == "evaluate"
+    assert captured.get("split_name") == "validation"
+    assert captured.get("policy_mode") == "research"
+    assert "H_trigger" in captured
+    assert "confirmation_count" in captured
+    assert not (rdir / "alert_policy.json").exists()
+
+
+def test_app_replay_test_evaluate_missing_freeze_no_spawn(monkeypatch, tmp_path, tiny_bearing_tables):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+
+    captured: dict = {}
+    _bearing_replay_harness(
+        monkeypatch,
+        tmp_path,
+        tiny_bearing_tables,
+        run_id="bearings_gru_test_eval_missing",
+        captured=captured,
+    )
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at, mode="Test")
+    captions = "\n".join(str(w.value) for w in at.caption)
+    assert "Freeze from Validation first" in captions
+    eval_btn = next(b for b in at.button if "Evaluate test set" in b.label)
+    eval_btn.click()
+    at.run()
+    assert not at.exception
+    errors = "\n".join(str(w.value) for w in at.error)
+    assert "Freeze from Validation first" in errors
+    assert captured == {}
+
+
+def test_app_replay_test_evaluate_frozen_omits_hk(monkeypatch, tmp_path, tiny_bearing_tables):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+
+    captured: dict = {}
+    rdir, _split = _bearing_replay_harness(
+        monkeypatch,
+        tmp_path,
+        tiny_bearing_tables,
+        run_id="bearings_gru_test_eval_frozen",
+        captured=captured,
+    )
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at)
+    next(b for b in at.button if "Freeze alert policy" in b.label).click()
+    at.run()
+    assert (rdir / "alert_policy.json").exists()
+    captured.clear()
+    _set_replay_mode(at, "Test")
+    captions = "\n".join(str(w.value) for w in at.caption)
+    assert "Test evaluation uses the frozen validation-selected policy." in captions
+    next(b for b in at.button if "Evaluate test set" in b.label).click()
+    at.run()
+    assert not at.exception
+    assert captured.get("kind") == "evaluate"
+    assert captured.get("split_name") == "test"
+    assert captured.get("policy_mode") == "frozen"
+    assert set(_HK_JOB_KEYS).isdisjoint(captured)
+
+
+def test_app_replay_test_play_uses_frozen_hk_not_widgets(
+    monkeypatch, tmp_path, tiny_bearing_tables
+):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+    from pdm.replay import rescore_replay_alerts as real_rescore
+
+    seen: dict = {}
+
+    def _wrap(predictions, policy, **kwargs):
+        seen["H_trigger"] = float(policy["H_trigger"])
+        seen["confirmation_count"] = int(policy.get("confirmation_count") or 0)
+        return real_rescore(predictions, policy, **kwargs)
+
+    monkeypatch.setattr("pdm.replay.rescore_replay_alerts", _wrap)
+    rdir, split = _bearing_replay_harness(
+        monkeypatch, tmp_path, tiny_bearing_tables, run_id="bearings_gru_test_frozen_play"
+    )
+    test_uid = split["test"][0]
+    _write_simple_eval(
+        rdir,
+        "20260107T000000Z_blindhk",
+        run_id="bearings_gru_test_frozen_play",
+        split_name="test",
+        unit_ids=list(split["test"]),
+        blind=True,
+        pred_uid=test_uid,
+    )
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at)
+    h = next(n for n in at.number_input if "H_trigger" in n.label)
+    h.set_value(7.0)
+    at.run()
+    next(b for b in at.button if "Freeze alert policy" in b.label).click()
+    at.run()
+    frozen = json.loads((rdir / "alert_policy.json").read_text(encoding="utf-8"))
+    frozen_h = float(frozen["H_trigger"])
+    assert frozen_h == 7.0 * 60.0
+    h = next(n for n in at.number_input if "H_trigger" in n.label)
+    h.set_value(41.0)
+    at.run()
+    widget_h = float(next(n for n in at.number_input if "H_trigger" in n.label).value) * 60.0
+    assert widget_h != frozen_h
+    _set_replay_mode(at, "Test")
+    leftover = float(next(n for n in at.number_input if "H_trigger" in n.label).value) * 60.0
+    assert leftover == widget_h
+    markdown = "\n".join(str(w.value) for w in at.markdown)
+    assert "420 s (7 min)" in markdown
+    assert "2460 s (41 min)" not in markdown
+    view = at.session_state["_replay_view"]
+    assert float(view["h_s"]) == frozen_h
+    play = next(b for b in at.button if b.label == "Play")
+    assert not play.disabled
+    assert seen.get("H_trigger") == frozen_h
+    assert seen.get("H_trigger") != leftover
+
+
+def test_app_replay_test_play_uses_stored_eval_h_without_freeze(
+    monkeypatch, tmp_path, tiny_bearing_tables
+):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+    from pdm.replay import rescore_replay_alerts as real_rescore
+
+    seen: dict = {}
+
+    def _wrap(predictions, policy, **kwargs):
+        seen["H_trigger"] = float(policy["H_trigger"])
+        return real_rescore(predictions, policy, **kwargs)
+
+    monkeypatch.setattr("pdm.replay.rescore_replay_alerts", _wrap)
+    rdir, split = _bearing_replay_harness(
+        monkeypatch, tmp_path, tiny_bearing_tables, run_id="bearings_gru_test_stored_h"
+    )
+    stored_h = 123.0
+    _write_simple_eval(
+        rdir,
+        "20260108T000000Z_storedh",
+        run_id="bearings_gru_test_stored_h",
+        split_name="test",
+        unit_ids=list(split["test"]),
+        blind=True,
+        pred_uid=split["test"][0],
+        alert_policy={
+            "H_trigger": stored_h,
+            "warning_horizon_s": stored_h,
+            "minimum_action_lead_time": 60.0,
+            "confirmation_count": 2,
+        },
+    )
+    assert not (rdir / "alert_policy.json").exists()
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at)
+    next(n for n in at.number_input if "H_trigger" in n.label).set_value(41.0)
+    at.run()
+    leftover = float(next(n for n in at.number_input if "H_trigger" in n.label).value) * 60.0
+    assert leftover != stored_h
+    _set_replay_mode(at, "Test")
+    assert not (rdir / "alert_policy.json").exists()
+    markdown = "\n".join(str(w.value) for w in at.markdown)
+    assert "123 s (2.05 min)" in markdown
+    assert "2460 s (41 min)" not in markdown
+    play = next(b for b in at.button if b.label == "Play")
+    assert not play.disabled
+    assert seen.get("H_trigger") == stored_h
+    assert seen.get("H_trigger") != leftover
+
+
+def test_app_replay_test_play_blocked_without_freeze_or_stored_h(
+    monkeypatch, tmp_path, tiny_bearing_tables
+):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+    from pdm.replay import rescore_replay_alerts as real_rescore
+
+    seen: dict = {}
+
+    def _wrap(predictions, policy, **kwargs):
+        seen["H_trigger"] = float(policy["H_trigger"])
+        return real_rescore(predictions, policy, **kwargs)
+
+    monkeypatch.setattr("pdm.replay.rescore_replay_alerts", _wrap)
+    rdir, split = _bearing_replay_harness(
+        monkeypatch, tmp_path, tiny_bearing_tables, run_id="bearings_gru_test_no_policy"
+    )
+    _write_simple_eval(
+        rdir,
+        "20260109T000000Z_nopolicy",
+        run_id="bearings_gru_test_no_policy",
+        split_name="test",
+        unit_ids=list(split["test"]),
+        blind=True,
+        pred_uid=split["test"][0],
+    )
+    assert not (rdir / "alert_policy.json").exists()
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at)
+    next(n for n in at.number_input if "H_trigger" in n.label).set_value(41.0)
+    at.run()
+    leftover = float(next(n for n in at.number_input if "H_trigger" in n.label).value) * 60.0
+    assert leftover == 41.0 * 60.0
+    _set_replay_mode(at, "Test")
+    play = next(b for b in at.button if b.label == "Play")
+    assert play.disabled
+    errors = "\n".join(str(w.value) for w in at.error)
+    assert "Freeze from Validation first" in errors
+    assert "widget" in errors.lower()
+    markdown = "\n".join(str(w.value) for w in at.markdown)
+    assert "2460 s (41 min)" not in markdown
+    assert "unavailable" in markdown
+    assert seen == {}
+
+
+def test_app_replay_test_mode_excludes_validation_eval(monkeypatch, tmp_path, tiny_bearing_tables):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+
+    rdir, split = _bearing_replay_harness(
+        monkeypatch, tmp_path, tiny_bearing_tables, run_id="bearings_gru_eval_picker"
+    )
+    val_id = "20260104T000000Z_val0001"
+    test_id = "20260104T000000Z_test0001"
+    _write_simple_eval(
+        rdir,
+        val_id,
+        run_id="bearings_gru_eval_picker",
+        split_name="validation",
+        unit_ids=list(split["validation"]),
+        blind=False,
+        pred_uid=split["validation"][0],
+    )
+    _write_simple_eval(
+        rdir,
+        test_id,
+        run_id="bearings_gru_eval_picker",
+        split_name="test",
+        unit_ids=list(split["test"]),
+        blind=True,
+        pred_uid=split["test"][0],
+    )
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at)
+    val_box = next(s for s in at.selectbox if "Evaluation" in s.label)
+    assert val_id in list(val_box.options)
+    assert test_id not in list(val_box.options)
+    _set_replay_mode(at, "Test")
+    test_box = next(s for s in at.selectbox if "Evaluation" in s.label)
+    assert test_id in list(test_box.options)
+    assert val_id not in list(test_box.options)
+
+
+def test_app_replay_play_disabled_uid_not_in_mask(monkeypatch, tmp_path, tiny_bearing_tables):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+
+    rdir, split = _bearing_replay_harness(
+        monkeypatch, tmp_path, tiny_bearing_tables, run_id="bearings_gru_play_mask"
+    )
+    eval_id = "20260105T000000Z_mask0001"
+    _write_simple_eval(
+        rdir,
+        eval_id,
+        run_id="bearings_gru_play_mask",
+        split_name="validation",
+        unit_ids=["Bearing1_1"],
+        blind=False,
+        pred_uid=split["validation"][0],
+    )
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at)
+    play = next(b for b in at.button if b.label == "Play")
+    assert play.disabled
+    errors = "\n".join(str(w.value) for w in at.error)
+    assert "unit mask" in errors.lower() or "not in this evaluation" in errors.lower()
+
+
+def test_app_replay_research_rescore_does_not_rewrite_alerts(
+    monkeypatch, tmp_path, tiny_bearing_tables
+):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+
+    rdir, split = _bearing_replay_harness(
+        monkeypatch, tmp_path, tiny_bearing_tables, run_id="bearings_gru_research_rescore"
+    )
+    eval_id = "20260106T000000Z_blind01"
+    marker = "FROZEN_BLIND_ALERT_ROW\n"
+    edir = _write_simple_eval(
+        rdir,
+        eval_id,
+        run_id="bearings_gru_research_rescore",
+        split_name="test",
+        unit_ids=list(split["test"]),
+        blind=True,
+        pred_uid=split["test"][0],
+        alerts_body=marker,
+    )
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at, mode="Research")
+    captions = "\n".join(str(w.value) for w in at.caption)
+    assert "Research — not a blind benchmark." in captions
+    h = next(n for n in at.number_input if "H_trigger" in n.label)
+    h.set_value(float(h.value) + 1.0)
+    at.run()
+    assert not at.exception
+    assert edir.joinpath("alerts.csv").read_text(encoding="utf-8") == marker
+    play = next(b for b in at.button if b.label == "Play")
+    assert not play.disabled
+    unit_box = next(s for s in at.selectbox if s.label == "Unit")
+    assert split["validation"][0] not in list(unit_box.options)
+    assert split["test"][0] in list(unit_box.options)
+
+
+def test_app_replay_research_evaluate_job_is_test_research(
+    monkeypatch, tmp_path, tiny_bearing_tables
+):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+
+    captured: dict = {}
+    rdir, split = _bearing_replay_harness(
+        monkeypatch,
+        tmp_path,
+        tiny_bearing_tables,
+        run_id="bearings_gru_research_eval",
+        captured=captured,
+    )
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_replay_screen(at, mode="Research")
+    freeze = next(b for b in at.button if "Freeze alert policy" in b.label)
+    assert freeze.disabled
+    next(b for b in at.button if "Evaluate test set" in b.label).click()
+    at.run()
+    assert not at.exception
+    assert captured.get("kind") == "evaluate"
+    assert captured.get("split_name") == "test"
+    assert captured.get("policy_mode") == "research"
+    assert "H_trigger" in captured
+    assert not (rdir / "alert_policy.json").exists()
+    unit_box = next(s for s in at.selectbox if s.label == "Unit")
+    assert split["validation"][0] not in list(unit_box.options)

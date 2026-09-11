@@ -67,15 +67,17 @@ alerts:
   # max_useful_horizon_s: optional; omit or null = no too_early cap
 
 gap:
-  # Inference (replay/predict): on prefix rows 0..t,
+  # Prepare parquet, build_windows, count_window_eligibility, replay, and predict
+  # all use the same causal rule on prefix rows 0..t:
   #   gap[i] = delta_t_s[i] > gap_multiplier * median(delta_t_s[1:i])
   # Future timestamps never enter the median. Row 0 is never a gap.
   # When the prefix has no past Δt (i < 2) or that median is non-positive,
   # compare against sampling_interval_s.
+  # Full-file median (causal=False) is a Data-screen diagnostic only and
+  # must not decide train / val / eval / replay eligibility.
   # sampling_interval_s = CSV Time step 0.1 (assumed minutes) * time_to_seconds 60.
   # Internal 6 s interval on the assumed scale — not a verified wall-clock period.
   # Documented from CSV spacing, not a MATLAB field. Do not change time_to_seconds.
-  # Prepared parquet may still store full-file median(Δt) gaps for offline build_windows.
   gap_multiplier: 3.0
   sampling_interval_s: 6.0
   do_not_window_across_gap: true

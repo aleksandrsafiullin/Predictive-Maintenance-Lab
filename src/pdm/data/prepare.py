@@ -27,7 +27,12 @@ from pdm.splits import (
     populate_origin_unit_id,
     split_hash,
 )
-from pdm.windows import count_window_eligibility
+from pdm.windows import (
+    GAP_RULE_VERSION,
+    count_window_eligibility,
+    diagnostic_fullfile_gap_marker_count,
+    filter_gap_params,
+)
 
 ProgressFn = Callable[[str, dict[str, Any]], None]
 
@@ -80,6 +85,12 @@ def load_processed(dataset_id: str) -> dict[str, Any]:
     split = read_json(d / "split.json")
     report = read_json(d / "data_report.json") if (d / "data_report.json").exists() else {}
     fingerprint = load_processed_fingerprint(d, split, dataset_id)
+    schema: dict[str, Any] = {}
+    schema_path = d / "feature_schema.json"
+    if schema_path.exists():
+        schema = read_json(schema_path)
+    # Train/eval gate this field from processed_fingerprint.json only.
+    # Do not fill from feature_schema.json (schema-only ≠ current).
     return {
         "features": features,
         "units": units,
@@ -88,6 +99,8 @@ def load_processed(dataset_id: str) -> dict[str, Any]:
         "dir": d,
         "fingerprint": fingerprint,
         "dataset_version": fingerprint.get("dataset_version"),
+        "feature_schema": schema,
+        "gap_rule_version": fingerprint.get("gap_rule_version"),
     }
 
 
@@ -138,6 +151,9 @@ def dataset_fingerprint_for_run(
     fp.setdefault("split_protocol", split.get("protocol"))
     if split.get("dataset_id"):
         fp.setdefault("dataset_id", split["dataset_id"])
+    nested = processed.get("fingerprint") or {}
+    if nested.get("gap_rule_version") is not None:
+        fp["gap_rule_version"] = nested["gap_rule_version"]
     return fp
 
 
@@ -221,6 +237,7 @@ def write_processed_version(
     schema = {
         "dataset_id": dataset_id,
         "feature_pipeline_version": FEATURE_PIPELINE_VERSION,
+        "gap_rule_version": GAP_RULE_VERSION,
         "feature_columns": [c for c in features.columns],
         "measurement_contract": ["dataset_id", "unit_id", "timestamp_s"],
         "forbidden_model_inputs": [
@@ -264,6 +281,7 @@ def write_processed_version(
             file_hashes=hashes,
             split=split,
             created_at=created_at,
+            gap_rule_version=GAP_RULE_VERSION,
         )
         report = _data_report(dataset_id, features, units, split, cfg, sensor_note, inspection)
         report.update(
@@ -272,6 +290,7 @@ def write_processed_version(
                 "split_protocol": split.get("protocol"),
                 "split_hash": fingerprint["split_hash"],
                 "feature_pipeline_version": FEATURE_PIPELINE_VERSION,
+                "gap_rule_version": GAP_RULE_VERSION,
                 "features_hash": hashes["features.parquet"],
                 "units_hash": hashes["units.parquet"],
                 "split_json_hash": hashes["split.json"],
@@ -305,12 +324,13 @@ def build_processed_fingerprint(
     file_hashes: dict[str, str],
     split: dict[str, Any],
     created_at: str | None = None,
+    gap_rule_version: str | None = None,
 ) -> dict[str, Any]:
     features_h = file_hashes.get("features.parquet", "")
     units_h = file_hashes.get("units.parquet", "")
     split_h = file_hashes.get("split.json", "")
     schema_h = file_hashes.get("feature_schema.json", "")
-    return {
+    out: dict[str, Any] = {
         "dataset_id": dataset_id,
         "dataset_version": dataset_version,
         "created_at": created_at,
@@ -326,6 +346,9 @@ def build_processed_fingerprint(
         "split_json_hash_short": sha256_short(split_h),
         "feature_schema_hash_short": sha256_short(schema_h),
     }
+    if gap_rule_version is not None:
+        out["gap_rule_version"] = gap_rule_version
+    return out
 
 
 def _fingerprint_from_files(
@@ -418,10 +441,25 @@ def _data_report(dataset_id, features, units, split, cfg, sensor_note, inspectio
             "n_missing": int(s.isna().sum()),
         }
     history_length = int((cfg.get("model") or {}).get("history_length", 20))
+    gap_kw: dict[str, float] = {}
+    gap_diagnostics: dict[str, Any] | None = None
+    if dataset_id == "filters":
+        k, samp = filter_gap_params(cfg)
+        gap_kw = {"gap_multiplier": k, "sampling_interval_s": samp}
+        n_fullfile = diagnostic_fullfile_gap_marker_count(
+            features, gap_multiplier=k, sampling_interval_s=samp
+        )
+        n_causal = int(features["gap_before"].sum()) if "gap_before" in features.columns else 0
+        gap_diagnostics = {
+            "eligibility_rule": GAP_RULE_VERSION,
+            "n_causal_gap_markers": n_causal,
+            "n_fullfile_gap_markers": n_fullfile,
+            "fullfile_is_diagnostic_only": True,
+        }
     window_counts = count_window_eligibility(
-        features, units, history_length, dataset_id, split
+        features, units, history_length, dataset_id, split, **gap_kw
     )
-    return {
+    payload: dict[str, Any] = {
         "dataset_id": dataset_id,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "n_units": int(units.shape[0]),
@@ -478,6 +516,9 @@ def _data_report(dataset_id, features, units, split, cfg, sensor_note, inspectio
             else {}
         ),
     }
+    if gap_diagnostics is not None:
+        payload["gap_diagnostics"] = gap_diagnostics
+    return payload
 
 
 def _events_vs_censoring(dataset_id: str, units: pd.DataFrame) -> dict[str, Any]:

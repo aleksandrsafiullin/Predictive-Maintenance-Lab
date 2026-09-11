@@ -5,7 +5,7 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 import numpy as np
 import pandas as pd
@@ -16,8 +16,8 @@ from pdm.alerts import (
     classify_alert_outcome,
     confirmed_lead_time_s,
     copy_alert_policy_into_evaluation_config,
-    ensure_alert_policy,
     has_sufficient_coverage,
+    require_frozen_alert_policy,
     resolve_alert_policy,
 )
 from pdm.baselines import coverage_stats
@@ -62,6 +62,8 @@ class IncompatibleDataError(RuntimeError):
 
 
 DEFAULT_BEARINGS_NEAR_EVENT_ZONES_S = (3600.0, 1800.0, 600.0)
+EXPERIMENT_SNAPSHOT_NAME = "experiment_snapshot.json"
+_LEGACY_PRESSURE_LIMIT_PA = 600.0
 
 
 def mae(y_hat: np.ndarray, y: np.ndarray) -> float:
@@ -228,8 +230,68 @@ def load_near_event_zones_s(cfg: dict[str, Any] | None) -> list[float]:
     """Frozen config zones. Never derived from test residuals."""
     raw = ((cfg or {}).get("evaluation") or {}).get("near_event_zones_s")
     if not raw:
+        nested = (cfg or {}).get("config")
+        if isinstance(nested, dict):
+            raw = (nested.get("evaluation") or {}).get("near_event_zones_s")
+    if not raw:
         return [float(z) for z in DEFAULT_BEARINGS_NEAR_EVENT_ZONES_S]
     return [float(z) for z in raw]
+
+
+def load_experiment_snapshot(rdir: Path) -> dict[str, Any] | None:
+    """Resolved task snapshot written at train. None if the run is legacy."""
+    path = Path(rdir) / EXPERIMENT_SNAPSHOT_NAME
+    if not path.exists():
+        return None
+    from pdm.io_util import read_json
+
+    data = read_json(path)
+    if not isinstance(data, dict):
+        raise ValueError(f"experiment_snapshot.json must be an object: {path}")
+    return data
+
+
+def _pressure_limit_from_mapping(blob: Mapping[str, Any] | None) -> float | None:
+    if not blob:
+        return None
+    val = blob.get("pressure_limit_pa")
+    if val is None:
+        nested = blob.get("config")
+        if isinstance(nested, Mapping):
+            val = nested.get("pressure_limit_pa")
+    if val is None:
+        return None
+    return float(val)
+
+
+def load_run_pressure_limit_pa(rdir: Path, fallback: float | None = None) -> float:
+    """Snapshot Δp threshold when present; else caller fallback (legacy 04 YAML)."""
+    snap = load_experiment_snapshot(rdir)
+    if snap is not None:
+        val = _pressure_limit_from_mapping(snap)
+        if val is not None:
+            return val
+    if fallback is None:
+        return float(_LEGACY_PRESSURE_LIMIT_PA)
+    return float(fallback)
+
+
+def resolve_run_task_config(
+    rdir: Path, live_cfg: Mapping[str, Any] | None = None
+) -> tuple[dict[str, Any], bool]:
+    """Task config for evaluate. Snapshot wins; live YAML only if the file is missing."""
+    live = dict(live_cfg or {})
+    snap = load_experiment_snapshot(rdir)
+    if snap is None:
+        return live, True
+    nested = snap.get("config")
+    if isinstance(nested, dict):
+        merged = dict(nested)
+        for key, value in snap.items():
+            if key != "config":
+                merged[key] = value
+        return merged, False
+    return dict(snap), False
 
 
 def equal_weight_unit_mae_by_zone(
@@ -607,8 +669,13 @@ def build_rul_metrics(
 
 
 def fingerprint_mismatches(saved: dict[str, Any], current: dict[str, Any]) -> list[str]:
-    """Field-by-field fingerprint diff. `split_hash` accepts legacy `split_fingerprint`."""
+    """Field-by-field fingerprint diff. `split_hash` accepts legacy `split_fingerprint`.
+
+    ``gap_rule_version`` is compared to the expected constant, not saved==current.
+    Missing on both sides is a mismatch.
+    """
     from pdm.splits import resolve_split_hash
+    from pdm.windows import GAP_RULE_VERSION
 
     differing: list[str] = []
     for field in _JSON_COMPARE_FIELDS:
@@ -618,7 +685,46 @@ def fingerprint_mismatches(saved: dict[str, Any], current: dict[str, Any]) -> li
             sv, cv = saved.get(field), current.get(field)
         if sv != cv:
             differing.append(field)
+    _extend_unique(differing, expected_constant_mismatches(saved, current, "gap_rule_version", GAP_RULE_VERSION))
     return differing
+
+
+def expected_constant_mismatches(
+    saved: dict[str, Any],
+    current: dict[str, Any],
+    field: str,
+    expected: Any,
+) -> list[str]:
+    """True mismatch if saved or current is not ``expected`` (missing ≠ expected)."""
+    if saved.get(field) != expected or current.get(field) != expected:
+        return [field]
+    return []
+
+
+def assert_gap_rule_current(fp: Mapping[str, Any] | None) -> None:
+    """Refuse train/eval when processed fingerprint is not ``GAP_RULE_VERSION``.
+
+    Source is ``processed_fingerprint.json`` only. A ``feature_schema.json``
+    value must not satisfy this gate.
+    """
+    from pdm.windows import GAP_RULE_VERSION
+
+    blob = dict(fp or {})
+    nested = blob.get("fingerprint")
+    if isinstance(nested, dict):
+        blob = nested
+    version = blob.get("gap_rule_version")
+    if version != GAP_RULE_VERSION:
+        raise IncompatibleDataError(
+            ["gap_rule_version"],
+            detail=(
+                f"gap_rule_version={version!r} is not {GAP_RULE_VERSION!r}; "
+                "re-run prepare so gap flags are causal"
+            ),
+        )
+
+
+require_current_gap_rule = assert_gap_rule_current
 
 
 def _extend_unique(dst: list[str], extra: list[str]) -> list[str]:
@@ -679,10 +785,12 @@ def bind_evaluation_to_run(
 
     Never returns the live split from `load_processed()` when a run snapshot exists.
     CLI `--force` skips the abort; UI must not pass force.
+    Fingerprint / file-hash / split / gap_rule_version mismatches are data incompatible.
+    METRICS_VERSION / coverage-definition drift is evaluation-method-changed, not IncompatibleDataError.
     """
     from pdm.data.prepare import load_processed, load_processed_fingerprint, resolve_processed_dir
     from pdm.experiments import load_run_snapshot
-    from pdm.io_util import read_json
+    from pdm.io_util import read_json, sha256_file
     from pdm.splits import resolve_split_hash, split_hash
 
     snap = load_run_snapshot(rdir)
@@ -698,10 +806,23 @@ def bind_evaluation_to_run(
     if resolve_split_hash(current_fp) is None and live_split:
         current_fp["split_hash"] = split_hash(live_split)
 
+    assert_gap_rule_current(current_fp)
+
     differing = fingerprint_mismatches(run_fp, current_fp)
     _extend_unique(differing, _processed_file_hash_mismatches(run_fp, processed_dir))
     _extend_unique(differing, _live_split_hash_mismatch(run_fp, live_split))
     _extend_unique(differing, _checkpoint_hash_mismatch(run_fp, rdir))
+
+    exp_snap = load_experiment_snapshot(rdir)
+    snapshot_missing = exp_snap is None
+    snapshot_metrics_version = None if exp_snap is None else exp_snap.get("metrics_version")
+    evaluation_method_changed = (not snapshot_missing) and snapshot_metrics_version != METRICS_VERSION
+    stored_prep_hash = None if exp_snap is None else exp_snap.get("preprocessing_hash")
+    if stored_prep_hash:
+        prep_path = Path(rdir) / "preprocessing.json"
+        if not prep_path.exists() or sha256_file(prep_path) != stored_prep_hash:
+            _extend_unique(differing, ["preprocessing_hash"])
+
     if differing and not force:
         raise IncompatibleDataError(differing)
 
@@ -718,6 +839,10 @@ def bind_evaluation_to_run(
         "forced": bool(differing and force),
         "protocol": run_split.get("protocol"),
         "test_ids": list(run_split.get("test") or []),
+        "validation_ids": list(run_split.get("validation") or []),
+        "snapshot_missing": snapshot_missing,
+        "evaluation_method_changed": bool(evaluation_method_changed),
+        "snapshot_metrics_version": snapshot_metrics_version,
     }
 
 
@@ -728,7 +853,7 @@ _FILTER_TIME_SCALE_REPORT_KEYS = (
     "original_time_unit",
 )
 
-METRICS_VERSION = "v0"
+METRICS_VERSION = "v1"
 _ALERT_DEPENDENT_PRED_COLUMNS = ("alert_status",)
 ALERT_UNIT_COLUMNS = (
     "n_alert_episodes",
@@ -787,7 +912,11 @@ def publish_eval_dir(staging: Path, dest: Path) -> None:
 
 
 def prediction_export_frame(pred: pd.DataFrame) -> pd.DataFrame:
-    """Drop H/K / alert-policy columns so predictions.csv is independent of alert settings."""
+    """Drop H/K / alert-policy columns so predictions.csv is independent of alert settings.
+
+    Keeps current sensor/model state (`observed_limit_reached`, `prediction_status`,
+    `valid_history_reason`, `differential_pressure`). Those are not future GT.
+    """
     drop = [c for c in _ALERT_DEPENDENT_PRED_COLUMNS if c in pred.columns]
     return pred.drop(columns=drop) if drop else pred.copy()
 
@@ -799,11 +928,16 @@ def _evaluation_config(
     dataset_id: str,
     run_fp: dict[str, Any],
     split: dict[str, Any],
-    test_ids: list[str],
     checkpoint_sha: str,
+    test_ids: list[str] | None = None,
+    split_name: Literal["validation", "test"] = "test",
+    unit_ids: list[str] | None = None,
+    source: str | None = None,
+    blind_benchmark: bool = False,
 ) -> dict[str, Any]:
     from pdm.splits import resolve_split_hash, split_hash
 
+    ids = [str(u) for u in (unit_ids if unit_ids is not None else (test_ids or []))]
     cfg: dict[str, Any] = {
         "eval_id": eval_id,
         "run_id": run_id,
@@ -811,11 +945,14 @@ def _evaluation_config(
         "checkpoint_hash": checkpoint_sha,
         "metrics_version": METRICS_VERSION,
         "evaluate_mask": {
-            "split": "test",
+            "split": split_name,
             "protocol": split.get("protocol"),
-            "unit_ids": [str(u) for u in test_ids],
+            "unit_ids": ids,
+            "blind_benchmark": bool(blind_benchmark),
         },
     }
+    if source is not None:
+        cfg["source"] = str(source)
     for field in _EVAL_CONFIG_FP_FIELDS:
         if field == "split_hash":
             cfg["split_hash"] = resolve_split_hash(run_fp) or split_hash(split)
@@ -860,10 +997,99 @@ def filter_time_scale_from_bound(bound: dict[str, Any]) -> dict[str, Any]:
     return {key: report[key] for key in _FILTER_TIME_SCALE_REPORT_KEYS if key in report}
 
 
+POLICY_MODES = ("research", "frozen")
+EVAL_SPLIT_NAMES = ("validation", "test")
+
+
+def hk_overrides_present(
+    *,
+    warning_horizon_s: float | None = None,
+    H_trigger: float | None = None,
+    confirmation_count: int | None = None,
+    minimum_action_lead_time: float | None = None,
+    max_useful_horizon_s: float | None = None,
+) -> bool:
+    return any(
+        v is not None
+        for v in (
+            warning_horizon_s,
+            H_trigger,
+            confirmation_count,
+            minimum_action_lead_time,
+            max_useful_horizon_s,
+        )
+    )
+
+
+def policy_mode_from_hk_overrides(**hk: Any) -> str:
+    """CLI: any H/K flag → research (never write). None of them → frozen."""
+    return "research" if hk_overrides_present(**hk) else "frozen"
+
+
+def normalize_policy_mode(policy_mode: str | None, *, hk_present: bool) -> str:
+    if policy_mode is None or str(policy_mode).strip() == "":
+        return "research" if hk_present else "frozen"
+    mode = str(policy_mode).strip()
+    if mode not in POLICY_MODES:
+        raise ValueError(f"policy_mode must be 'research' or 'frozen', got {mode!r}")
+    return mode
+
+
+def research_eval_source(split_name: str) -> str:
+    return "validation_eval" if split_name == "validation" else "research"
+
+
+def generate_split_predictions(
+    *,
+    features: pd.DataFrame,
+    predictor: Any,
+    dataset_id: str,
+    run_id: str,
+    split_name: Literal["validation", "test"],
+    unit_ids: list[str],
+    history_length: int,
+    policy: Mapping[str, Any],
+    train_units: pd.DataFrame,
+    pressure_limit_pa: float,
+    truth_units: pd.DataFrame,
+) -> pd.DataFrame:
+    """Replay every listed unit. Predictions.csv stays H/K-independent after export."""
+    from pdm.replay import replay_unit
+
+    if split_name not in EVAL_SPLIT_NAMES:
+        raise ValueError(f"split_name must be 'validation' or 'test', got {split_name!r}")
+    h = float(policy["H_trigger"])
+    k = int(policy["confirmation_count"])
+    reset = float(policy.get("reset_factor", 1.2))
+    pred_frames: list[pd.DataFrame] = []
+    for uid in unit_ids:
+        meas = features[features["unit_id"] == uid]
+        out = replay_unit(
+            meas,
+            predictor,
+            dataset_id=dataset_id,
+            unit_id=str(uid),
+            run_id=run_id,
+            history_length=int(history_length),
+            warning_horizon_s=float(h),
+            confirmation_count=k,
+            reset_factor=reset,
+            train_units=train_units,
+            pressure_limit_pa=pressure_limit_pa,
+            truth_units=truth_units,
+        )
+        pred_frames.append(out["predictions"])
+    if not pred_frames:
+        return pd.DataFrame()
+    return pd.concat(pred_frames, ignore_index=True)
+
+
 def evaluate_run(
     dataset_id: str,
     run_id: str,
     *,
+    split_name: Literal["validation", "test"] = "test",
+    policy_mode: str | None = None,
     warning_horizon_s: float | None = None,
     H_trigger: float | None = None,
     confirmation_count: int | None = None,
@@ -877,8 +1103,10 @@ def evaluate_run(
     from pdm.io_util import atomic_write_json, atomic_write_text, checkpoint_hash, read_json
     from pdm.paths import dataset_runs
     from pdm.predict import Predictor
-    from pdm.replay import replay_unit
     from pdm.train import load_trained_model
+
+    if split_name not in EVAL_SPLIT_NAMES:
+        raise ValueError(f"split_name must be 'validation' or 'test', got {split_name!r}")
 
     rdir = dataset_runs(dataset_id) / run_id
     bound = bind_evaluation_to_run(rdir, dataset_id, force=force)
@@ -886,56 +1114,82 @@ def evaluate_run(
     units = bound["units"]
     split = bound["split"]
     run_fp = dict(bound["run_fingerprint"] or {})
-    cfg = load_dataset_config(dataset_id)
-    dev = resolve_device(device)
-    model, prep, meta = load_trained_model(rdir, device=dev.torch_device, which="best")
-    predictor = Predictor(model, prep, history_length=int(meta["history_length"]), device=dev.torch_device)
-    train_units = units[units["unit_id"].isin(split["train"])]
-    alerts_cfg = dict(cfg.get("alerts") or {})
-    default_h = default_horizon_s(
-        train_units, float(alerts_cfg.get("horizon_fraction_of_median_train", 0.10))
-    )
-    policy = resolve_alert_policy(
-        rdir,
-        alerts_cfg=alerts_cfg,
-        H_trigger=H_trigger,
+    if split_name == "validation":
+        unit_ids = [str(u) for u in (bound.get("validation_ids") or split.get("validation") or [])]
+    else:
+        unit_ids = [str(u) for u in (bound.get("test_ids") or split.get("test") or [])]
+
+    hk_present = hk_overrides_present(
         warning_horizon_s=warning_horizon_s,
+        H_trigger=H_trigger,
         confirmation_count=confirmation_count,
         minimum_action_lead_time=minimum_action_lead_time,
         max_useful_horizon_s=max_useful_horizon_s,
-        default_h_trigger=default_h,
-        source="evaluate",
     )
-    # Freeze on first eval if the validation picker has not written a file yet.
-    # Later H/K changes do not rewrite this file or saved predictions.csv.
-    ensure_alert_policy(rdir, policy)
+    mode = normalize_policy_mode(policy_mode, hk_present=hk_present)
+
+    live_cfg = load_dataset_config(dataset_id)
+    cfg, snapshot_missing = resolve_run_task_config(rdir, live_cfg)
+    snapshot_missing = bool(bound.get("snapshot_missing", snapshot_missing))
+    alerts_cfg = dict(cfg.get("alerts") or {})
+    train_units = units[units["unit_id"].isin(split["train"])]
+    if mode == "frozen":
+        # Ignore CLI/widget H/K. Missing file must fail — never first-write YAML defaults.
+        policy = require_frozen_alert_policy(rdir)
+        eval_source = str(policy.get("source") or "validation_ui")
+        blind_benchmark = split_name == "test"
+    else:
+        default_h = default_horizon_s(
+            train_units, float(alerts_cfg.get("horizon_fraction_of_median_train", 0.10))
+        )
+        eval_source = research_eval_source(split_name)
+        policy = resolve_alert_policy(
+            rdir,
+            alerts_cfg=alerts_cfg,
+            H_trigger=H_trigger,
+            warning_horizon_s=warning_horizon_s,
+            confirmation_count=confirmation_count,
+            minimum_action_lead_time=minimum_action_lead_time,
+            max_useful_horizon_s=max_useful_horizon_s,
+            default_h_trigger=default_h,
+            source=eval_source,
+        )
+        policy["source"] = eval_source
+        blind_benchmark = False
+
+    dev = resolve_device(device)
+    model, prep, meta = load_trained_model(
+        rdir,
+        device=dev.torch_device,
+        which="best",
+        verify_checkpoint_hash=not force,
+    )
+    predictor = Predictor(model, prep, history_length=int(meta["history_length"]), device=dev.torch_device)
     h = float(policy["H_trigger"])
     k = int(policy["confirmation_count"])
-    test_ids = list(bound["test_ids"])
-    pred_frames = []
-    for uid in test_ids:
-        meas = features[features["unit_id"] == uid]
-        out = replay_unit(
-            meas,
-            predictor,
-            dataset_id=dataset_id,
-            unit_id=uid,
-            run_id=run_id,
-            history_length=int(meta["history_length"]),
-            warning_horizon_s=float(h),
-            confirmation_count=k,
-            reset_factor=float(policy["reset_factor"]),
-            train_units=train_units,
-            pressure_limit_pa=float(cfg.get("pressure_limit_pa", 600.0)),
-            truth_units=units,
-        )
-        pred_frames.append(out["predictions"])
-    preds = pd.concat(pred_frames, ignore_index=True) if pred_frames else pd.DataFrame()
+    live_limit = live_cfg.get("pressure_limit_pa")
+    if live_limit is None:
+        live_limit = cfg.get("pressure_limit_pa")
+    pressure_limit_pa = load_run_pressure_limit_pa(rdir, live_limit)
+    preds = generate_split_predictions(
+        features=features,
+        predictor=predictor,
+        dataset_id=dataset_id,
+        run_id=run_id,
+        split_name=split_name,
+        unit_ids=unit_ids,
+        history_length=int(meta["history_length"]),
+        policy=policy,
+        train_units=train_units,
+        pressure_limit_pa=pressure_limit_pa,
+        truth_units=units,
+    )
     if not preds.empty:
         preds = attach_actual_rul(preds, units, dataset_id)
     pred_export = prediction_export_frame(preds)
 
-    ckpt_sha = run_fp.get("checkpoint_hash") or checkpoint_hash(rdir / "best.pt")
+    expected_ckpt = run_fp.get("checkpoint_hash")
+    ckpt_sha = checkpoint_hash(rdir / "best.pt")
     eval_id, staging, dest = allocate_eval_staging(rdir)
     try:
         eval_cfg = copy_alert_policy_into_evaluation_config(
@@ -945,12 +1199,22 @@ def evaluate_run(
                 dataset_id=dataset_id,
                 run_fp=run_fp,
                 split=split,
-                test_ids=test_ids,
+                split_name=split_name,
+                unit_ids=unit_ids,
                 checkpoint_sha=str(ckpt_sha),
+                source=eval_source,
+                blind_benchmark=blind_benchmark,
             ),
             policy,
             metrics_version=METRICS_VERSION,
         )
+        eval_cfg["snapshot_missing"] = snapshot_missing
+        eval_cfg["evaluation_method_changed"] = bool(bound.get("evaluation_method_changed"))
+        if bound.get("snapshot_metrics_version") is not None:
+            eval_cfg["snapshot_metrics_version"] = bound.get("snapshot_metrics_version")
+        eval_cfg["pressure_limit_pa"] = pressure_limit_pa
+        if expected_ckpt and str(expected_ckpt) != str(ckpt_sha):
+            eval_cfg["expected_checkpoint_hash"] = str(expected_ckpt)
         atomic_write_json(staging / "evaluation_config.json", eval_cfg)
         atomic_write_text(staging / "predictions.csv", pred_export.to_csv(index=False))
         metrics, by_unit = build_rul_metrics(
@@ -961,7 +1225,7 @@ def evaluate_run(
             eval_id=eval_id,
             run_id=run_id,
             split=split,
-            test_ids=test_ids,
+            test_ids=unit_ids,
             bound=bound,
             rdir=rdir,
         )
@@ -973,6 +1237,7 @@ def evaluate_run(
             units=units,
             eval_dir=staging,
             run_id=run_id,
+            pressure_limit_pa=pressure_limit_pa,
         )
         metrics = read_json(staging / "metrics.json")
         publish_eval_dir(staging, dest)
@@ -1082,7 +1347,11 @@ def summarize_alert_metrics(
     units: pd.DataFrame,
     policy: Mapping[str, Any],
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
-    """Score every confirmed episode. miss / insufficient_coverage are per unit with no alert."""
+    """Score every confirmed episode. miss / insufficient_coverage are per unit with no alert.
+
+    v1 coverage uses unit ``observation_end_s``. When ``minimum_action_lead_time == 0``,
+    step timestamps decide whether any sample is strictly before the event.
+    """
     last_ts: dict[str, float] = {}
     if not steps.empty and "unit_id" in steps.columns:
         for uid, g in steps.groupby("unit_id", sort=False):
@@ -1136,6 +1405,9 @@ def summarize_alert_metrics(
     for uid in scored_ids:
         event, obs, event_source = lookup.get(uid, (None, None, None))
         unit_steps = steps[steps["unit_id"].astype(str) == uid]
+        unit_ts = None
+        if not unit_steps.empty and "timestamp_s" in unit_steps.columns:
+            unit_ts = unit_steps["timestamp_s"].to_numpy(dtype=np.float64)
         tw = time_weighted_warning_share(
             unit_steps["timestamp_s"].to_numpy(dtype=np.float64),
             unit_steps["warning_active"].to_numpy(dtype=bool),
@@ -1152,7 +1424,9 @@ def summarize_alert_metrics(
         if event is not None:
             n_event += 1
             if obs is not None:
-                coverage = has_sufficient_coverage(float(obs), event, policy)
+                coverage = has_sufficient_coverage(
+                    float(obs), event, policy, timestamps_s=unit_ts
+                )
                 if coverage:
                     n_cov += 1
         if n_ep:
@@ -1172,6 +1446,7 @@ def summarize_alert_metrics(
                 observation_end_s=float(obs) if obs is not None else 0.0,
                 policy=policy,
                 confirmed_alert_time_s=None,
+                timestamps_s=unit_ts,
             )
             if unit_outcome == "miss":
                 n_miss += 1
@@ -1240,6 +1515,7 @@ def run_alert_evaluation(
     units: pd.DataFrame,
     eval_dir: Path | None = None,
     run_id: str | None = None,
+    pressure_limit_pa: float | None = None,
 ) -> dict[str, Any]:
     """Score alerts from frozen predictions.csv. Never regenerates or rewrites predictions."""
     from pdm.io_util import atomic_write_json, atomic_write_text, read_json
@@ -1253,7 +1529,9 @@ def run_alert_evaluation(
         pred_bytes = None
         pred = predictions if predictions is not None else pd.DataFrame()
 
-    episodes, steps = alerts_from_predictions(pred, policy, run_id=run_id)
+    episodes, steps = alerts_from_predictions(
+        pred, policy, run_id=run_id, pressure_limit_pa=pressure_limit_pa
+    )
     alert_block, by_unit, episodes = summarize_alert_metrics(
         episodes=episodes,
         steps=steps,

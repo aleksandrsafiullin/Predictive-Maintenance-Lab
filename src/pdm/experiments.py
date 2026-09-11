@@ -84,6 +84,64 @@ def _count_evaluations(run_path: Path) -> int:
     return sum(1 for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
+def evaluation_mask_view(cfg: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Normalize `evaluate_mask`. Missing mask → split=test, not a blind benchmark."""
+    raw = cfg.get("evaluate_mask") if isinstance(cfg, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return {"split": "test", "blind_benchmark": False, "unit_ids": None}
+    split = str(raw.get("split") or "test").strip() or "test"
+    if split not in {"validation", "test"}:
+        split = "test"
+    ids_raw = raw.get("unit_ids")
+    unit_ids = None if ids_raw is None else [str(u) for u in ids_raw]
+    out: dict[str, Any] = {
+        "split": split,
+        "blind_benchmark": bool(raw.get("blind_benchmark")),
+        "unit_ids": unit_ids,
+    }
+    if raw.get("protocol") is not None:
+        out["protocol"] = raw.get("protocol")
+    return out
+
+
+def evaluations_for_mode(evals: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+    """Filter eval rows for Validation / Test / Research. Test requires a blind benchmark."""
+    label = str(mode).strip()
+    want_split = "validation" if label == "Validation" else "test"
+    require_blind = label == "Test"
+    matching: list[dict[str, Any]] = []
+    for row in evals:
+        mask = row.get("evaluate_mask") or evaluation_mask_view(None)
+        if str(mask.get("split") or "test") != want_split:
+            continue
+        if require_blind and not bool(mask.get("blind_benchmark")):
+            continue
+        matching.append(row)
+    return matching
+
+
+def mask_unit_ids(mask: Mapping[str, Any] | None, fallback: list[str] | None) -> list[str]:
+    """Selected eval `evaluate_mask.unit_ids`, else the current mode split list."""
+    ids = None if mask is None else mask.get("unit_ids")
+    if ids is None:
+        return [str(u) for u in (fallback or [])]
+    return [str(u) for u in ids]
+
+
+def empty_evaluation_artifacts(*, eval_id: str | None = None, legacy: bool = False) -> dict[str, Any]:
+    return {
+        "eval_id": eval_id,
+        "eval_dir": None,
+        "legacy": bool(legacy),
+        "predictions": None,
+        "alerts": None,
+        "metrics": None,
+        "metrics_by_unit": None,
+        "evaluation_config": None,
+        "evaluate_mask": evaluation_mask_view(None),
+    }
+
+
 def list_evaluations(run_path: Path) -> list[dict[str, Any]]:
     """Immutable eval dirs under `runs/<run_id>/evaluations/`, newest first."""
     root = evaluations_dir(run_path)
@@ -101,15 +159,19 @@ def list_evaluations(run_path: Path) -> list[dict[str, Any]]:
             "has_metrics": (path / "metrics.json").exists(),
             "legacy": False,
         }
+        cfg: dict[str, Any] | None = None
         cfg_path = path / "evaluation_config.json"
         if cfg_path.exists():
             try:
-                cfg = read_json(cfg_path)
-                for key in ("metrics_version", "checkpoint_hash", "split_hash"):
-                    if key in cfg:
-                        row[key] = cfg[key]
+                loaded = read_json(cfg_path)
+                if isinstance(loaded, dict):
+                    cfg = loaded
+                    for key in ("metrics_version", "checkpoint_hash", "split_hash"):
+                        if key in cfg:
+                            row[key] = cfg[key]
             except Exception:
-                pass
+                cfg = None
+        row["evaluate_mask"] = evaluation_mask_view(cfg)
         rows.append(row)
     rows.sort(key=lambda r: r.get("eval_id") or "", reverse=True)
     return rows
@@ -120,6 +182,15 @@ def _artifacts_from_eval_dir(eval_dir: Path) -> dict[str, Any]:
         p = eval_dir / name
         return p if p.exists() else None
 
+    cfg_path = _optional("evaluation_config.json")
+    cfg = None
+    if cfg_path is not None:
+        try:
+            loaded = read_json(cfg_path)
+            if isinstance(loaded, dict):
+                cfg = loaded
+        except Exception:
+            cfg = None
     return {
         "eval_id": eval_dir.name,
         "eval_dir": eval_dir,
@@ -128,30 +199,14 @@ def _artifacts_from_eval_dir(eval_dir: Path) -> dict[str, Any]:
         "alerts": _optional("alerts.csv"),
         "metrics": _optional("metrics.json"),
         "metrics_by_unit": _optional("metrics_by_unit.csv"),
-        "evaluation_config": _optional("evaluation_config.json"),
+        "evaluation_config": cfg_path,
+        "evaluate_mask": evaluation_mask_view(cfg),
     }
 
 
-def resolve_evaluation_artifacts(run_path: Path, eval_id: str | None = None) -> dict[str, Any]:
-    """Prefer `evaluations/<eval_id>/`. Legacy root files are read-only fallback only."""
+def legacy_evaluation_artifacts(run_path: Path) -> dict[str, Any]:
+    """Run-root predictions/metrics. Treated as test split, not a blind benchmark."""
     run_path = Path(run_path)
-    if eval_id:
-        dest = evaluations_dir(run_path) / eval_id
-        if dest.is_dir():
-            return _artifacts_from_eval_dir(dest)
-        return {
-            "eval_id": eval_id,
-            "eval_dir": None,
-            "legacy": False,
-            "predictions": None,
-            "alerts": None,
-            "metrics": None,
-            "metrics_by_unit": None,
-            "evaluation_config": None,
-        }
-    rows = list_evaluations(run_path)
-    if rows:
-        return _artifacts_from_eval_dir(Path(rows[0]["path"]))
     pred = run_path / LEGACY_PREDICTIONS_NAME
     alerts = run_path / LEGACY_ALERTS_NAME
     metrics = run_path / LEGACY_METRICS_NAME
@@ -164,7 +219,22 @@ def resolve_evaluation_artifacts(run_path: Path, eval_id: str | None = None) -> 
         "metrics": metrics if metrics.exists() else None,
         "metrics_by_unit": None,
         "evaluation_config": None,
+        "evaluate_mask": evaluation_mask_view(None),
     }
+
+
+def resolve_evaluation_artifacts(run_path: Path, eval_id: str | None = None) -> dict[str, Any]:
+    """Prefer `evaluations/<eval_id>/`. Legacy root files are read-only fallback only."""
+    run_path = Path(run_path)
+    if eval_id:
+        dest = evaluations_dir(run_path) / eval_id
+        if dest.is_dir():
+            return _artifacts_from_eval_dir(dest)
+        return empty_evaluation_artifacts(eval_id=eval_id)
+    rows = list_evaluations(run_path)
+    if rows:
+        return _artifacts_from_eval_dir(Path(rows[0]["path"]))
+    return legacy_evaluation_artifacts(run_path)
 
 
 PRIMARY_METRIC_LABELS = {
@@ -423,16 +493,16 @@ def metrics_by_unit_display_frame(
     by_unit: pd.DataFrame | None,
     *,
     dataset_id: str,
-    test_ids: list[str] | None = None,
+    unit_ids: list[str] | None = None,
 ) -> pd.DataFrame:
-    """English per-unit table. Bearings include every test unit even if a CSV row is missing."""
+    """English per-unit table. Lists mask / mode units even if a CSV row is missing."""
     src = by_unit.copy() if by_unit is not None else pd.DataFrame()
     if not src.empty and "unit_id" in src.columns:
         src["unit_id"] = src["unit_id"].astype(str)
     elif src.empty:
         src = pd.DataFrame(columns=["unit_id"])
-    if test_ids:
-        ordered = pd.DataFrame({"unit_id": [str(u) for u in test_ids]})
+    if unit_ids:
+        ordered = pd.DataFrame({"unit_id": [str(u) for u in unit_ids]})
         src = ordered.merge(src, on="unit_id", how="left")
     out = pd.DataFrame()
     if "unit_id" in src.columns:

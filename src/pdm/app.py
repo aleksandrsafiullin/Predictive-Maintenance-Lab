@@ -11,6 +11,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from pdm.alerts import (
+    MISSING_FROZEN_POLICY_MESSAGE,
     alert_policy_hash,
     build_alert_policy,
     load_alert_policy,
@@ -21,13 +22,22 @@ from pdm.config import load_dataset_config, model_defaults
 from pdm.data.filters import filter_time_scale_meta
 from pdm.data.prepare import load_processed, processed_ready
 from pdm.device import resolve_device
-from pdm.evaluate import IncompatibleDataError, default_horizon_s, load_evaluation_alert_policy
+from pdm.evaluate import (
+    IncompatibleDataError,
+    default_horizon_s,
+    load_evaluation_alert_policy,
+    load_run_pressure_limit_pa,
+)
 from pdm.experiments import (
     baseline_coverage_callout,
+    empty_evaluation_artifacts,
     evaluation_metric_cards,
     evaluation_notes,
+    evaluations_for_mode,
+    legacy_evaluation_artifacts,
     list_evaluations,
     list_runs,
+    mask_unit_ids,
     metrics_by_unit_display_frame,
     near_event_zone_frame,
     read_evaluation_metrics,
@@ -62,6 +72,10 @@ st.set_page_config(page_title="Predictive Maintenance Lab", layout="wide")
 os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
 
 LABELS = {"bearings": "Bearings", "filters": "Filters"}
+REPLAY_MODE_VALIDATION = "Validation"
+REPLAY_MODE_TEST = "Test"
+REPLAY_MODE_RESEARCH = "Research"
+REPLAY_MODES = (REPLAY_MODE_VALIDATION, REPLAY_MODE_TEST, REPLAY_MODE_RESEARCH)
 REPLAY_PLAY_INTERVAL_S = 0.4
 _REPLAY_VIEW_KEY = "_replay_view"
 _REPLAY_SESSION_KEYS = (
@@ -618,6 +632,79 @@ def screen_train(dataset_id: str) -> None:
             st.json(vm)
 
 
+def _replay_pressure_limit_pa(rdir, cfg: dict) -> float:
+    """Snapshot when present; else live YAML (subtask 04 fallback)."""
+    return load_run_pressure_limit_pa(rdir, cfg.get("pressure_limit_pa"))
+
+
+def _freeze_checkpoint_hash(bound: dict, rdir) -> str | None:
+    fp = bound.get("run_fingerprint") if isinstance(bound.get("run_fingerprint"), dict) else {}
+    stored = fp.get("checkpoint_hash")
+    if stored:
+        return str(stored)
+    ckpt = rdir / "best.pt"
+    if ckpt.exists():
+        from pdm.io_util import checkpoint_hash
+
+        return checkpoint_hash(ckpt)
+    return None
+
+
+def _mode_unit_ids(split: dict, replay_mode: str) -> list[str]:
+    key = "validation" if replay_mode == REPLAY_MODE_VALIDATION else "test"
+    return [str(u) for u in (split.get(key) or [])]
+
+
+def _evaluate_scope_noun(replay_mode: str) -> str:
+    if replay_mode == REPLAY_MODE_VALIDATION:
+        return "validation set"
+    if replay_mode == REPLAY_MODE_RESEARCH:
+        return "test set (not a blind benchmark)"
+    return "test set"
+
+
+def _overall_heading(replay_mode: str) -> str:
+    if replay_mode == REPLAY_MODE_VALIDATION:
+        return "**Overall validation**"
+    if replay_mode == REPLAY_MODE_RESEARCH:
+        return "**Overall test (not a blind benchmark)**"
+    return "**Overall test**"
+
+
+def _test_mode_replay_policy(frozen: dict | None, stored_policy: dict | None) -> dict | None:
+    """Test Play/rescore uses freeze file / eval policy, never leftover widgets."""
+    if isinstance(frozen, dict) and frozen.get("H_trigger") is not None:
+        return frozen
+    if isinstance(stored_policy, dict) and stored_policy.get("H_trigger") is not None:
+        return stored_policy
+    return None
+
+
+def _evaluate_job(
+    *,
+    dataset_id: str,
+    run_id: str,
+    replay_mode: str,
+    h_s: float,
+    k: int,
+    lead_s: float,
+    max_useful: float | None,
+) -> dict:
+    job: dict = {"kind": "evaluate", "dataset_id": dataset_id, "run_id": run_id}
+    if replay_mode == REPLAY_MODE_TEST:
+        job["split_name"] = "test"
+        job["policy_mode"] = "frozen"
+        return job
+    job["policy_mode"] = "research"
+    job["split_name"] = "validation" if replay_mode == REPLAY_MODE_VALIDATION else "test"
+    job["H_trigger"] = h_s
+    job["warning_horizon_s"] = h_s
+    job["confirmation_count"] = int(k)
+    job["minimum_action_lead_time"] = lead_s
+    job["max_useful_horizon_s"] = max_useful
+    return job
+
+
 def screen_replay(dataset_id: str) -> None:
     st.header(f"Test & Replay — {LABELS[dataset_id]}")
     st.info("Historical replay — not a live equipment connection")
@@ -643,12 +730,19 @@ def screen_replay(dataset_id: str) -> None:
     features = bound["features"]
     units = bound["units"]
     split = bound["split"]
-    test_units = split.get("test") or []
-    uid = st.selectbox("Test unit", test_units)
+    replay_mode = st.radio("Replay mode", REPLAY_MODES, index=0, horizontal=True)
+    mode_units = _mode_unit_ids(split, replay_mode)
+    uid = st.selectbox(
+        "Unit",
+        mode_units,
+        key=f"replay_unit_{dataset_id}_{run_id}_{replay_mode}",
+    )
     cfg = load_dataset_config(dataset_id)
     train_units = units[units["unit_id"].isin(split["train"])]
     alerts_cfg = dict(cfg.get("alerts") or {})
     frozen = load_alert_policy(rdir)
+    hk_enabled = replay_mode != REPLAY_MODE_TEST
+    freeze_enabled = replay_mode == REPLAY_MODE_VALIDATION
     default_h = (
         float(frozen["H_trigger"])
         if frozen
@@ -671,6 +765,7 @@ def screen_replay(dataset_id: str) -> None:
         value=float(default_h / factor),
         min_value=0.0,
         key=f"h_trigger_{dataset_id}_{run_id}",
+        disabled=not hk_enabled,
         help="Trigger when predicted RUL ≤ H. Alias of warning_horizon_s. Changing H does not retrain.",
     )
     h_s = float(h_disp) * factor
@@ -684,6 +779,7 @@ def screen_replay(dataset_id: str) -> None:
         value=float(default_lead / factor),
         min_value=0.0,
         key=f"min_lead_{dataset_id}_{run_id}",
+        disabled=not hk_enabled,
         help="timely iff confirmed lead_time ≥ this value and the alert is before the event.",
     )
     lead_s = float(lead_disp) * factor
@@ -693,6 +789,7 @@ def screen_replay(dataset_id: str) -> None:
         value=float((frozen_max or 0.0) / factor),
         min_value=0.0,
         key=f"max_useful_{dataset_id}_{run_id}",
+        disabled=not hk_enabled,
         help="Alerts with lead_time above this are too_early. 0 disables the cap.",
     )
     max_s = float(max_disp) * factor
@@ -704,6 +801,7 @@ def screen_replay(dataset_id: str) -> None:
         max_value=20,
         value=default_k,
         key=f"confirm_k_{dataset_id}_{run_id}",
+        disabled=not hk_enabled,
     )
     delay = max(int(k) - 1, 0)
     st.caption(
@@ -722,74 +820,93 @@ def screen_replay(dataset_id: str) -> None:
             "H_trigger is a trigger threshold, not an accuracy promise. "
             "Changing H does not retrain the network."
         )
+    if replay_mode == REPLAY_MODE_RESEARCH:
+        st.caption("Research — not a blind benchmark.")
     if frozen:
         st.caption(
             f"Frozen run policy (`alert_policy.json`): H_trigger={frozen['H_trigger']:.4g} s, "
             f"minimum_action_lead_time={frozen['minimum_action_lead_time']:.4g} s, "
             f"K={frozen['confirmation_count']}. Widget changes are research-only until you freeze again."
         )
+        if replay_mode == REPLAY_MODE_TEST:
+            st.caption("Test evaluation uses the frozen validation-selected policy.")
     else:
-        st.caption(
-            "No frozen policy yet. Tune on validation, then Freeze. "
-            "The first Evaluate also writes `runs/<run_id>/alert_policy.json` if missing."
-        )
-    if st.button("Freeze alert policy"):
-        save_alert_policy(
-            rdir,
-            build_alert_policy(
-                H_trigger=h_s,
-                minimum_action_lead_time=lead_s,
-                confirmation_count=int(k),
-                reset_factor=float(alerts_cfg.get("reset_factor", 1.2)),
-                max_useful_horizon_s=max_useful,
-                source="validation_ui",
-            ),
-            overwrite=True,
-        )
-        st.success("Saved frozen policy to alert_policy.json")
-        st.rerun()
-    if st.button("Evaluate test set", disabled=worker_alive()):
-        spawn_worker(
-            {
-                "kind": "evaluate",
-                "dataset_id": dataset_id,
-                "run_id": run_id,
-                "warning_horizon_s": h_s,
-                "H_trigger": h_s,
-                "confirmation_count": int(k),
-                "minimum_action_lead_time": lead_s,
-                "max_useful_horizon_s": max_useful,
-            }
-        )
-        st.rerun()
+        st.caption("No frozen policy yet. Tune on validation, then Freeze.")
+        if replay_mode == REPLAY_MODE_TEST:
+            st.caption(MISSING_FROZEN_POLICY_MESSAGE)
+    if st.button("Freeze alert policy", disabled=not freeze_enabled):
+        if replay_mode != REPLAY_MODE_VALIDATION:
+            st.error("Freeze only from Validation.")
+        else:
+            save_alert_policy(
+                rdir,
+                build_alert_policy(
+                    H_trigger=h_s,
+                    minimum_action_lead_time=lead_s,
+                    confirmation_count=int(k),
+                    reset_factor=float(alerts_cfg.get("reset_factor", 1.2)),
+                    max_useful_horizon_s=max_useful,
+                    source="validation_ui",
+                    split="validation",
+                    unit_ids=[str(u) for u in (split.get("validation") or [])],
+                    checkpoint_hash=_freeze_checkpoint_hash(bound, rdir),
+                ),
+                overwrite=True,
+            )
+            st.success("Saved frozen policy to alert_policy.json")
+            st.rerun()
+    eval_label = (
+        "Evaluate validation set" if replay_mode == REPLAY_MODE_VALIDATION else "Evaluate test set"
+    )
+    if st.button(eval_label, disabled=worker_alive()):
+        if replay_mode == REPLAY_MODE_TEST and frozen is None:
+            st.error(MISSING_FROZEN_POLICY_MESSAGE)
+        else:
+            spawn_worker(
+                _evaluate_job(
+                    dataset_id=dataset_id,
+                    run_id=run_id,
+                    replay_mode=replay_mode,
+                    h_s=h_s,
+                    k=int(k),
+                    lead_s=lead_s,
+                    max_useful=max_useful,
+                )
+            )
+            st.rerun()
     eval_running = worker_alive() and read_status().get("kind") in {"evaluate", "replay_predict"}
     if eval_running:
         st.info("Evaluating…")
         _auto_refresh()
 
-    evals = list_evaluations(rdir)
+    mode_evals = evaluations_for_mode(list_evaluations(rdir), replay_mode)
     eval_id = None
-    if evals:
-        eval_id = st.selectbox("Evaluation", [e["eval_id"] for e in evals])
+    if mode_evals:
+        eval_id = st.selectbox(
+            "Evaluation",
+            [e["eval_id"] for e in mode_evals],
+            key=f"eval_pick_{dataset_id}_{run_id}_{replay_mode}",
+        )
         st.caption(
             "Each Evaluate writes a new `evaluations/<eval_id>/` and never overwrites a prior report. "
             "predictions.csv does not depend on H/K."
         )
-    elif (rdir / "predictions.csv").exists():
+    elif replay_mode == REPLAY_MODE_RESEARCH and (rdir / "predictions.csv").exists():
         st.caption(
             "Legacy run-root `predictions.csv` / `test_metrics.json` (read-only). "
             "New evaluations write under `evaluations/<eval_id>/`."
         )
 
-    artifacts = resolve_evaluation_artifacts(rdir, eval_id)
-    split_label = split_label_for_unit(split, uid)
-    _render_replay_header(
-        run_id=run_id,
-        split_label=split_label,
-        eval_id=eval_id,
-        h_s=h_s,
-        dataset_id=dataset_id,
-        has_predictions=artifacts.get("predictions") is not None,
+    if eval_id:
+        artifacts = resolve_evaluation_artifacts(rdir, eval_id)
+    elif replay_mode == REPLAY_MODE_RESEARCH and not mode_evals:
+        artifacts = legacy_evaluation_artifacts(rdir)
+    else:
+        artifacts = empty_evaluation_artifacts()
+    table_unit_ids = mask_unit_ids(artifacts.get("evaluate_mask"), mode_units)
+    stored_policy = load_evaluation_alert_policy(
+        artifacts.get("eval_dir"),
+        config_path=artifacts.get("evaluation_config"),
     )
     widget_policy = build_alert_policy(
         H_trigger=h_s,
@@ -800,7 +917,26 @@ def screen_replay(dataset_id: str) -> None:
         source="replay_ui",
         fill_max_useful_from_cfg=False,
     )
-    policy_hash = str(widget_policy.get("policy_hash") or alert_policy_hash(widget_policy))
+    if replay_mode == REPLAY_MODE_TEST:
+        replay_policy = _test_mode_replay_policy(frozen, stored_policy)
+    else:
+        replay_policy = widget_policy
+    test_policy_missing = replay_mode == REPLAY_MODE_TEST and replay_policy is None
+    if replay_policy is not None:
+        replay_h_s: float | None = float(replay_policy["H_trigger"])
+        policy_hash = str(replay_policy.get("policy_hash") or alert_policy_hash(replay_policy))
+    else:
+        replay_h_s = None
+        policy_hash = "test-no-frozen-policy"
+    split_label = split_label_for_unit(split, uid)
+    _render_replay_header(
+        run_id=run_id,
+        split_label=split_label,
+        eval_id=eval_id,
+        h_s=replay_h_s,
+        dataset_id=dataset_id,
+        has_predictions=artifacts.get("predictions") is not None,
+    )
     session_key = replay_session_key(dataset_id, run_id, uid, eval_id, policy_hash)
     _sync_replay_session(session_key)
 
@@ -808,20 +944,20 @@ def screen_replay(dataset_id: str) -> None:
     n = len(meas)
     if n <= 0:
         st.warning("Selected unit has no measurements.")
-        _render_evaluation_panel(dataset_id, artifacts, test_units)
+        _render_evaluation_panel(dataset_id, artifacts, table_unit_ids, replay_mode=replay_mode)
         return
     preds_path = artifacts.get("predictions")
     has_preds = preds_path is not None
     frozen_alerts_path = artifacts.get("alerts")
     frozen_alerts = pd.read_csv(frozen_alerts_path) if frozen_alerts_path is not None else pd.DataFrame()
-    stored_policy = load_evaluation_alert_policy(
-        artifacts.get("eval_dir"),
-        config_path=artifacts.get("evaluation_config"),
-    )
     stored_hash = None
     if stored_policy:
         stored_hash = stored_policy.get("policy_hash") or alert_policy_hash(stored_policy)
-    policy_stale = bool(stored_hash) and str(stored_hash) != str(policy_hash)
+    policy_stale = (
+        replay_mode != REPLAY_MODE_TEST
+        and bool(stored_hash)
+        and str(stored_hash) != str(policy_hash)
+    )
 
     hist_csv = rdir / "training_history.csv"
     st.subheader("1. Training history")
@@ -836,29 +972,45 @@ def screen_replay(dataset_id: str) -> None:
     else:
         st.write("No training history file.")
 
-    if not has_preds:
-        st.error(
-            "Play is blocked until Evaluate test set writes `evaluations/<eval_id>/predictions.csv`. "
-            "This screen does not run model inference on the Streamlit request thread. "
-            "Queue Evaluate (background worker) — not an unbounded inline Predictor."
-        )
+    matching_eval = bool(eval_id) or bool(artifacts.get("legacy") and has_preds)
+    uid_in_mask = str(uid) in set(table_unit_ids)
+    play_enabled = bool(matching_eval and has_preds and uid_in_mask and not test_policy_missing)
+    if not play_enabled:
+        if test_policy_missing:
+            st.error(
+                f"{MISSING_FROZEN_POLICY_MESSAGE}. "
+                "Test replay does not use widget H/K."
+            )
+        elif matching_eval and has_preds and not uid_in_mask:
+            st.error(
+                "Play is blocked: selected unit is not in this evaluation's unit mask. "
+                "This screen does not run model inference on the Streamlit request thread."
+            )
+        else:
+            st.error(
+                "Play is blocked until Evaluate writes `evaluations/<eval_id>/predictions.csv`. "
+                "This screen does not run model inference on the Streamlit request thread. "
+                "Queue Evaluate (background worker) — not an unbounded inline Predictor."
+            )
         if eval_running:
             st.info("Evaluate is running in the worker. Replay unlocks when predictions.csv is written.")
         _render_replay_controls(enabled=False, n=max(n, 1))
-        _render_evaluation_panel(dataset_id, artifacts, test_units)
+        _render_evaluation_panel(dataset_id, artifacts, table_unit_ids, replay_mode=replay_mode)
         return
 
     preds = pd.read_csv(preds_path)
     unit_pred = preds[preds["unit_id"] == uid].sort_values("timestamp_s").reset_index(drop=True)
     cache_key = (str(eval_id or ""), policy_hash, str(uid))
+    pressure_limit_pa = _replay_pressure_limit_pa(rdir, cfg)
     block_alert_status = False
     if st.session_state.get("replay_alert_cache_key") != cache_key:
         try:
             episodes, steps = rescore_replay_alerts(
                 unit_pred,
-                widget_policy,
+                replay_policy,
                 run_id=run_id,
                 measurements=meas,
+                pressure_limit_pa=pressure_limit_pa,
             )
             st.session_state.replay_alert_cache_key = cache_key
             st.session_state.replay_alert_episodes = episodes
@@ -894,7 +1046,7 @@ def screen_replay(dataset_id: str) -> None:
     unit_table = metrics_by_unit_display_frame(
         read_metrics_by_unit(artifacts),
         dataset_id=dataset_id,
-        test_ids=[str(u) for u in (test_units or [])],
+        unit_ids=table_unit_ids,
     )
     st.session_state[_REPLAY_VIEW_KEY] = {
         "dataset_id": dataset_id,
@@ -906,23 +1058,26 @@ def screen_replay(dataset_id: str) -> None:
         "unit_pred": unit_pred,
         "episodes": episodes,
         "steps": steps,
-        "h_s": h_s,
+        "h_s": replay_h_s,
         "n": n,
         "block_alert_status": block_alert_status,
         "unit_meta": unit_meta,
-        "pressure_limit_pa": float(cfg.get("pressure_limit_pa", 600.0)),
+        "pressure_limit_pa": pressure_limit_pa,
         "unit_table": unit_table,
         "overall_cards": evaluation_metric_cards(metrics, dataset_id),
+        "replay_mode": replay_mode,
     }
     _mount_replay_playback(playing=bool(st.session_state.get("playing")))
-    _render_evaluation_panel(dataset_id, artifacts, test_units)
+    _render_evaluation_panel(dataset_id, artifacts, table_unit_ids, replay_mode=replay_mode)
     if frozen_alerts_path is not None:
         with st.expander("Retrospective eval alert log (all units)"):
             st.caption("Frozen `alerts.csv` from Evaluate. Not filtered to replay time; not the live H/K rescore.")
             st.dataframe(frozen_alerts, width="stretch", hide_index=True)
 
 
-def _render_evaluation_panel(dataset_id: str, artifacts: dict, test_ids: list) -> None:
+def _render_evaluation_panel(
+    dataset_id: str, artifacts: dict, unit_ids: list, *, replay_mode: str
+) -> None:
     st.subheader("Evaluation summary")
     eval_id = artifacts.get("eval_id")
     if eval_id:
@@ -933,7 +1088,7 @@ def _render_evaluation_panel(dataset_id: str, artifacts: dict, test_ids: list) -
 
     metrics = read_evaluation_metrics(artifacts)
     if metrics is None:
-        st.info("No metrics.json yet. Run Evaluate test set.")
+        st.info(f"No metrics.json yet. Run Evaluate {_evaluate_scope_noun(replay_mode)}.")
         _eval_artifact_downloads(artifacts, dataset_id)
         return
     if not metrics.get("primary_metric"):
@@ -963,12 +1118,13 @@ def _render_evaluation_panel(dataset_id: str, artifacts: dict, test_ids: list) -
     table = metrics_by_unit_display_frame(
         read_metrics_by_unit(artifacts),
         dataset_id=dataset_id,
-        test_ids=[str(u) for u in (test_ids or [])],
+        unit_ids=[str(u) for u in (unit_ids or [])],
     )
     st.dataframe(table, width="stretch", hide_index=True)
     if dataset_id == "bearings":
         st.caption(
-            "All test units are listed as rows. XJTU-SY holds out 3 bearings (instance 5 in each regime)."
+            "All units in the selected evaluation mask are listed as rows. "
+            "XJTU-SY holds out 3 bearings (instance 5 in each regime)."
         )
     else:
         st.caption(
@@ -1013,7 +1169,9 @@ def _eval_artifact_downloads(artifacts: dict, dataset_id: str) -> None:
         )
 
 
-def _format_h_trigger_header(h_s: float, dataset_id: str) -> str:
+def _format_h_trigger_header(h_s: float | None, dataset_id: str) -> str:
+    if h_s is None or not _finite_number(h_s):
+        return "unavailable"
     if dataset_id == "filters":
         return f"{h_s:.4g} s (internal)"
     return f"{h_s:.4g} s ({h_s / 60.0:.3g} min)"
@@ -1030,7 +1188,7 @@ def _render_replay_header(
     run_id: str,
     split_label: str,
     eval_id: str | None,
-    h_s: float,
+    h_s: float | None,
     dataset_id: str,
     has_predictions: bool = False,
 ) -> None:
@@ -1254,6 +1412,7 @@ def _render_end_of_unit_card(
     unit_table: pd.DataFrame | None,
     overall_cards: list[dict],
     dataset_id: str,
+    replay_mode: str,
 ) -> None:
     st.subheader("End of unit")
     msg = end_state.get("message")
@@ -1279,26 +1438,40 @@ def _render_end_of_unit_card(
             else:
                 st.dataframe(row, width="stretch", hide_index=True)
         else:
-            st.caption("No evaluation table yet. Run Evaluate test set.")
+            st.caption(f"No evaluation table yet. Run Evaluate {_evaluate_scope_noun(replay_mode)}.")
     with right:
-        st.markdown("**Overall test**")
+        st.markdown(_overall_heading(replay_mode))
         cards = list(overall_cards or [])
         if not cards:
-            st.caption("No overall test metrics yet.")
+            if replay_mode == REPLAY_MODE_VALIDATION:
+                st.caption("No overall validation metrics yet.")
+            elif replay_mode == REPLAY_MODE_RESEARCH:
+                st.caption("No overall test metrics yet (not a blind benchmark).")
+            else:
+                st.caption("No overall test metrics yet.")
         else:
             for start in range(0, min(len(cards), 4), 2):
                 chunk = cards[start : start + 2]
                 cols = st.columns(len(chunk))
                 for col, card in zip(cols, chunk):
                     col.metric(card["label"], card["value"])
+    table_word = (
+        "overall validation table"
+        if replay_mode == REPLAY_MODE_VALIDATION
+        else (
+            "overall test table (not a blind benchmark)"
+            if replay_mode == REPLAY_MODE_RESEARCH
+            else "overall test table"
+        )
+    )
     if dataset_id == "filters":
         st.caption(
-            "Unit row vs overall test table from the frozen evaluation. "
+            f"Unit row vs {table_word} from the frozen evaluation. "
             "Official RUL in that table is an evaluation label, not a sensor fact. "
             "This card does not change replay predictions."
         )
     else:
-        st.caption("Unit row vs overall test table from the frozen evaluation. Overlay only — predictions unchanged.")
+        st.caption(f"Unit row vs {table_word} from the frozen evaluation. Overlay only — predictions unchanged.")
 
 
 def _replay_playback_body() -> None:
@@ -1424,6 +1597,7 @@ def _replay_playback_body() -> None:
             unit_table=unit_table,
             overall_cards=overall_cards,
             dataset_id=dataset_id,
+            replay_mode=str(view.get("replay_mode") or REPLAY_MODE_TEST),
         )
     st.subheader("Alert log")
     st.caption("Selected unit only, timestamps ≤ current replay time. Full eval log is in the expander below.")

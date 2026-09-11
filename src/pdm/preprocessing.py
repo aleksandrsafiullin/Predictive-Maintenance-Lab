@@ -144,6 +144,61 @@ class Preprocessor:
         )
 
 
+def apply_preprocessor(
+    prep: Preprocessor,
+    features: pd.DataFrame,
+    dataset_id: str | None = None,
+) -> pd.DataFrame:
+    """Encode raw measurements with a saved preprocessor, then scale. Train-only maps/scaler."""
+    ds = dataset_id or prep.dataset_id
+    if not ds:
+        raise ValueError("dataset_id required to apply preprocessor")
+    feat_df = raw_to_feature_frame(
+        ds,
+        features,
+        prep.categorical_maps,
+        prep.log1p_features,
+        raw_features=True,
+    )
+    return prep.transform_frame(feat_df)
+
+
+def preprocessor_resume_mismatches(saved: Preprocessor, live: Preprocessor) -> list[str]:
+    """Scaler / maps / time_scale_s / feature_pipeline_version vs a live fit. Not eval-method drift."""
+    differing: list[str] = []
+    if saved.feature_pipeline_version != live.feature_pipeline_version:
+        differing.append("feature_pipeline_version")
+    if saved.categorical_maps != live.categorical_maps:
+        differing.append("categorical_maps")
+    if not np.isclose(float(saved.time_scale_s), float(live.time_scale_s), rtol=0.0, atol=1e-9):
+        differing.append("time_scale_s")
+    saved_mean = np.asarray(saved.scaler_mean, dtype=np.float64)
+    live_mean = np.asarray(live.scaler_mean, dtype=np.float64)
+    saved_scale = np.asarray(saved.scaler_scale, dtype=np.float64)
+    live_scale = np.asarray(live.scaler_scale, dtype=np.float64)
+    scaler_ok = (
+        saved_mean.shape == live_mean.shape
+        and saved_scale.shape == live_scale.shape
+        and np.allclose(saved_mean, live_mean, rtol=0.0, atol=1e-9, equal_nan=True)
+        and np.allclose(saved_scale, live_scale, rtol=0.0, atol=1e-9, equal_nan=True)
+    )
+    if not scaler_ok:
+        differing.append("scaler")
+    if not _optional_floats_close(saved.gap_multiplier, live.gap_multiplier):
+        differing.append("gap_multiplier")
+    if not _optional_floats_close(saved.sampling_interval_s, live.sampling_interval_s):
+        differing.append("sampling_interval_s")
+    return differing
+
+
+def _optional_floats_close(left: float | None, right: float | None) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    return bool(np.isclose(float(left), float(right), rtol=0.0, atol=1e-9))
+
+
 def _one_hot(df, column: str, categories: list[str] | None = None):
     """One-hot encode ``column`` using train-only ``categories``.
 

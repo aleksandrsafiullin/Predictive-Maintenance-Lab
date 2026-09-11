@@ -129,9 +129,14 @@ def replay_unit(
             "input_until_s": t,
             "predicted_rul_s": pred.get("predicted_rul_s"),
             "baseline_rul_s": baseline_rul,
+            "prediction_status": pred.get("status") or "",
+            "valid_history_reason": pred.get("valid_history_reason") or "",
+            "observed_limit_reached": bool(observed_limit),
             "alert_status": snap["status"],
             "step": step,
         }
+        if "differential_pressure" in row.index and pd.notna(row.get("differential_pressure")):
+            rec["differential_pressure"] = float(row["differential_pressure"])
         if "time_original" in row.index and pd.notna(row.get("time_original")):
             rec["time_original"] = float(row["time_original"])
         # Evaluator-only actual RUL: computed after the prediction, never passed to Predictor.
@@ -218,10 +223,17 @@ def rescore_replay_alerts(
     *,
     run_id: str | None = None,
     measurements: pd.DataFrame | None = None,
+    pressure_limit_pa: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Re-run AlertEngine on frozen predicted_rul_s. Never calls the model or writes files."""
+    """Re-run AlertEngine on frozen predicted_rul_s. Never calls the model or writes files.
+
+    `pressure_limit_pa` is the run/config Δp threshold (same source as the plot line).
+    Do not omit it in the UI and rely on a hardcoded Pa default.
+    """
     if predictions is None or getattr(predictions, "empty", True):
-        return alerts_from_predictions(predictions, policy, run_id=run_id)
+        return alerts_from_predictions(
+            predictions, policy, run_id=run_id, pressure_limit_pa=pressure_limit_pa
+        )
     pred = predictions.copy()
     if (
         measurements is not None
@@ -235,7 +247,9 @@ def rescore_replay_alerts(
         extra["unit_id"] = extra["unit_id"].astype(str)
         pred["unit_id"] = pred["unit_id"].astype(str)
         pred = pred.merge(extra, on=["unit_id", "timestamp_s"], how="left")
-    return alerts_from_predictions(pred, policy, run_id=run_id)
+    return alerts_from_predictions(
+        pred, policy, run_id=run_id, pressure_limit_pa=pressure_limit_pa
+    )
 
 
 END_OF_OBSERVED_DATA = "End of observed data"

@@ -131,28 +131,34 @@ def main(argv: list[str] | None = None) -> int:
     p_ev.add_argument("--dataset", required=True, choices=["bearings", "filters"])
     p_ev.add_argument("--run-id", required=True)
     p_ev.add_argument(
+        "--split",
+        choices=["validation", "test"],
+        default="test",
+        help="Evaluate mask split. Default: test.",
+    )
+    p_ev.add_argument(
         "--horizon-s",
         type=float,
         default=None,
-        help="H_trigger in seconds (alias of warning_horizon_s). Default: frozen policy or 10% of median train duration.",
+        help="H_trigger in seconds. Any H/K flag sets policy_mode=research and never writes alert_policy.json.",
     )
     p_ev.add_argument(
         "--k",
         type=int,
         default=None,
-        help="Confirmation count K. Default: frozen policy or config alerts.confirmation_count.",
+        help="Confirmation count K. Any H/K flag sets policy_mode=research (never writes).",
     )
     p_ev.add_argument(
         "--min-action-lead-s",
         type=float,
         default=None,
-        help="minimum_action_lead_time in seconds. Default: frozen policy or fraction of H_trigger.",
+        help="minimum_action_lead_time in seconds. Any H/K flag sets policy_mode=research (never writes).",
     )
     p_ev.add_argument(
         "--max-useful-horizon-s",
         type=float,
         default=None,
-        help="Optional too_early cap. Omit to use frozen policy / config (0 disables).",
+        help="Optional too_early cap. Any H/K flag sets policy_mode=research (never writes).",
     )
     p_ev.add_argument(
         "--force",
@@ -208,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(rec, indent=2, default=str))
         return 0
     if args.cmd == "evaluate":
-        from pdm.evaluate import evaluate_run
+        from pdm.evaluate import evaluate_run, policy_mode_from_hk_overrides
         from pdm.experiments import list_evaluations, run_dir
 
         if args.list:
@@ -217,6 +223,13 @@ def main(argv: list[str] | None = None) -> int:
         rec = evaluate_run(
             args.dataset,
             args.run_id,
+            split_name=args.split,
+            policy_mode=policy_mode_from_hk_overrides(
+                warning_horizon_s=args.horizon_s,
+                confirmation_count=args.k,
+                minimum_action_lead_time=args.min_action_lead_s,
+                max_useful_horizon_s=args.max_useful_horizon_s,
+            ),
             warning_horizon_s=args.horizon_s,
             confirmation_count=args.k,
             minimum_action_lead_time=args.min_action_lead_s,

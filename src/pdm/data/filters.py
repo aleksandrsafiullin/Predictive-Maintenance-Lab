@@ -355,13 +355,13 @@ def _measurements_from_csv(
         dt = np.zeros_like(t_s)
         if t_s.size > 1:
             dt[1:] = np.diff(t_s)
-        # Full-file median for offline build_windows. Replay/predict recomputes
-        # gap_before on the available prefix so future rows cannot change flags at t.
+        # Causal prefix median — same rule as inference / build_windows.
+        # causal=False (full-file median) is diagnostics-only; do not store it.
         gap_before = gap_before_from_delta_t(
             dt,
             gap_multiplier=gap_multiplier,
             sampling_interval_s=sampling_interval_s,
-            causal=False,
+            causal=True,
         )
         for i in range(len(g)):
             rows.append(

@@ -127,15 +127,21 @@ def run_job(job: dict) -> None:
                     "run_id": job["run_id"],
                 }
             )
-            metrics = evaluate_run(
-                job["dataset_id"],
-                job["run_id"],
-                warning_horizon_s=job.get("H_trigger", job.get("warning_horizon_s")),
-                confirmation_count=job.get("confirmation_count"),
-                minimum_action_lead_time=job.get("minimum_action_lead_time"),
-                max_useful_horizon_s=job.get("max_useful_horizon_s"),
-                device=job.get("device", "auto"),
-            )
+            eval_kwargs: dict = {
+                "split_name": job.get("split_name", "test"),
+                "policy_mode": job.get("policy_mode"),
+                "device": job.get("device", "auto"),
+            }
+            for key in (
+                "H_trigger",
+                "warning_horizon_s",
+                "confirmation_count",
+                "minimum_action_lead_time",
+                "max_useful_horizon_s",
+            ):
+                if key in job:
+                    eval_kwargs[key] = job[key]
+            metrics = evaluate_run(job["dataset_id"], job["run_id"], **eval_kwargs)
             write_status(
                 {
                     "status": "completed",

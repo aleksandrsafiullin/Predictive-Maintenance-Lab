@@ -105,6 +105,8 @@ Test-set (not used for epoch pick or scalers):
 - Filters GRU primary (RUL at official prefix end, 50 units): MAE 7012 s. Linear Δp baseline coverage 8.6% of points (unreliable slope → no number). On overlap, baseline MAE 939 s vs NN 7269 s (**baseline better where it fires**). H=420 s. 43 units `Insufficient observed coverage` relative to H; 7 scored, 0 timely.
 - Filters LSTM primary prefix-end MAE 6562 s (also smoke; not a quality benchmark).
 
+After R1–R5 the train/eval/replay contract changed (causal gap eligibility, coverage v1, freeze-only alert policy). Post-patch pipeline versions **must not** reuse the old smoke checkpoint or blob hashes as quality evidence — including `33d60a985e5bfd0bae49762ac88764ef92b07bb3`. The table above is a historical `--smoke` record, not a claim about the current pipeline. A Full 30-epoch run is a **future** human step after a new `prepare`; this report does not invent replacement MAE/NLL.
+
 ## 6. Tests
 
 `pytest tests -q`: **14 passed**.

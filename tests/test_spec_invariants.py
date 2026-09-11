@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
@@ -7,16 +8,22 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from pdm.alerts import (
     AlertEngine,
+    AlertPolicy,
     alert_policy_hash,
+    alerts_from_predictions,
     build_alert_policy,
     classify_alert_outcome,
     confirmed_lead_time_s,
     copy_alert_policy_into_evaluation_config,
+    has_sufficient_coverage,
+    last_admissible_confirmation_time_s,
     load_alert_policy,
     resolve_alert_policy,
+    save_alert_policy,
 )
 from pdm.config import load_dataset_config
 from pdm.data.archive import _describe_mat_variable, probe_mat
@@ -26,6 +33,7 @@ from pdm.data.filters import (
     FILTER_TIME_TO_SECONDS,
     FILTERS_FULL_HISTORY_STATUSES,
     _filters_full_history_status,
+    _measurements_from_csv,
     _time_to_seconds,
     extract_filters_tables,
     filter_time_scale_meta,
@@ -44,6 +52,7 @@ from pdm.evaluate import (
     METRICS_VERSION,
     IncompatibleDataError,
     _filter_validation_block,
+    assert_gap_rule_current,
     attach_actual_rul,
     bind_evaluation_to_run,
     build_rul_metrics,
@@ -53,7 +62,12 @@ from pdm.evaluate import (
     filter_prefix_backtest_table,
     filter_prefix_end_table,
     filter_time_scale_from_bound,
+    fingerprint_mismatches,
+    load_experiment_snapshot,
     load_near_event_zones_s,
+    load_run_pressure_limit_pa,
+    prediction_export_frame,
+    resolve_run_task_config,
     run_alert_evaluation,
     summarize_rul_table,
 )
@@ -87,24 +101,31 @@ from pdm.splits import (
     split_hash,
 )
 from pdm.train import (
+    UnitBalancedSampler,
+    UnitWindowDataset,
+    _collate,
     checkpoints_compatible,
     compatibility_dict,
     load_saved_train_settings,
     next_max_windows_on_mode_change,
     resolve_max_windows_per_unit,
     resolve_run_train_args,
+    run_training,
     selection_metric_spec,
     training_mode_label,
 )
 from pdm.train import split_fingerprint as train_split_fingerprint
 from pdm.windows import (
     FORBIDDEN_FEATURE_NAMES,
+    GAP_RULE_VERSION,
     build_windows,
+    count_window_eligibility,
     filter_gap_params,
     gap_before_from_delta_t,
     recompute_filter_gap_before,
     valid_history_window,
     window_matrix,
+    window_timestamp_reason,
 )
 
 
@@ -552,6 +573,8 @@ def test_alert_outcome_timely_lead_time_and_coverage():
         )
         == "miss"
     )
+    # last_admissible = 100 - min_lead=5 = 95; obs_end=80 is still insufficient.
+    # H_trigger=10 is not the coverage bound (that would have been event-H=90).
     assert (
         classify_alert_outcome(
             event_time_s=100.0,
@@ -565,74 +588,74 @@ def test_alert_outcome_timely_lead_time_and_coverage():
 
 def test_insufficient_coverage_not_false_miss(tmp_path):
     policy = {
-        "H_trigger": 10.0,
-        "minimum_action_lead_time": 30.0,
+        "H_trigger": 30.0,
+        "minimum_action_lead_time": 10.0,
         "confirmation_count": 1,
         "reset_factor": 1.2,
         "max_useful_horizon_s": None,
     }
-    # coverage_horizon = max(H=10, min_lead=30)=30. Truncated obs_end=2 is not a miss.
-    # obs_end=85 covers min_lead but not H-only (event-10=90) → still miss, not insufficient.
-    # Filter prefixes: NaN event_time, finite official RUL → overlay event = obs_end + official.
+    # v1 last_admissible = event - min_lead (inclusive). H_trigger is not the bound.
+    # Flagship: event=100, obs_end=75, H=30, min_lead=10 → last_admissible=90.
+    # 75 < 90 → insufficient_coverage. Old max(H, lead)=30 would have scored miss
+    # because 75 >= event-H=70.
+    # Filter prefixes: NaN event_time, finite official RUL → overlay event =
+    # obs_end + official (eval annotation, not a 600 Pa event).
+    assert last_admissible_confirmation_time_s(100.0, policy) == pytest.approx(90.0)
     pred = pd.DataFrame(
         {
-            "run_id": ["r"] * 12,
+            "run_id": ["r"] * 10,
             "unit_id": (
                 ["trunc"] * 3
                 + ["full"] * 3
-                + ["h_only_trap"] * 2
                 + ["prefix_short"] * 2
                 + ["prefix_covered"] * 2
             ),
             "timestamp_s": [
                 0.0,
-                1.0,
-                2.0,
+                50.0,
+                75.0,
                 90.0,
                 95.0,
                 100.0,
-                80.0,
-                85.0,
                 10.0,
                 20.0,
                 90.0,
                 100.0,
             ],
-            "predicted_rul_s": [100.0] * 12,
+            "predicted_rul_s": [100.0] * 10,
         }
     )
     units = pd.DataFrame(
         {
-            "unit_id": ["trunc", "full", "h_only_trap", "prefix_short", "prefix_covered"],
-            "event_time_s": [100.0, 100.0, 100.0, np.nan, np.nan],
-            "observation_end_s": [2.0, 100.0, 85.0, 20.0, 100.0],
-            "official_rul_at_prefix_end_s": [np.nan, np.nan, np.nan, 50.0, 20.0],
+            "unit_id": ["trunc", "full", "prefix_short", "prefix_covered"],
+            "event_time_s": [100.0, 100.0, np.nan, np.nan],
+            "observation_end_s": [75.0, 100.0, 20.0, 100.0],
+            "official_rul_at_prefix_end_s": [np.nan, np.nan, 50.0, 8.0],
         }
     )
     out = run_alert_evaluation(pred, policy, units=units)
     block = out["metrics"]["alerts"]
     assert block["insufficient_coverage"] == 2
-    assert block["miss"] == 3
+    assert block["miss"] == 2
     assert block["timely"] == 0
-    assert block["n_units_with_event"] == 5
+    assert block["n_units_with_event"] == 4
     assert block["n_units_insufficient_coverage"] == 2
-    assert block["n_units_sufficient_coverage"] == 3
-    assert block["denominator_units_scored"] == 3
-    assert block["n_units_scored"] == 3
+    assert block["n_units_sufficient_coverage"] == 2
+    assert block["denominator_units_scored"] == 2
+    assert block["n_units_scored"] == 2
     assert block["miss_rate"] == pytest.approx(1.0)
     assert block["timely_rate"] == pytest.approx(0.0)
     by = out["by_unit"].set_index("unit_id")
     assert by.loc["trunc", "alert_outcome"] == "insufficient_coverage"
     assert by.loc["full", "alert_outcome"] == "miss"
-    # obs_end=85: sufficient vs max(H,min_lead)=30, but not vs H=10 window (event-10=90).
-    assert by.loc["h_only_trap", "alert_outcome"] == "miss"
     assert bool(by.loc["trunc", "has_sufficient_coverage"]) is False
     assert bool(by.loc["full", "has_sufficient_coverage"]) is True
     assert by.loc["prefix_short", "alert_event_source"] == "official_rul_overlay"
     assert by.loc["prefix_short", "evaluator_event_time_s"] == pytest.approx(70.0)
     assert by.loc["prefix_short", "alert_outcome"] == "insufficient_coverage"
+    # overlay event = 100+8=108 (annotation, not 600 Pa); last_admissible=98.
     assert by.loc["prefix_covered", "alert_event_source"] == "official_rul_overlay"
-    assert by.loc["prefix_covered", "evaluator_event_time_s"] == pytest.approx(120.0)
+    assert by.loc["prefix_covered", "evaluator_event_time_s"] == pytest.approx(108.0)
     assert by.loc["prefix_covered", "alert_outcome"] == "miss"
 
     edir = tmp_path / "eval_cov"
@@ -645,10 +668,101 @@ def test_insufficient_coverage_not_false_miss(tmp_path):
     assert "official_rul" not in frozen
     metrics = json.loads((edir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["alerts"]["insufficient_coverage"] == 2
-    assert metrics["alerts"]["miss"] == 3
-    assert metrics["alerts"]["denominator_units_scored"] == 3
+    assert metrics["alerts"]["miss"] == 2
+    assert metrics["alerts"]["denominator_units_scored"] == 2
     by_csv = pd.read_csv(edir / "metrics_by_unit.csv")
     assert "alert_outcome" in by_csv.columns
+
+
+def test_coverage_boundary_at_last_admissible_timestamp():
+    policy = {
+        "H_trigger": 30.0,
+        "minimum_action_lead_time": 10.0,
+        "confirmation_count": 1,
+        "reset_factor": 1.2,
+        "max_useful_horizon_s": None,
+    }
+    event = 100.0
+    last = last_admissible_confirmation_time_s(event, policy)
+    assert last == pytest.approx(90.0)
+    assert has_sufficient_coverage(90.0, event, policy) is True
+    assert has_sufficient_coverage(89.0, event, policy) is False
+    assert (
+        classify_alert_outcome(
+            event_time_s=event,
+            observation_end_s=90.0,
+            policy=policy,
+            confirmed_alert_time_s=None,
+        )
+        == "miss"
+    )
+    assert (
+        classify_alert_outcome(
+            event_time_s=event,
+            observation_end_s=89.0,
+            policy=policy,
+            confirmed_alert_time_s=None,
+        )
+        == "insufficient_coverage"
+    )
+
+
+def test_min_lead_zero_sample_at_event_is_not_sufficient():
+    policy = {
+        "H_trigger": 10.0,
+        "minimum_action_lead_time": 0.0,
+        "confirmation_count": 1,
+        "reset_factor": 1.2,
+        "max_useful_horizon_s": None,
+    }
+    event = 100.0
+    assert last_admissible_confirmation_time_s(event, policy) is None
+    assert has_sufficient_coverage(event, event, policy) is False
+    assert has_sufficient_coverage(99.0, event, policy) is True
+    assert (
+        classify_alert_outcome(
+            event_time_s=event,
+            observation_end_s=event,
+            policy=policy,
+            confirmed_alert_time_s=None,
+        )
+        == "insufficient_coverage"
+    )
+    assert (
+        classify_alert_outcome(
+            event_time_s=event,
+            observation_end_s=99.0,
+            policy=policy,
+            confirmed_alert_time_s=None,
+        )
+        == "miss"
+    )
+    assert has_sufficient_coverage(event, event, policy, timestamps_s=[event]) is False
+    assert has_sufficient_coverage(event, event, policy, timestamps_s=[99.0, event]) is True
+
+    pred = pd.DataFrame(
+        {
+            "run_id": ["r"] * 4,
+            "unit_id": ["at_event", "before", "with_prior", "with_prior"],
+            "timestamp_s": [100.0, 99.0, 99.0, 100.0],
+            "predicted_rul_s": [50.0] * 4,
+        }
+    )
+    units = pd.DataFrame(
+        {
+            "unit_id": ["at_event", "before", "with_prior"],
+            "event_time_s": [100.0, 100.0, 100.0],
+            "observation_end_s": [100.0, 99.0, 100.0],
+        }
+    )
+    by = run_alert_evaluation(pred, policy, units=units)["by_unit"].set_index("unit_id")
+    assert by.loc["at_event", "alert_outcome"] == "insufficient_coverage"
+    assert bool(by.loc["at_event", "has_sufficient_coverage"]) is False
+    assert by.loc["before", "alert_outcome"] == "miss"
+    assert bool(by.loc["before", "has_sufficient_coverage"]) is True
+    # obs_end == event, but a step timestamp strictly before the event is enough.
+    assert by.loc["with_prior", "alert_outcome"] == "miss"
+    assert bool(by.loc["with_prior", "has_sufficient_coverage"]) is True
 
 
 def test_alert_multiple_episodes_and_time_weighting(tmp_path):
@@ -957,6 +1071,420 @@ def test_filter_causal_gap_uses_prefix_median_not_full_file():
     np.testing.assert_array_equal(rec["gap_before"].to_numpy(), causal)
 
 
+def _r2_filter_features(timestamps, *, gap_before_fill: bool = True, unit_id: str = "u0"):
+    ts = np.asarray(timestamps, dtype=np.float64)
+    dt = np.zeros(ts.size, dtype=np.float64)
+    if ts.size > 1:
+        dt[1:] = np.diff(ts)
+    n = int(ts.size)
+    return pd.DataFrame(
+        {
+            "dataset_id": ["filters"] * n,
+            "unit_id": [unit_id] * n,
+            "timestamp_s": ts,
+            "operating_age_s": ts,
+            "delta_t_s": dt,
+            "differential_pressure": np.linspace(10.0, 100.0, n),
+            "delta_pressure": np.zeros(n),
+            "flow_rate": np.full(n, 80.0),
+            "dust_feed": np.full(n, 100.0),
+            "dust": ["A3"] * n,
+            "gap_before": np.full(n, gap_before_fill, dtype=bool),
+        }
+    )
+
+
+def _r2_units(*, observation_end_s: float = 10_000.0, unit_id: str = "u0"):
+    return pd.DataFrame(
+        {
+            "unit_id": [unit_id],
+            "event_observed": [0],
+            "event_time_s": [np.nan],
+            "observation_end_s": [observation_end_s],
+        }
+    )
+
+
+def test_review_r2_window_61242_offline_online_match():
+    ts = np.array([0.0, 6.0, 12.0, 42.0, 142.0, 242.0, 342.0])
+    hist, k, samp = 3, 3.0, 6.0
+    features = _r2_filter_features(ts, gap_before_fill=True)
+    units = _r2_units()
+    windows = build_windows(
+        features, units, hist, "filters", gap_multiplier=k, sampling_interval_s=samp
+    )
+    offline_ends = {float(t) for t in windows["timestamp_s"]}
+    idx_42 = int(np.where(ts == 42.0)[0][0])
+
+    for end_idx, t in enumerate(ts):
+        prefix = features.iloc[: end_idx + 1]
+        online_ok, reason = valid_history_window(
+            prefix,
+            hist,
+            dataset_id="filters",
+            required_columns=[],
+            gap_multiplier=k,
+            sampling_interval_s=samp,
+        )
+        offline_ok = t in offline_ends
+        assert online_ok == offline_ok, (t, online_ok, offline_ok, reason)
+        src = ReplaySource(features, gap_multiplier=k, sampling_interval_s=samp)
+        rec = src.prefix(end_idx)
+        ok_src, reason_src = valid_history_window(
+            rec,
+            hist,
+            dataset_id="filters",
+            required_columns=[],
+            gap_multiplier=k,
+            sampling_interval_s=samp,
+        )
+        assert ok_src == online_ok
+        assert reason_src == reason
+
+    prefix_42 = features.iloc[: idx_42 + 1]
+    online_42, reason_42 = valid_history_window(
+        prefix_42,
+        hist,
+        dataset_id="filters",
+        required_columns=[],
+        gap_multiplier=k,
+        sampling_interval_s=samp,
+    )
+    assert not online_42 and reason_42 == "gap_in_window"
+    assert 42.0 not in offline_ends
+    assert 12.0 in offline_ends
+    causal_42 = recompute_filter_gap_before(
+        prefix_42, gap_multiplier=k, sampling_interval_s=samp, causal=True
+    )
+    flag_42 = bool(causal_42.loc[causal_42["timestamp_s"] == 42.0, "gap_before"].iloc[0])
+    dt = np.zeros(ts.size, dtype=np.float64)
+    dt[1:] = np.diff(ts)
+    full = gap_before_from_delta_t(dt, gap_multiplier=k, sampling_interval_s=samp, causal=False)
+    assert flag_42
+    assert not bool(full[idx_42])
+
+    extra = np.array([1042.0, 2042.0, 3042.0])
+    ts_long = np.concatenate([ts, extra])
+    features_long = _r2_filter_features(ts_long, gap_before_fill=False)
+    units_long = _r2_units(observation_end_s=10_000.0)
+    windows_long = build_windows(
+        features_long, units_long, hist, "filters", gap_multiplier=k, sampling_interval_s=samp
+    )
+    prefix_42_long = features_long.iloc[: idx_42 + 1]
+    causal_long = recompute_filter_gap_before(
+        prefix_42_long, gap_multiplier=k, sampling_interval_s=samp, causal=True
+    )
+    np.testing.assert_array_equal(
+        causal_42["gap_before"].to_numpy(), causal_long["gap_before"].to_numpy()
+    )
+    online_long, reason_long = valid_history_window(
+        prefix_42_long,
+        hist,
+        dataset_id="filters",
+        required_columns=[],
+        gap_multiplier=k,
+        sampling_interval_s=samp,
+    )
+    assert online_long == online_42 and reason_long == reason_42
+    assert (windows_long["timestamp_s"] == 42.0).any() == (windows["timestamp_s"] == 42.0).any()
+
+    dense_future = float(ts[-1]) + np.cumsum(np.full(40, 1.0))
+    ts_dense = np.concatenate([ts, dense_future])
+    dt_dense = np.zeros(ts_dense.size, dtype=np.float64)
+    dt_dense[1:] = np.diff(ts_dense)
+    full_dense = gap_before_from_delta_t(
+        dt_dense, gap_multiplier=k, sampling_interval_s=samp, causal=False
+    )
+    causal_dt = gap_before_from_delta_t(dt, gap_multiplier=k, sampling_interval_s=samp, causal=True)
+    causal_dense = gap_before_from_delta_t(
+        dt_dense, gap_multiplier=k, sampling_interval_s=samp, causal=True
+    )
+    np.testing.assert_array_equal(causal_dt, causal_dense[: ts.size])
+    assert not np.array_equal(full, full_dense[: ts.size])
+
+    prep = Preprocessor(
+        feature_names=["operating_age_s"],
+        log1p_features=[],
+        scaler_mean=[0.0],
+        scaler_scale=[1.0],
+        time_scale_s=1.0,
+        fill_values={"operating_age_s": 0.0},
+        dataset_id="filters",
+        gap_multiplier=k,
+        sampling_interval_s=samp,
+    )
+    model = PDMNet(1, hidden_size=4, architecture="gru", head="weibull", time_scale_s=1.0)
+    predictor = Predictor(model, prep, history_length=hist)
+    out_short = predictor.predict_from_history(prefix_42)
+    out_long = predictor.predict_from_history(prefix_42_long)
+    assert out_short.get("valid_history_reason") == out_long.get("valid_history_reason") == "gap_in_window"
+    src_long = ReplaySource(features_long, gap_multiplier=k, sampling_interval_s=samp)
+    rec_long = src_long.prefix(idx_42)
+    np.testing.assert_array_equal(rec_long["gap_before"].to_numpy(), causal_42["gap_before"].to_numpy())
+
+
+def test_build_windows_matches_valid_history_even_when_stored_flags_poisoned():
+    ts = np.array([0.0, 6.0, 12.0, 18.0, 24.0, 30.0, 36.0])
+    hist, k, samp = 3, 3.0, 6.0
+    all_true = _r2_filter_features(ts, gap_before_fill=True)
+    dt = np.zeros(ts.size, dtype=np.float64)
+    dt[1:] = np.diff(ts)
+    full_flags = gap_before_from_delta_t(dt, gap_multiplier=k, sampling_interval_s=samp, causal=False)
+    full_file = _r2_filter_features(ts, gap_before_fill=False)
+    full_file["gap_before"] = full_flags
+    units = _r2_units()
+    for features in (all_true, full_file):
+        windows = build_windows(
+            features, units, hist, "filters", gap_multiplier=k, sampling_interval_s=samp
+        )
+        offline_ends = {float(t) for t in windows["timestamp_s"]}
+        for end_idx, t in enumerate(ts):
+            online_ok, _reason = valid_history_window(
+                features.iloc[: end_idx + 1],
+                hist,
+                dataset_id="filters",
+                required_columns=[],
+                gap_multiplier=k,
+                sampling_interval_s=samp,
+            )
+            assert online_ok == (t in offline_ends)
+        counts = count_window_eligibility(
+            features, units, hist, "filters", gap_multiplier=k, sampling_interval_s=samp
+        )
+        assert counts["eligible"] == len(windows)
+
+
+def test_build_windows_skips_duplicate_or_nonmonotonic_timestamps():
+    hist, k, samp = 3, 3.0, 6.0
+    units = _r2_units()
+    dup = _r2_filter_features([0.0, 6.0, 6.0, 12.0], gap_before_fill=False)
+    windows = build_windows(
+        dup, units, hist, "filters", gap_multiplier=k, sampling_interval_s=samp
+    )
+    prefix = dup.iloc[:3]
+    online_ok, reason = valid_history_window(
+        prefix,
+        hist,
+        dataset_id="filters",
+        required_columns=[],
+        gap_multiplier=k,
+        sampling_interval_s=samp,
+    )
+    assert not online_ok
+    assert reason == "timestamps_not_strictly_increasing"
+    assert window_timestamp_reason(prefix["timestamp_s"].to_numpy()) == reason
+    assert windows.empty or 6.0 not in set(windows["timestamp_s"].astype(float))
+    counts = count_window_eligibility(
+        dup, units, hist, "filters", gap_multiplier=k, sampling_interval_s=samp
+    )
+    assert counts["excluded"]["timestamps"] >= 1
+
+    nan_ts = _r2_filter_features([0.0, 6.0, 12.0, 18.0], gap_before_fill=False)
+    nan_ts.loc[nan_ts.index[-1], "timestamp_s"] = np.nan
+    ok_nan, reason_nan = valid_history_window(
+        nan_ts,
+        hist,
+        dataset_id="filters",
+        required_columns=[],
+        gap_multiplier=k,
+        sampling_interval_s=samp,
+    )
+    w_nan = build_windows(
+        nan_ts, units, hist, "filters", gap_multiplier=k, sampling_interval_s=samp
+    )
+    assert not ok_nan and reason_nan == "non_finite_timestamps"
+    assert not w_nan.empty
+    assert np.isfinite(w_nan["timestamp_s"].to_numpy(dtype=np.float64)).all()
+
+
+def test_measurements_from_csv_writes_causal_gap_flags():
+    ts = np.array([0.0, 6.0, 12.0, 42.0, 142.0, 242.0, 342.0])
+    df = pd.DataFrame(
+        {
+            "Data_No": np.ones(ts.size, dtype=int),
+            "Time": ts / 60.0,
+            "Differential_pressure": np.linspace(10.0, 100.0, ts.size),
+            "Flow_rate": 80.0,
+            "Dust_feed": 100.0,
+            "Dust": "A3",
+        }
+    )
+    out = _measurements_from_csv(df, "author_train", 60.0, 3.0, 6.0)
+    dt = out["delta_t_s"].to_numpy(dtype=np.float64)
+    causal = gap_before_from_delta_t(dt, gap_multiplier=3.0, sampling_interval_s=6.0, causal=True)
+    full = gap_before_from_delta_t(dt, gap_multiplier=3.0, sampling_interval_s=6.0, causal=False)
+    np.testing.assert_array_equal(out["gap_before"].to_numpy(), causal)
+    assert bool(causal[3]) and not bool(full[3])
+
+
+def test_write_processed_version_records_causal_gap_rule(tmp_path, tiny_filter_tables):
+    features, units = tiny_filter_tables
+    split = filters_split(units)
+    rec = write_processed_version(
+        "filters",
+        features,
+        units,
+        split,
+        sensor_note="n",
+        cfg={},
+        processed_root=tmp_path / "filters",
+    )
+    assert rec["fingerprint"]["gap_rule_version"] == GAP_RULE_VERSION == "causal_v1"
+    schema = json.loads((rec["dir"] / "feature_schema.json").read_text(encoding="utf-8"))
+    assert schema["gap_rule_version"] == "causal_v1"
+    fp_disk = json.loads((rec["dir"] / "processed_fingerprint.json").read_text(encoding="utf-8"))
+    assert fp_disk["gap_rule_version"] == "causal_v1"
+    assert rec["report"]["gap_rule_version"] == "causal_v1"
+    diag = rec["report"]["gap_diagnostics"]
+    assert diag["fullfile_is_diagnostic_only"] is True
+    assert diag["eligibility_rule"] == GAP_RULE_VERSION
+
+
+def test_stale_or_missing_gap_rule_version_refuses_train_and_eval(
+    tmp_path, monkeypatch, tiny_filter_tables
+):
+    features, units = tiny_filter_tables
+    split = filters_split(units)
+    base_fp = {
+        "dataset_id": "filters",
+        "dataset_version": "stub",
+        "split_hash": split_hash(split),
+        "features_hash": "a" * 64,
+        "units_hash": "b" * 64,
+        "feature_pipeline_version": FEATURE_PIPELINE_VERSION,
+    }
+
+    def _processed(version):
+        fp = dict(base_fp)
+        if version is not None:
+            fp["gap_rule_version"] = version
+        return {
+            "features": features,
+            "units": units,
+            "split": split,
+            "report": {},
+            "dir": tmp_path,
+            "fingerprint": fp,
+            "dataset_version": "stub",
+            "gap_rule_version": version,
+        }
+
+    monkeypatch.setattr("pdm.train.load_processed", lambda _ds: _processed(None))
+    with pytest.raises(IncompatibleDataError) as missing_train:
+        run_training("filters", smoke=True, max_epochs=1)
+    assert "gap_rule_version" in missing_train.value.differing
+
+    monkeypatch.setattr("pdm.train.load_processed", lambda _ds: _processed("fullfile_v0"))
+    with pytest.raises(IncompatibleDataError) as stale_train:
+        run_training("filters", smoke=True, max_epochs=1)
+    assert "gap_rule_version" in stale_train.value.differing
+
+    both_missing = fingerprint_mismatches(base_fp, base_fp)
+    assert "gap_rule_version" in both_missing
+    both_stale = fingerprint_mismatches(
+        {**base_fp, "gap_rule_version": "fullfile_v0"},
+        {**base_fp, "gap_rule_version": "fullfile_v0"},
+    )
+    assert "gap_rule_version" in both_stale
+    current = {**base_fp, "gap_rule_version": GAP_RULE_VERSION}
+    assert "gap_rule_version" not in fingerprint_mismatches(current, current)
+    with pytest.raises(IncompatibleDataError):
+        assert_gap_rule_current(base_fp)
+    with pytest.raises(IncompatibleDataError):
+        assert_gap_rule_current({**base_fp, "gap_rule_version": "fullfile_v0"})
+
+    processed_root = tmp_path / "processed" / "filters"
+    runs_root = tmp_path / "runs"
+    monkeypatch.setattr("pdm.data.prepare.dataset_processed", lambda _id: processed_root)
+    monkeypatch.setattr("pdm.paths.dataset_runs", lambda _id: runs_root / _id)
+    rec = write_processed_version(
+        "filters",
+        features,
+        units,
+        split,
+        sensor_note="n",
+        cfg={},
+        processed_root=processed_root,
+    )
+    fp_path = rec["dir"] / "processed_fingerprint.json"
+    live_fp = json.loads(fp_path.read_text(encoding="utf-8"))
+    live_fp.pop("gap_rule_version", None)
+    fp_path.write_text(json.dumps(live_fp), encoding="utf-8")
+    schema_path = rec["dir"] / "feature_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema.pop("gap_rule_version", None)
+    schema_path.write_text(json.dumps(schema), encoding="utf-8")
+
+    rdir = runs_root / "filters" / "stub_run"
+    rdir.mkdir(parents=True)
+    run_fp = dict(live_fp)
+    (rdir / "best.pt").write_bytes(b"synthetic-checkpoint-bytes")
+    atomic_write_json(rdir / "dataset_fingerprint.json", run_fp)
+    atomic_write_json(rdir / "split.json", split)
+    with pytest.raises(IncompatibleDataError) as missing_eval:
+        bind_evaluation_to_run(rdir, "filters")
+    assert "gap_rule_version" in missing_eval.value.differing
+
+    live_fp["gap_rule_version"] = "fullfile_v0"
+    fp_path.write_text(json.dumps(live_fp), encoding="utf-8")
+    run_fp["gap_rule_version"] = "fullfile_v0"
+    atomic_write_json(rdir / "dataset_fingerprint.json", run_fp)
+    with pytest.raises(IncompatibleDataError) as stale_eval:
+        bind_evaluation_to_run(rdir, "filters")
+    assert "gap_rule_version" in stale_eval.value.differing
+
+
+def test_schema_only_gap_rule_version_refuses_train_and_eval(
+    tmp_path, monkeypatch, tiny_filter_tables
+):
+    """feature_schema.json is not a train/eval gate. Fingerprint JSON is."""
+    features, units = tiny_filter_tables
+    split = filters_split(units)
+    processed_root = tmp_path / "processed" / "filters"
+    runs_root = tmp_path / "runs"
+    monkeypatch.setattr("pdm.data.prepare.dataset_processed", lambda _id: processed_root)
+    monkeypatch.setattr("pdm.paths.dataset_runs", lambda _id: runs_root / _id)
+    rec = write_processed_version(
+        "filters",
+        features,
+        units,
+        split,
+        sensor_note="n",
+        cfg={},
+        processed_root=processed_root,
+    )
+    fp_path = rec["dir"] / "processed_fingerprint.json"
+    live_fp = json.loads(fp_path.read_text(encoding="utf-8"))
+    live_fp.pop("gap_rule_version", None)
+    fp_path.write_text(json.dumps(live_fp), encoding="utf-8")
+    schema = json.loads((rec["dir"] / "feature_schema.json").read_text(encoding="utf-8"))
+    assert schema.get("gap_rule_version") == GAP_RULE_VERSION
+
+    loaded = load_processed("filters")
+    assert loaded["fingerprint"].get("gap_rule_version") is None
+    assert loaded.get("gap_rule_version") is None
+    with pytest.raises(IncompatibleDataError):
+        assert_gap_rule_current(
+            {
+                "gap_rule_version": GAP_RULE_VERSION,
+                "fingerprint": loaded["fingerprint"],
+            }
+        )
+
+    with pytest.raises(IncompatibleDataError) as ei_train:
+        run_training("filters", smoke=True, max_epochs=1)
+    assert "gap_rule_version" in ei_train.value.differing
+
+    rdir = runs_root / "filters" / "schema_only_run"
+    rdir.mkdir(parents=True)
+    (rdir / "best.pt").write_bytes(b"synthetic-checkpoint-bytes")
+    atomic_write_json(rdir / "dataset_fingerprint.json", dict(live_fp))
+    atomic_write_json(rdir / "split.json", split)
+    with pytest.raises(IncompatibleDataError) as ei_eval:
+        bind_evaluation_to_run(rdir, "filters")
+    assert "gap_rule_version" in ei_eval.value.differing
+
+
 def test_split_hash_alias_and_protocol_identity():
     split = {
         "train": ["a", "b"],
@@ -1020,6 +1548,7 @@ def test_processed_fingerprint_versioning_does_not_mutate_prior(
     fp1 = rec1["fingerprint"]
     assert fp1["dataset_version"] == v1
     assert fp1["feature_pipeline_version"] == FEATURE_PIPELINE_VERSION
+    assert fp1["gap_rule_version"] == GAP_RULE_VERSION
     assert fp1["split_hash"] == split_hash(split)
     assert fp1["features_hash"] == h1
     assert fp1["features_hash_short"] == h1[:12]
@@ -1254,6 +1783,257 @@ def _write_tiny_bearing_checkpoint(rdir, prep, split, fp, *, history_length: int
     atomic_write_json(rdir / "dataset_fingerprint.json", fp)
 
 
+def _write_tiny_experiment_snapshot(rdir, **overrides) -> dict:
+    snap = dict(load_dataset_config("bearings"))
+    snap["metrics_version"] = METRICS_VERSION
+    snap["gap_rule_version"] = GAP_RULE_VERSION
+    snap["feature_pipeline_version"] = FEATURE_PIPELINE_VERSION
+    snap["source_commit"] = None
+    prep_path = rdir / "preprocessing.json"
+    if prep_path.exists():
+        snap["preprocessing_hash"] = sha256_file(prep_path)
+    snap.update(overrides)
+    atomic_write_json(rdir / "experiment_snapshot.json", snap)
+    return snap
+
+
+def _tiny_bearing_run(tmp_path, monkeypatch, tiny_bearing_tables, run_id="tiny_eval_run"):
+    features, units = tiny_bearing_tables
+    split = bearings_split(units)
+    processed_root = tmp_path / "processed" / "bearings"
+    runs_root = tmp_path / "runs"
+    monkeypatch.setattr("pdm.data.prepare.dataset_processed", lambda _id: processed_root)
+    monkeypatch.setattr("pdm.paths.dataset_runs", lambda _id: runs_root / _id)
+    rec = write_processed_version(
+        "bearings", features, units, split, sensor_note="n", cfg={}, processed_root=processed_root
+    )
+    rdir = runs_root / "bearings" / run_id
+    rdir.mkdir(parents=True)
+    fp = dataset_fingerprint_for_run(
+        {"fingerprint": rec["fingerprint"], "dir": rec["dir"], "split": split}, split
+    )
+    prep, _ = fit_preprocessor("bearings", features, units, split, {"features": {"log1p_features": []}})
+    _write_tiny_bearing_checkpoint(rdir, prep, split, fp, history_length=3)
+    return features, units, split, rec, rdir, run_id, prep
+
+
+def test_evaluate_uses_snapshot_pressure_limit_not_live_yaml(
+    tmp_path, monkeypatch, tiny_bearing_tables
+):
+    _features, _units, _split, _rec, rdir, run_id, _prep = _tiny_bearing_run(
+        tmp_path, monkeypatch, tiny_bearing_tables
+    )
+    _write_tiny_experiment_snapshot(
+        rdir,
+        pressure_limit_pa=500.0,
+        evaluation={"near_event_zones_s": [120, 60]},
+    )
+    live = dict(load_dataset_config("bearings"))
+    live["pressure_limit_pa"] = 600.0
+    live["evaluation"] = {"near_event_zones_s": [3600, 1800, 600]}
+
+    def fake_cfg(_dataset_id, _overrides=None):
+        return dict(live)
+
+    monkeypatch.setattr("pdm.config.load_dataset_config", fake_cfg)
+    seen: dict[str, float] = {}
+    import pdm.evaluate as ev
+
+    orig_gen = ev.generate_split_predictions
+
+    def spy_gen(**kwargs):
+        seen["pressure_limit_pa"] = kwargs["pressure_limit_pa"]
+        return orig_gen(**kwargs)
+
+    monkeypatch.setattr(ev, "generate_split_predictions", spy_gen)
+    rec = evaluate_run(
+        "bearings", run_id, warning_horizon_s=60.0, confirmation_count=1, device="cpu"
+    )
+    assert seen["pressure_limit_pa"] == 500.0
+    assert load_run_pressure_limit_pa(rdir, 600.0) == 500.0
+    assert load_experiment_snapshot(rdir)["pressure_limit_pa"] == 500.0
+    task_cfg, missing = resolve_run_task_config(rdir, live)
+    assert missing is False
+    assert load_near_event_zones_s(task_cfg) == [120.0, 60.0]
+    edir = rdir / "evaluations" / rec["eval_id"]
+    cfg = json.loads((edir / "evaluation_config.json").read_text(encoding="utf-8"))
+    metrics = json.loads((edir / "metrics.json").read_text(encoding="utf-8"))
+    assert cfg["snapshot_missing"] is False
+    assert cfg["pressure_limit_pa"] == 500.0
+    assert metrics["near_event_zones_s"] == [120, 60]
+    assert live["pressure_limit_pa"] == 600.0
+
+
+def test_resume_does_not_rewrite_preprocessing_json(tmp_path, monkeypatch, tiny_bearing_tables):
+    features, units = tiny_bearing_tables
+    split = bearings_split(units)
+    processed_root = tmp_path / "processed" / "bearings"
+    runs_root = tmp_path / "runs"
+    monkeypatch.setattr("pdm.data.prepare.dataset_processed", lambda _id: processed_root)
+    monkeypatch.setattr("pdm.paths.dataset_runs", lambda _id: runs_root / _id)
+    monkeypatch.setattr("pdm.train.dataset_runs", lambda _id: runs_root / _id)
+    write_processed_version(
+        "bearings", features, units, split, sensor_note="n", cfg={}, processed_root=processed_root
+    )
+    rec = run_training(
+        "bearings",
+        architecture="gru",
+        smoke=True,
+        max_epochs=1,
+        history_length=3,
+        device_pref="cpu",
+        max_windows_per_unit=8,
+    )
+    rdir = Path(rec["dir"])
+    prep_path = rdir / "preprocessing.json"
+    snap_path = rdir / "experiment_snapshot.json"
+    assert prep_path.exists() and snap_path.exists()
+    snap = json.loads(snap_path.read_text(encoding="utf-8"))
+    assert snap["preprocessing_hash"] == sha256_file(prep_path)
+    assert snap["metrics_version"] == METRICS_VERSION
+    assert snap["gap_rule_version"] == GAP_RULE_VERSION
+    assert snap["feature_pipeline_version"] == FEATURE_PIPELINE_VERSION
+    assert snap.get("source_commit") is None or isinstance(snap.get("source_commit"), str)
+    assert "alerts" in snap and "gap" in snap and "model" in snap
+    assert snap["evaluation"]["near_event_zones_s"] == [3600, 1800, 600]
+    hash_before = sha256_file(prep_path)
+    bytes_before = prep_path.read_bytes()
+    cfg_before = (rdir / "config.yaml").read_bytes()
+    rec2 = run_training(
+        "bearings",
+        architecture="gru",
+        history_length=3,
+        resume_run_id=rec["run_id"],
+        device_pref="cpu",
+    )
+    assert rec2["run_id"] == rec["run_id"]
+    assert sha256_file(prep_path) == hash_before
+    assert prep_path.read_bytes() == bytes_before
+    assert (rdir / "config.yaml").read_bytes() == cfg_before
+    orig_fit = fit_preprocessor
+
+    def drifted_fit(*args, **kwargs):
+        prep, feat = orig_fit(*args, **kwargs)
+        prep.scaler_mean = [float(x) + 1.0 for x in prep.scaler_mean]
+        return prep, feat
+
+    monkeypatch.setattr("pdm.train.fit_preprocessor", drifted_fit)
+    with pytest.raises(IncompatibleDataError) as ei:
+        run_training(
+            "bearings",
+            architecture="gru",
+            history_length=3,
+            resume_run_id=rec["run_id"],
+            device_pref="cpu",
+        )
+    assert "scaler" in ei.value.differing
+    assert sha256_file(prep_path) == hash_before
+    assert (rdir / "config.yaml").read_bytes() == cfg_before
+
+
+def test_resume_aborts_if_live_yaml_gap_multiplier_drifts(
+    tmp_path, monkeypatch, tiny_filter_tables
+):
+    features, units = tiny_filter_tables
+    split = filters_split(units)
+    processed_root = tmp_path / "processed" / "filters"
+    runs_root = tmp_path / "runs"
+    monkeypatch.setattr("pdm.data.prepare.dataset_processed", lambda _id: processed_root)
+    monkeypatch.setattr("pdm.paths.dataset_runs", lambda _id: runs_root / _id)
+    monkeypatch.setattr("pdm.train.dataset_runs", lambda _id: runs_root / _id)
+    write_processed_version(
+        "filters", features, units, split, sensor_note="n", cfg={}, processed_root=processed_root
+    )
+    run_id = "filters_resume_gap"
+    rdir = runs_root / "filters" / run_id
+    rdir.mkdir(parents=True)
+    snap = dict(load_dataset_config("filters"))
+    snap["gap"] = dict(snap.get("gap") or {})
+    snap["gap"]["gap_multiplier"] = 3.0
+    snap["gap"]["sampling_interval_s"] = 6.0
+    snap["model"] = dict(snap.get("model") or {})
+    snap["model"]["architecture"] = "gru"
+    snap["model"]["history_length"] = 20
+    atomic_write_json(rdir / "experiment_snapshot.json", snap)
+    cfg_path = rdir / "config.yaml"
+    cfg_path.write_text("dataset_id: filters\nmarker: keep_saved_config\n", encoding="utf-8")
+    live = dict(load_dataset_config("filters"))
+    live["gap"] = dict(live.get("gap") or {})
+    live["gap"]["gap_multiplier"] = 9.0
+
+    def fake_cfg(_dataset_id, _overrides=None):
+        return dict(live)
+
+    monkeypatch.setattr("pdm.train.load_dataset_config", fake_cfg)
+    seen_mult: list[float] = []
+    orig_bw = build_windows
+
+    def spy_bw(*args, **kwargs):
+        if kwargs.get("gap_multiplier") is not None:
+            seen_mult.append(float(kwargs["gap_multiplier"]))
+        return orig_bw(*args, **kwargs)
+
+    monkeypatch.setattr("pdm.train.build_windows", spy_bw)
+    with pytest.raises(IncompatibleDataError) as ei:
+        run_training("filters", architecture="gru", resume_run_id=run_id, device_pref="cpu")
+    assert "gap_multiplier" in ei.value.differing
+    assert 9.0 not in seen_mult
+    assert "keep_saved_config" in cfg_path.read_text(encoding="utf-8")
+
+
+def test_force_eval_checkpoint_hash_is_actual_bytes(tmp_path, monkeypatch, tiny_bearing_tables):
+    _features, _units, _split, _rec, rdir, run_id, _prep = _tiny_bearing_run(
+        tmp_path, monkeypatch, tiny_bearing_tables, run_id="tiny_force_run"
+    )
+    actual = checkpoint_hash(rdir / "best.pt")
+    fp = json.loads((rdir / "dataset_fingerprint.json").read_text(encoding="utf-8"))
+    expected = "0" * 64
+    fp["checkpoint_hash"] = expected
+    atomic_write_json(rdir / "dataset_fingerprint.json", fp)
+    with pytest.raises(IncompatibleDataError) as ei:
+        bind_evaluation_to_run(rdir, "bearings")
+    assert "checkpoint_hash" in ei.value.differing
+    rec = evaluate_run(
+        "bearings",
+        run_id,
+        warning_horizon_s=60.0,
+        confirmation_count=1,
+        device="cpu",
+        force=True,
+    )
+    cfg = json.loads(
+        (rdir / "evaluations" / rec["eval_id"] / "evaluation_config.json").read_text(encoding="utf-8")
+    )
+    assert cfg["checkpoint_hash"] == actual
+    assert cfg["expected_checkpoint_hash"] == expected
+    assert cfg["checkpoint_hash"] != cfg["expected_checkpoint_hash"]
+
+
+def test_metrics_version_drift_is_method_changed_not_incompatible_data(
+    tmp_path, monkeypatch, tiny_bearing_tables
+):
+    _features, _units, _split, _rec, rdir, run_id, _prep = _tiny_bearing_run(
+        tmp_path, monkeypatch, tiny_bearing_tables, run_id="tiny_metrics_run"
+    )
+    _write_tiny_experiment_snapshot(rdir, metrics_version="v0")
+    bound = bind_evaluation_to_run(rdir, "bearings")
+    assert bound["evaluation_method_changed"] is True
+    assert bound["snapshot_metrics_version"] == "v0"
+    assert "metrics_version" not in bound["differing"]
+    rec = evaluate_run(
+        "bearings", run_id, warning_horizon_s=60.0, confirmation_count=1, device="cpu"
+    )
+    assert rec["eval_id"]
+    cfg = json.loads(
+        (rdir / "evaluations" / rec["eval_id"] / "evaluation_config.json").read_text(encoding="utf-8")
+    )
+    assert cfg["evaluation_method_changed"] is True
+    assert cfg["snapshot_metrics_version"] == "v0"
+    assert cfg["metrics_version"] == METRICS_VERSION
+    assert METRICS_VERSION != "v0"
+    assert cfg["snapshot_missing"] is False
+
+
 def test_evaluate_run_immutable_dirs_predictions_independent_of_hk(
     tmp_path, monkeypatch, tiny_bearing_tables
 ):
@@ -1278,12 +2058,7 @@ def test_evaluate_run_immutable_dirs_predictions_independent_of_hk(
 
     rec1 = evaluate_run("bearings", run_id, warning_horizon_s=60.0, confirmation_count=1, device="cpu")
     policy_path = rdir / "alert_policy.json"
-    assert policy_path.exists()
-    frozen1 = json.loads(policy_path.read_text(encoding="utf-8"))
-    assert frozen1["H_trigger"] == 60.0
-    assert frozen1["warning_horizon_s"] == 60.0
-    assert frozen1["confirmation_count"] == 1
-    assert frozen1["minimum_action_lead_time"] == 30.0
+    assert not policy_path.exists()
     rec2 = evaluate_run("bearings", run_id, warning_horizon_s=10_000.0, confirmation_count=7, device="cpu")
     assert rec1["eval_id"] != rec2["eval_id"]
     assert rec1["metrics_version"] == METRICS_VERSION
@@ -1309,6 +2084,9 @@ def test_evaluate_run_immutable_dirs_predictions_independent_of_hk(
         assert cfg["split_hash"]
         assert cfg["evaluate_mask"]["split"] == "test"
         assert cfg["evaluate_mask"]["unit_ids"] == list(split["test"])
+        assert cfg["evaluate_mask"]["blind_benchmark"] is False
+        assert cfg["source"] == "research"
+        assert cfg["alert_policy"]["source"] == "research"
         assert cfg["metrics_version"] == METRICS_VERSION
         assert "minimum_action_lead_time" not in cfg
         assert "warning_horizon_s" not in cfg
@@ -1338,6 +2116,9 @@ def test_evaluate_run_immutable_dirs_predictions_independent_of_hk(
         assert set(by_unit["unit_id"].astype(str)) == set(split["test"])
         pred = pd.read_csv(edir / "predictions.csv")
         assert "alert_status" not in pred.columns
+        assert "observed_limit_reached" in pred.columns
+        assert "prediction_status" in pred.columns
+        assert "valid_history_reason" in pred.columns
         assert not pred.empty
         alerts = pd.read_csv(edir / "alerts.csv")
         assert "timestamp_s" in alerts.columns or alerts.empty
@@ -1370,11 +2151,18 @@ def test_evaluate_run_immutable_dirs_predictions_independent_of_hk(
     assert rec3["eval_id"] not in {rec1["eval_id"], rec2["eval_id"]}
     assert (d1 / "predictions.csv").read_text(encoding="utf-8") == first_pred
     assert len(list_evaluations(rdir)) == 3
-    frozen2 = json.loads(policy_path.read_text(encoding="utf-8"))
-    assert frozen2["H_trigger"] == frozen1["H_trigger"]
-    assert frozen2["confirmation_count"] == frozen1["confirmation_count"]
-    assert frozen2["minimum_action_lead_time"] == frozen1["minimum_action_lead_time"]
-    assert frozen2["policy_hash"] == frozen1["policy_hash"]
+    assert not policy_path.exists()
+    save_alert_policy(
+        rdir,
+        build_alert_policy(
+            H_trigger=60.0,
+            confirmation_count=1,
+            minimum_action_lead_time=30.0,
+            source="validation_ui",
+            split="validation",
+            unit_ids=list(split["validation"]),
+        ),
+    )
     cfg1 = json.loads((d1 / "evaluation_config.json").read_text(encoding="utf-8"))
     cfg_identity = {k: v for k, v in cfg1.items() if k != "alert_policy"}
     merged = copy_alert_policy_into_evaluation_config(cfg_identity, run_dir=rdir)
@@ -1384,6 +2172,399 @@ def test_evaluate_run_immutable_dirs_predictions_independent_of_hk(
     assert "alert_policy" in cfg1
     assert load_alert_policy(rdir)["H_trigger"] == 60.0
     assert (d1 / "predictions.csv").read_text(encoding="utf-8") == first_pred
+
+
+def _setup_tiny_bearing_eval(tmp_path, monkeypatch, tiny_bearing_tables, run_id="tiny_policy_run"):
+    features, units = tiny_bearing_tables
+    split = bearings_split(units)
+    processed_root = tmp_path / "processed" / "bearings"
+    runs_root = tmp_path / "runs"
+    monkeypatch.setattr("pdm.data.prepare.dataset_processed", lambda _id: processed_root)
+    monkeypatch.setattr("pdm.paths.dataset_runs", lambda _id: runs_root / _id)
+    rec = write_processed_version(
+        "bearings", features, units, split, sensor_note="n", cfg={}, processed_root=processed_root
+    )
+    rdir = runs_root / "bearings" / run_id
+    rdir.mkdir(parents=True)
+    fp = dataset_fingerprint_for_run(
+        {"fingerprint": rec["fingerprint"], "dir": rec["dir"], "split": split}, split
+    )
+    prep, _ = fit_preprocessor("bearings", features, units, split, {"features": {"log1p_features": []}})
+    _write_tiny_bearing_checkpoint(rdir, prep, split, fp, history_length=3)
+    return rdir, run_id, split
+
+
+def _freeze_validation_policy(
+    rdir,
+    split,
+    *,
+    h=60.0,
+    k=2,
+    lead=30.0,
+    checkpoint_hash="ckpt_val",
+):
+    return save_alert_policy(
+        rdir,
+        build_alert_policy(
+            H_trigger=h,
+            confirmation_count=k,
+            minimum_action_lead_time=lead,
+            source="validation_ui",
+            split="validation",
+            unit_ids=list(split["validation"]),
+            checkpoint_hash=checkpoint_hash,
+        ),
+    )
+
+
+def test_evaluate_mask_validation_vs_test_unit_lists(tmp_path, monkeypatch, tiny_bearing_tables):
+    rdir, run_id, split = _setup_tiny_bearing_eval(tmp_path, monkeypatch, tiny_bearing_tables)
+    bound = bind_evaluation_to_run(rdir, "bearings")
+    assert bound["validation_ids"] == list(split["validation"])
+    assert bound["test_ids"] == list(split["test"])
+    rec_val = evaluate_run(
+        "bearings",
+        run_id,
+        split_name="validation",
+        policy_mode="research",
+        warning_horizon_s=60.0,
+        confirmation_count=1,
+        device="cpu",
+    )
+    rec_test = evaluate_run(
+        "bearings",
+        run_id,
+        split_name="test",
+        policy_mode="research",
+        warning_horizon_s=60.0,
+        confirmation_count=1,
+        device="cpu",
+    )
+    assert rec_val["eval_id"] != rec_test["eval_id"]
+    cfg_val = json.loads(
+        (rdir / "evaluations" / rec_val["eval_id"] / "evaluation_config.json").read_text(encoding="utf-8")
+    )
+    cfg_test = json.loads(
+        (rdir / "evaluations" / rec_test["eval_id"] / "evaluation_config.json").read_text(encoding="utf-8")
+    )
+    assert cfg_val["evaluate_mask"]["split"] == "validation"
+    assert cfg_val["evaluate_mask"]["protocol"] == split["protocol"]
+    assert cfg_val["evaluate_mask"]["unit_ids"] == list(split["validation"])
+    assert cfg_val["evaluate_mask"]["blind_benchmark"] is False
+    assert cfg_val["source"] == "validation_eval"
+    assert cfg_val["alert_policy"]["source"] == "validation_eval"
+    assert cfg_test["evaluate_mask"]["split"] == "test"
+    assert cfg_test["evaluate_mask"]["unit_ids"] == list(split["test"])
+    assert cfg_test["evaluate_mask"]["blind_benchmark"] is False
+    assert cfg_test["source"] == "research"
+    by_val = pd.read_csv(rdir / "evaluations" / rec_val["eval_id"] / "metrics_by_unit.csv")
+    by_test = pd.read_csv(rdir / "evaluations" / rec_test["eval_id"] / "metrics_by_unit.csv")
+    assert set(by_val["unit_id"].astype(str)) == set(split["validation"])
+    assert set(by_test["unit_id"].astype(str)) == set(split["test"])
+
+
+def test_frozen_test_eval_ignores_hk_overrides(tmp_path, monkeypatch, tiny_bearing_tables):
+    rdir, run_id, split = _setup_tiny_bearing_eval(tmp_path, monkeypatch, tiny_bearing_tables)
+    frozen = _freeze_validation_policy(rdir, split, h=60.0, k=2, lead=30.0)
+    before = (rdir / "alert_policy.json").read_bytes()
+    rec = evaluate_run(
+        "bearings",
+        run_id,
+        split_name="test",
+        policy_mode="frozen",
+        warning_horizon_s=9999.0,
+        confirmation_count=9,
+        minimum_action_lead_time=1.0,
+        max_useful_horizon_s=2.0,
+        device="cpu",
+    )
+    after = (rdir / "alert_policy.json").read_bytes()
+    assert after == before
+    cfg = json.loads(
+        (rdir / "evaluations" / rec["eval_id"] / "evaluation_config.json").read_text(encoding="utf-8")
+    )
+    loaded = load_alert_policy(rdir)
+    assert cfg["alert_policy"]["policy_hash"] == frozen["policy_hash"]
+    assert cfg["alert_policy"]["policy_hash"] == loaded["policy_hash"]
+    assert cfg["alert_policy"]["H_trigger"] == 60.0
+    assert cfg["alert_policy"]["confirmation_count"] == 2
+    assert cfg["alert_policy"]["minimum_action_lead_time"] == 30.0
+    assert cfg["evaluate_mask"]["blind_benchmark"] is True
+    assert cfg["evaluate_mask"]["split"] == "test"
+
+
+def test_frozen_test_eval_without_policy_file_fails(tmp_path, monkeypatch, tiny_bearing_tables):
+    rdir, run_id, _split = _setup_tiny_bearing_eval(tmp_path, monkeypatch, tiny_bearing_tables)
+    policy_path = rdir / "alert_policy.json"
+    assert not policy_path.exists()
+    with pytest.raises(FileNotFoundError, match="Freeze from Validation first"):
+        evaluate_run("bearings", run_id, split_name="test", policy_mode="frozen", device="cpu")
+    assert not policy_path.exists()
+    with pytest.raises(FileNotFoundError, match="Freeze from Validation first"):
+        evaluate_run("bearings", run_id, device="cpu")
+    assert not policy_path.exists()
+
+
+def test_research_eval_does_not_create_alert_policy_json(tmp_path, monkeypatch, tiny_bearing_tables):
+    rdir, run_id, _split = _setup_tiny_bearing_eval(tmp_path, monkeypatch, tiny_bearing_tables)
+    policy_path = rdir / "alert_policy.json"
+    evaluate_run(
+        "bearings",
+        run_id,
+        split_name="test",
+        policy_mode="research",
+        warning_horizon_s=80.0,
+        confirmation_count=1,
+        device="cpu",
+    )
+    assert not policy_path.exists()
+
+
+def test_validation_evaluate_does_not_create_alert_policy_json(tmp_path, monkeypatch, tiny_bearing_tables):
+    rdir, run_id, split = _setup_tiny_bearing_eval(tmp_path, monkeypatch, tiny_bearing_tables)
+    policy_path = rdir / "alert_policy.json"
+    rec = evaluate_run(
+        "bearings",
+        run_id,
+        split_name="validation",
+        policy_mode="research",
+        warning_horizon_s=45.0,
+        confirmation_count=2,
+        minimum_action_lead_time=10.0,
+        device="cpu",
+    )
+    assert not policy_path.exists()
+    cfg = json.loads(
+        (rdir / "evaluations" / rec["eval_id"] / "evaluation_config.json").read_text(encoding="utf-8")
+    )
+    assert cfg["source"] == "validation_eval"
+    assert cfg["alert_policy"]["source"] == "validation_eval"
+    assert cfg["evaluate_mask"]["blind_benchmark"] is False
+    assert cfg["evaluate_mask"]["unit_ids"] == list(split["validation"])
+
+
+def test_cli_evaluate_without_hk_flags_is_frozen(tmp_path, monkeypatch, tiny_bearing_tables):
+    from pdm.cli import main as pdm_main
+
+    rdir, run_id, _split = _setup_tiny_bearing_eval(tmp_path, monkeypatch, tiny_bearing_tables)
+    policy_path = rdir / "alert_policy.json"
+    with pytest.raises(FileNotFoundError, match="Freeze from Validation first"):
+        pdm_main(["evaluate", "--dataset", "bearings", "--run-id", run_id])
+    assert not policy_path.exists()
+
+    captured = {}
+
+    def fake_eval(*_a, **kwargs):
+        captured.update(kwargs)
+        return {"eval_id": "x"}
+
+    monkeypatch.setattr("pdm.evaluate.evaluate_run", fake_eval)
+    pdm_main(["evaluate", "--dataset", "bearings", "--run-id", run_id])
+    assert captured["policy_mode"] == "frozen"
+    assert captured["split_name"] == "test"
+    assert captured["warning_horizon_s"] is None
+    assert captured["confirmation_count"] is None
+
+
+def test_cli_evaluate_with_hk_flags_is_research_never_writes(tmp_path, monkeypatch, tiny_bearing_tables):
+    from pdm.cli import main as pdm_main
+
+    rdir, run_id, _split = _setup_tiny_bearing_eval(tmp_path, monkeypatch, tiny_bearing_tables)
+    policy_path = rdir / "alert_policy.json"
+    captured = {}
+
+    def fake_eval(*_a, **kwargs):
+        captured.update(kwargs)
+        return {"eval_id": "x"}
+
+    monkeypatch.setattr("pdm.evaluate.evaluate_run", fake_eval)
+    pdm_main(
+        [
+            "evaluate",
+            "--dataset",
+            "bearings",
+            "--run-id",
+            run_id,
+            "--horizon-s",
+            "90",
+            "--k",
+            "2",
+            "--split",
+            "test",
+        ]
+    )
+    assert captured["policy_mode"] == "research"
+    assert captured["split_name"] == "test"
+    assert captured["warning_horizon_s"] == 90.0
+    assert captured["confirmation_count"] == 2
+
+    monkeypatch.setattr("pdm.evaluate.evaluate_run", evaluate_run)
+    pdm_main(
+        [
+            "evaluate",
+            "--dataset",
+            "bearings",
+            "--run-id",
+            run_id,
+            "--horizon-s",
+            "90",
+            "--k",
+            "2",
+        ]
+    )
+    assert not policy_path.exists()
+
+
+def test_research_eval_does_not_overwrite_alert_policy_json(tmp_path, monkeypatch, tiny_bearing_tables):
+    rdir, run_id, split = _setup_tiny_bearing_eval(tmp_path, monkeypatch, tiny_bearing_tables)
+    _freeze_validation_policy(rdir, split, h=60.0, k=2, lead=30.0)
+    policy_path = rdir / "alert_policy.json"
+    before = policy_path.read_bytes()
+    evaluate_run(
+        "bearings",
+        run_id,
+        split_name="test",
+        policy_mode="research",
+        warning_horizon_s=500.0,
+        confirmation_count=7,
+        device="cpu",
+    )
+    assert policy_path.read_bytes() == before
+    loaded = load_alert_policy(rdir)
+    assert loaded["H_trigger"] == 60.0
+    assert loaded["confirmation_count"] == 2
+
+
+def test_save_alert_policy_archives_previous_version(tmp_path):
+    rdir = tmp_path / "run_archive"
+    rdir.mkdir()
+    first = save_alert_policy(
+        rdir,
+        build_alert_policy(
+            H_trigger=10.0,
+            confirmation_count=1,
+            minimum_action_lead_time=5.0,
+            source="validation_ui",
+            split="validation",
+            unit_ids=["V1", "V2"],
+            checkpoint_hash="aaa",
+        ),
+    )
+    second = save_alert_policy(
+        rdir,
+        build_alert_policy(
+            H_trigger=20.0,
+            confirmation_count=3,
+            minimum_action_lead_time=8.0,
+            source="validation_ui",
+            split="validation",
+            unit_ids=["V1", "V2"],
+            checkpoint_hash="bbb",
+        ),
+    )
+    archived = list((rdir / "alert_policies").glob("*.json"))
+    assert len(archived) == 1
+    old = json.loads(archived[0].read_text(encoding="utf-8"))
+    assert old["H_trigger"] == 10.0
+    assert old["frozen_at"] == first["frozen_at"]
+    assert old["checkpoint_hash"] == "aaa"
+    assert old["unit_ids"] == ["V1", "V2"]
+    current = load_alert_policy(rdir)
+    assert current["H_trigger"] == 20.0
+    assert current["checkpoint_hash"] == "bbb"
+    assert current["frozen_at"] == second["frozen_at"]
+    assert current["frozen_at"] != first["frozen_at"] or current["policy_hash"] != first["policy_hash"]
+
+
+def test_alert_policy_provenance_round_trip(tmp_path):
+    rdir = tmp_path / "run_prov"
+    rdir.mkdir()
+    unit_ids = ["Bearing1_4", "Bearing2_4", "Bearing3_4"]
+    saved = save_alert_policy(
+        rdir,
+        build_alert_policy(
+            H_trigger=12.0,
+            confirmation_count=2,
+            minimum_action_lead_time=6.0,
+            source="validation_ui",
+            split="validation",
+            unit_ids=unit_ids,
+            checkpoint_hash="ckpt_full",
+        ),
+    )
+    loaded = load_alert_policy(rdir)
+    assert loaded["source"] == "validation_ui"
+    assert loaded["split"] == "validation"
+    assert loaded["unit_ids"] == unit_ids
+    assert loaded["checkpoint_hash"] == "ckpt_full"
+    assert loaded["frozen_at"] == saved["frozen_at"]
+    assert loaded["policy_hash"] == saved["policy_hash"]
+    round_trip = AlertPolicy.from_mapping(loaded).to_dict()
+    assert round_trip["source"] == "validation_ui"
+    assert round_trip["split"] == "validation"
+    assert round_trip["unit_ids"] == unit_ids
+    assert round_trip["checkpoint_hash"] == "ckpt_full"
+    assert round_trip["frozen_at"] == saved["frozen_at"]
+    assert round_trip["policy_hash"] == saved["policy_hash"]
+
+
+def test_validation_ui_source_rejected_for_test_split(tmp_path):
+    rdir = tmp_path / "run_reject"
+    rdir.mkdir()
+    with pytest.raises(ValueError, match="validation_ui"):
+        build_alert_policy(
+            H_trigger=10.0,
+            minimum_action_lead_time=5.0,
+            source="validation_ui",
+            split="test",
+            unit_ids=["T1"],
+        )
+    with pytest.raises(ValueError, match="validation_ui"):
+        save_alert_policy(
+            rdir,
+            {
+                "H_trigger": 10.0,
+                "minimum_action_lead_time": 5.0,
+                "confirmation_count": 3,
+                "source": "validation_ui",
+                "split": "test",
+                "unit_ids": ["T1"],
+            },
+        )
+    assert not (rdir / "alert_policy.json").exists()
+
+
+def test_worker_evaluate_job_passes_split_and_policy_mode(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_eval(dataset_id, run_id, **kwargs):
+        captured["dataset_id"] = dataset_id
+        captured["run_id"] = run_id
+        captured.update(kwargs)
+        return {"eval_id": "e1", "eval_dir": str(tmp_path / "e1")}
+
+    wdir = tmp_path / "worker"
+    wdir.mkdir()
+    monkeypatch.setattr("pdm.worker.worker_dir", lambda: wdir)
+    monkeypatch.setattr("pdm.evaluate.evaluate_run", fake_eval)
+    from pdm.worker import run_job
+
+    run_job(
+        {
+            "kind": "evaluate",
+            "dataset_id": "bearings",
+            "run_id": "r1",
+            "split_name": "validation",
+            "policy_mode": "research",
+            "H_trigger": 12.0,
+            "confirmation_count": 2,
+        }
+    )
+    assert captured["split_name"] == "validation"
+    assert captured["policy_mode"] == "research"
+    assert captured["H_trigger"] == 12.0
+    assert captured["confirmation_count"] == 2
+    assert "force" not in captured
 
 
 def test_bearings_near_event_zones_frozen_in_config():
@@ -1547,7 +2728,7 @@ def test_filter_endpoint_baseline_comparison(tmp_path, monkeypatch, tiny_filter_
         "3,0.7,1.3,0.7,1.25,99.0,2\n",
         encoding="utf-8",
     )
-    out = evaluate_run("filters", run_id, device="cpu")
+    out = evaluate_run("filters", run_id, device="cpu", policy_mode="research")
     mpath = Path(out["eval_dir"]) / "metrics.json"
     live = json.loads(mpath.read_text(encoding="utf-8"))
     assert live["primary_metric"] == "prefix_end_mae"
@@ -1839,8 +3020,13 @@ def test_data_report_caches_window_and_event_counts(tmp_path, tiny_bearing_table
     assert wc["eligible"] == len(built)
     assert wc["n_candidate_ends"] == len(features)
     excluded = wc["excluded"]
-    assert wc["eligible"] + excluded["gap"] + excluded["post_event"] + excluded["insufficient_length"] == len(
-        features
+    assert (
+        wc["eligible"]
+        + excluded["gap"]
+        + excluded["post_event"]
+        + excluded["insufficient_length"]
+        + excluded.get("timestamps", 0)
+        == len(features)
     )
     assert excluded["gap"] > 0
     assert excluded["insufficient_length"] > 0
@@ -2507,6 +3693,164 @@ def test_labels_do_not_affect_predictor(tmp_path, tiny_bearing_tables, tiny_filt
                 assert not np.allclose(clean_actual, poison_actual, equal_nan=True)
 
 
+def _synthetic_unit_window_dataset(
+    *,
+    n_units: int = 10,
+    n_rows: int = 103,
+    history: int = 4,
+    max_windows_per_unit: int | None = None,
+    seed: int = 42,
+) -> UnitWindowDataset:
+    """Labeled synthetic windows for sampler tests — not XJTU-SY / HSE."""
+    feat_rows: list[dict[str, object]] = []
+    win_rows: list[dict[str, object]] = []
+    n_win = n_rows - history + 1
+    for u in range(n_units):
+        uid = f"U{u}"
+        for i in range(n_rows):
+            feat_rows.append({"unit_id": uid, "timestamp_s": float(i), "feat": float(i)})
+        for start in range(n_win):
+            end = start + history - 1
+            win_rows.append(
+                {
+                    "unit_id": uid,
+                    "start_index": start,
+                    "end_index": end,
+                    "target_rul_s": float(n_rows - end),
+                    "duration_s": float(n_rows - start),
+                    "event": 1,
+                }
+            )
+    return UnitWindowDataset(
+        pd.DataFrame(feat_rows),
+        pd.DataFrame(win_rows),
+        ["feat"],
+        "bearings",
+        1.0,
+        max_windows_per_unit=max_windows_per_unit,
+        seed=seed,
+    )
+
+
+def test_unit_balanced_sampler_epoch_changes_sequence():
+    ds = _synthetic_unit_window_dataset()
+    sampler = UnitBalancedSampler(ds, n_draws=1000, seed=42)
+    seqs = []
+    for epoch in range(1, 31):
+        sampler.set_epoch(epoch)
+        seqs.append(list(sampler))
+    assert seqs[0] != seqs[1]
+    for prev, cur in zip(seqs, seqs[1:]):
+        assert prev != cur
+
+
+def test_unit_balanced_sampler_seed_epoch_reproducible():
+    ds = _synthetic_unit_window_dataset()
+    a = UnitBalancedSampler(ds, n_draws=1000, seed=42)
+    b = UnitBalancedSampler(ds, n_draws=1000, seed=42)
+    a.set_epoch(7)
+    b.set_epoch(7)
+    assert list(a) == list(b)
+    a.set_epoch(8)
+    b.set_epoch(8)
+    seq_a8 = list(a)
+    seq_b8 = list(b)
+    assert seq_a8 == seq_b8
+    a.set_epoch(7)
+    assert list(a) != seq_a8
+
+
+def test_unit_balanced_sampler_resume_does_not_restart_at_epoch_zero():
+    ds = _synthetic_unit_window_dataset()
+    continued = UnitBalancedSampler(ds, n_draws=1000, seed=42)
+    continued.set_epoch(1)
+    epoch1 = list(continued)
+    continued.set_epoch(2)
+    epoch2 = list(continued)
+    resumed = UnitBalancedSampler(ds, n_draws=1000, seed=42)
+    resumed.set_epoch(2)
+    assert list(resumed) == epoch2
+    assert list(resumed) != epoch1
+    # last.pt saved at epoch 10 → start_epoch 11 matches a fresh sampler at 11, not 1.
+    after_stop = UnitBalancedSampler(ds, n_draws=1000, seed=42)
+    after_stop.set_epoch(10)
+    list(after_stop)
+    after_stop.set_epoch(11)
+    fresh_11 = UnitBalancedSampler(ds, n_draws=1000, seed=42)
+    fresh_11.set_epoch(11)
+    seq_11 = list(after_stop)
+    assert seq_11 == list(fresh_11)
+    assert seq_11 != epoch1
+
+
+def test_unit_balanced_sampler_epoch_one_is_not_seed_plus_zero():
+    ds = _synthetic_unit_window_dataset()
+    sampler = UnitBalancedSampler(ds, n_draws=1000, seed=42)
+    assert sampler.epoch is None
+    with pytest.raises(RuntimeError, match="set_epoch"):
+        list(sampler)
+    sampler.set_epoch(0)
+    seed_plus_zero = list(sampler)
+    sampler.set_epoch(1)
+    epoch_one = list(sampler)
+    assert epoch_one != seed_plus_zero
+
+
+def test_unit_balanced_sampler_unique_count_is_per_epoch_not_cumulative():
+    ds = _synthetic_unit_window_dataset()
+    n_eligible = len(ds)
+    assert n_eligible == 1000
+    sampler = UnitBalancedSampler(ds, n_draws=40, seed=42)
+    sampler.set_epoch(1)
+    drawn1 = list(sampler)
+    stats1 = UnitBalancedSampler.draw_stats(n_eligible, drawn1)
+    sampler.set_epoch(2)
+    drawn2 = list(sampler)
+    stats2 = UnitBalancedSampler.draw_stats(n_eligible, drawn2)
+    s1, s2 = set(drawn1), set(drawn2)
+    assert stats1["n_eligible_windows"] == n_eligible
+    assert stats1["n_gradient_draws"] == 40
+    assert stats1["n_unique_sampled_windows"] == len(s1)
+    assert stats2["n_unique_sampled_windows"] == len(s2)
+    assert stats1["n_unique_sampled_windows"] < n_eligible
+    assert stats2["n_unique_sampled_windows"] < n_eligible
+    assert stats2["n_unique_sampled_windows"] <= 40
+    union = s1 | s2
+    assert len(union) > len(s2)
+    assert stats2["n_unique_sampled_windows"] < len(union)
+
+
+def test_unit_balanced_sampler_draw_stats_from_loader_stream():
+    ds = _synthetic_unit_window_dataset(n_units=4, n_rows=20, history=4)
+    sampler = UnitBalancedSampler(ds, n_draws=16, seed=42)
+    sampler.set_epoch(3)
+    expected = list(sampler)
+    loader = DataLoader(ds, batch_size=5, sampler=sampler, collate_fn=_collate)
+    drawn: list[int] = []
+    for batch in loader:
+        drawn.extend(int(i) for i in batch["window_index"])
+    assert drawn == expected
+    stats = UnitBalancedSampler.draw_stats(len(ds), drawn)
+    assert stats["n_eligible_windows"] == len(ds)
+    assert stats["n_gradient_draws"] == 16
+    assert stats["n_unique_sampled_windows"] == len(set(drawn))
+
+
+def test_unit_window_dataset_cap_is_one_time_not_per_epoch():
+    ds = _synthetic_unit_window_dataset(n_units=4, n_rows=20, history=4, max_windows_per_unit=5, seed=0)
+    counts: dict[str, int] = {}
+    for item in ds.index:
+        counts[str(item[0])] = counts.get(str(item[0]), 0) + 1
+    assert list(counts.values()) == [5, 5, 5, 5]
+    frozen = list(ds.index)
+    sampler = UnitBalancedSampler(ds, n_draws=20, seed=0)
+    sampler.set_epoch(1)
+    list(sampler)
+    sampler.set_epoch(2)
+    list(sampler)
+    assert list(ds.index) == frozen
+
+
 def test_resolve_max_windows_smoke_off_clears_omitted_cap():
     assert resolve_max_windows_per_unit(None, smoke=True) == 32
     assert resolve_max_windows_per_unit(None, smoke=False) is None
@@ -2618,6 +3962,192 @@ def test_alert_policy_cache_invalidation(tmp_path):
     assert current_key not in cache
     shown = cache.get(current_key, pd.DataFrame())
     assert shown.empty
+
+
+class _StubRulPredictor:
+    """Prefix-length RUL stub. Not a trained model."""
+
+    def __init__(self, ruls: list[float | None]) -> None:
+        self._ruls = list(ruls)
+
+    def predict_from_history(self, history_rows) -> dict:
+        i = max(len(history_rows) - 1, 0)
+        rul = self._ruls[i]
+        if rul is None:
+            return {
+                "predicted_rul_s": None,
+                "status": "Collecting history",
+                "valid_history_reason": "short_history",
+            }
+        return {
+            "predicted_rul_s": float(rul),
+            "status": "ok",
+            "valid_history_reason": "",
+        }
+
+
+def _sensor_limit_measurements() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "dataset_id": ["filters"] * 3,
+            "unit_id": ["U"] * 3,
+            "timestamp_s": [1.0, 2.0, 3.0],
+            "differential_pressure": [100.0, 200.0, 550.0],
+        }
+    )
+
+
+def _episode_times(ep: pd.DataFrame) -> list[float]:
+    if ep is None or getattr(ep, "empty", True) or "timestamp_s" not in ep.columns:
+        return []
+    return [float(x) for x in ep["timestamp_s"].tolist()]
+
+
+def test_sensor_limit_rescore_matches_in_memory_and_csv(tmp_path):
+    """K=3, three RUL≤H, third Δp=550 vs limit=500: no horizon-warning on any path."""
+    meas = _sensor_limit_measurements()
+    predictor = _StubRulPredictor([5.0, 4.0, 3.0])
+    h, k, limit = 10.0, 3, 500.0
+    mem = replay_unit(
+        meas,
+        predictor,
+        dataset_id="filters",
+        unit_id="U",
+        run_id="r",
+        history_length=1,
+        warning_horizon_s=h,
+        confirmation_count=k,
+        pressure_limit_pa=limit,
+    )
+    mem_pred = mem["predictions"]
+    assert list(mem_pred["observed_limit_reached"]) == [False, False, True]
+    assert mem_pred.iloc[-1]["alert_status"] == "Observed limit reached"
+    assert mem_pred.iloc[-1]["prediction_status"] == "ok"
+    assert "valid_history_reason" in mem_pred.columns
+    assert list(mem_pred["differential_pressure"]) == [100.0, 200.0, 550.0]
+    assert _episode_times(mem["alerts"]) == []
+
+    exported = prediction_export_frame(mem_pred)
+    assert "alert_status" not in exported.columns
+    for col in (
+        "observed_limit_reached",
+        "prediction_status",
+        "valid_history_reason",
+        "differential_pressure",
+    ):
+        assert col in exported.columns
+
+    csv_path = tmp_path / "predictions.csv"
+    exported.to_csv(csv_path, index=False)
+    csv_pred = pd.read_csv(csv_path)
+    policy = build_alert_policy(H_trigger=h, confirmation_count=k, source="test")
+    ep_csv, steps_csv = alerts_from_predictions(
+        csv_pred, policy, run_id="r", pressure_limit_pa=limit
+    )
+    ep_ui, steps_ui = rescore_replay_alerts(
+        csv_pred, policy, run_id="r", measurements=meas, pressure_limit_pa=limit
+    )
+    assert _episode_times(ep_csv) == _episode_times(ep_ui) == []
+    assert list(steps_csv["status"].astype(str)) == list(steps_ui["status"].astype(str))
+    assert list(steps_csv["status"].astype(str)) == list(mem_pred["alert_status"].astype(str))
+    assert list(steps_csv["warning_active"]) == list(steps_ui["warning_active"])
+    assert not bool(steps_csv["warning_active"].any())
+    assert steps_csv.iloc[-1]["status"] == "Observed limit reached"
+
+    nvp = pd.DataFrame(
+        {
+            "unit_id": ["U"],
+            "timestamp_s": [1.0],
+            "predicted_rul_s": [np.nan],
+            "prediction_status": ["No valid prediction"],
+        }
+    )
+    _, nvp_steps = alerts_from_predictions(nvp, policy, run_id="r", pressure_limit_pa=limit)
+    assert nvp_steps.iloc[0]["status"] == "No valid prediction"
+    coll = nvp.copy()
+    coll["prediction_status"] = "Collecting history"
+    _, coll_steps = alerts_from_predictions(coll, policy, run_id="r", pressure_limit_pa=limit)
+    assert coll_steps.iloc[0]["status"] == "Collecting history"
+
+
+def test_hk_change_does_not_change_predicted_rul_or_observed_limit():
+    meas = _sensor_limit_measurements()
+    ruls = [5.0, 4.0, 3.0]
+    out_a = replay_unit(
+        meas,
+        _StubRulPredictor(ruls),
+        dataset_id="filters",
+        unit_id="U",
+        run_id="r",
+        history_length=1,
+        warning_horizon_s=10.0,
+        confirmation_count=1,
+        pressure_limit_pa=500.0,
+    )
+    out_b = replay_unit(
+        meas,
+        _StubRulPredictor(ruls),
+        dataset_id="filters",
+        unit_id="U",
+        run_id="r",
+        history_length=1,
+        warning_horizon_s=0.5,
+        confirmation_count=1,
+        pressure_limit_pa=500.0,
+    )
+    live_a = out_a["predictions"]
+    live_b = out_b["predictions"]
+    assert list(live_a["alert_status"]) != list(live_b["alert_status"])
+    exp_a = prediction_export_frame(live_a)
+    exp_b = prediction_export_frame(live_b)
+    assert "alert_status" not in exp_a.columns
+    assert "alert_status" not in exp_b.columns
+    pd.testing.assert_series_equal(
+        exp_a["predicted_rul_s"].reset_index(drop=True),
+        exp_b["predicted_rul_s"].reset_index(drop=True),
+    )
+    pd.testing.assert_series_equal(
+        exp_a["observed_limit_reached"].reset_index(drop=True),
+        exp_b["observed_limit_reached"].reset_index(drop=True),
+        check_dtype=False,
+    )
+    assert list(exp_a["observed_limit_reached"]) == [False, False, True]
+
+
+def test_pressure_limit_500_not_hardcoded_600():
+    pred = pd.DataFrame(
+        {
+            "unit_id": ["U"],
+            "timestamp_s": [1.0],
+            "predicted_rul_s": [100.0],
+            "differential_pressure": [550.0],
+        }
+    )
+    policy = build_alert_policy(H_trigger=10.0, confirmation_count=1, source="test")
+    _, steps_500 = alerts_from_predictions(pred, policy, run_id="r", pressure_limit_pa=500.0)
+    assert list(steps_500["status"].astype(str)) == ["Observed limit reached"]
+    _, steps_none = alerts_from_predictions(pred, policy, run_id="r")
+    assert "Observed limit reached" not in set(steps_none["status"].astype(str))
+    from pdm import alerts as alerts_mod
+    from pdm import app as app_mod
+
+    assert "600.0" not in inspect.getsource(alerts_mod)
+    assert "600.0" not in inspect.getsource(alerts_from_predictions)
+    assert "600" not in inspect.getsource(alerts_from_predictions)
+    sig = inspect.signature(rescore_replay_alerts)
+    assert "pressure_limit_pa" in sig.parameters
+    assert "pressure_limit_pa=pressure_limit_pa" in inspect.getsource(app_mod.screen_replay)
+    assert "load_run_pressure_limit_pa" in inspect.getsource(app_mod._replay_pressure_limit_pa)
+
+
+def test_app_replay_pressure_limit_uses_snapshot_helper(tmp_path):
+    from pdm import app as app_mod
+
+    rdir = tmp_path / "run"
+    rdir.mkdir()
+    atomic_write_json(rdir / "experiment_snapshot.json", {"pressure_limit_pa": 500.0})
+    assert app_mod._replay_pressure_limit_pa(rdir, {"pressure_limit_pa": 600.0}) == 500.0
+    assert load_run_pressure_limit_pa(rdir, 600.0) == 500.0
 
 
 def test_replay_log_has_no_future_rows():
