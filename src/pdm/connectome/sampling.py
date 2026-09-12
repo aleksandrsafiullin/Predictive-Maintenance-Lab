@@ -6,7 +6,11 @@ import networkx as nx
 import numpy as np
 
 from pdm.connectome.graph import as_node_id
-from pdm.connectome.provenance import GRAPH_MODE_RANDOM_REWIRE, GRAPH_MODE_REAL, GRAPH_MODE_SYNTHETIC
+from pdm.connectome.provenance import (
+    GRAPH_MODE_RANDOM_REWIRE,
+    GRAPH_MODE_REAL,
+    GRAPH_MODE_SYNTHETIC,
+)
 
 LOGGER = logging.getLogger(__name__)
 
