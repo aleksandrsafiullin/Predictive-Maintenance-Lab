@@ -79,6 +79,7 @@ from pdm.predict import Predictor
 from pdm.preprocessing import (
     FEATURE_PIPELINE_VERSION,
     Preprocessor,
+    categorical_maps_fingerprint,
     fit_preprocessor,
     raw_to_feature_frame,
 )
@@ -107,6 +108,7 @@ from pdm.train import (
     checkpoints_compatible,
     compatibility_dict,
     load_saved_train_settings,
+    load_trained_model,
     next_max_windows_on_mode_change,
     resolve_max_windows_per_unit,
     resolve_run_train_args,
@@ -1529,6 +1531,77 @@ def test_checkpoints_compatible_accepts_split_hash_or_legacy_fingerprint():
     assert checkpoints_compatible({**saved_legacy, "features_hash": "aa"}, {**current, "features_hash": "aa"})
     assert not checkpoints_compatible({**saved_legacy, "features_hash": "aa"}, {**current, "features_hash": "bb"})
     assert checkpoints_compatible(saved_legacy, {**current, "features_hash": "bb", "dataset_version": "v"})
+
+
+def test_gru_checkpoint_compat_ignores_reservoir_yaml_defaults(
+    tmp_path, monkeypatch, tiny_bearing_tables
+):
+    """GRU compat blobs stay compatible even when live YAML has reservoir defaults."""
+    from pdm.config import model_defaults
+
+    base = {
+        "dataset_id": "bearings",
+        "architecture": "gru",
+        "history_length": 20,
+        "hidden_size": 64,
+        "recurrent_layers": 2,
+        "head": "rul",
+        "feature_names": ["horizontal_rms"],
+        "time_scale_s": 60.0,
+        "feature_pipeline_version": FEATURE_PIPELINE_VERSION,
+        "categorical_maps_fingerprint": "abc",
+        "split_hash": "deadbeefdeadbeef",
+    }
+    cfg = load_dataset_config("bearings")
+    mcfg = model_defaults(cfg)
+    assert "reservoir" in mcfg
+    current = {
+        **base,
+        "n_nodes": mcfg["reservoir"]["n_nodes"],
+        "graph_mode": mcfg["reservoir"]["graph_mode"],
+        "graph_hash": "not-in-gru-blob",
+        "state_mode": mcfg["reservoir"]["state_mode"],
+        "leak": mcfg["reservoir"]["leak"],
+        "spectral_radius": mcfg["reservoir"]["spectral_radius"],
+        "input_scale": mcfg["reservoir"]["input_scale"],
+        "seed": mcfg["reservoir"]["seed"],
+        "readout": mcfg["reservoir"]["readout"],
+    }
+    assert checkpoints_compatible(base, current)
+    assert checkpoints_compatible(base, base)
+
+    features, units, split, rec, rdir, _run_id, prep = _tiny_bearing_run(
+        tmp_path, monkeypatch, tiny_bearing_tables, run_id="tiny_gru_yaml_defaults"
+    )
+    gru_mcfg = {
+        "architecture": "gru",
+        "history_length": 3,
+        "hidden_size": 8,
+        "recurrent_layers": 1,
+    }
+    gru_compat = compatibility_dict(gru_mcfg, prep, split, "bearings", "rul")
+    for key in (
+        "n_nodes",
+        "graph_mode",
+        "graph_hash",
+        "state_mode",
+        "leak",
+        "spectral_radius",
+        "input_scale",
+        "seed",
+        "readout",
+    ):
+        assert key not in gru_compat
+    assert "feature_pipeline_version" in gru_compat
+    assert "categorical_maps_fingerprint" in gru_compat
+    assert gru_compat["categorical_maps_fingerprint"] == categorical_maps_fingerprint(prep.categorical_maps)
+    model, loaded_prep, meta = load_trained_model(rdir, device="cpu")
+    assert meta["architecture"] == "gru"
+    assert loaded_prep.feature_names == prep.feature_names
+    x = torch.zeros(1, 3, len(prep.feature_names))
+    with torch.no_grad():
+        out = model.predicted_rul_s(x)
+    assert out.shape[0] == 1
 
 
 def test_processed_fingerprint_versioning_does_not_mutate_prior(

@@ -136,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         choices=["synthetic_fixture", "real_connectome", "random_rewire"],
     )
+    p_tr.add_argument("--readout", default=None, choices=["ridge", "gradient"])
 
     p_ev = sub.add_parser("evaluate")
     p_ev.add_argument("--dataset", required=True, choices=["bearings", "filters"])
@@ -222,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
             max_windows_per_unit=args.max_windows_per_unit,
             n_nodes=args.n_nodes,
             graph_mode=args.graph_mode,
+            readout=args.readout,
         )
         print(json.dumps(rec, indent=2, default=str))
         return 0

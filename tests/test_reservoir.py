@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -10,10 +14,12 @@ from pdm.connectome.provenance import GRAPH_MODE_RANDOM_REWIRE, hash_graph
 from pdm.connectome.sampling import resolve_n_nodes, sample_connected_subgraph
 from pdm.connectome.sources import load_malemcns, load_synthetic_fixture
 from pdm.connectome.weights import log1p_adjacency
+from pdm.losses import weibull_nll
 from pdm.models import FlyConnectomeReservoir, LeakyESN, RandomReservoir
 from pdm.models.readout import fit_ridge
 from pdm.paths import configs_root
-from pdm.train import run_training
+from pdm.predict import Predictor
+from pdm.train import UnitWindowDataset, checkpoints_compatible, load_trained_model, run_training
 
 SYNTHETIC_LABEL = "Synthetic test graph — not a biological connectome"
 
@@ -119,18 +125,18 @@ def test_model_defaults_sets_readout_from_dataset_id():
         model_defaults(bad)
 
 
-def test_reservoir_arch_raises_in_run_training(monkeypatch):
-    created = {"opt": False}
+def test_reservoir_arch_does_not_raise_not_implemented():
+    from pdm.models import FlyConnectomeReservoir, build_model
 
-    class _SpyAdamW:
-        def __init__(self, *args, **kwargs):
-            created["opt"] = True
-            raise AssertionError("AdamW must not be constructed for reservoir architectures")
-
-    monkeypatch.setattr(torch.optim, "AdamW", _SpyAdamW)
-    with pytest.raises(NotImplementedError, match="Reservoir training not yet implemented in run_training"):
-        run_training(dataset_id="bearings", architecture="fly_connectome_reservoir")
-    assert created["opt"] is False
+    graph = _cycle_graph(8)
+    model = build_model(
+        architecture="fly_connectome_reservoir",
+        input_size=3,
+        graph=graph,
+        n_nodes=8,
+        seed=0,
+    )
+    assert isinstance(model, FlyConnectomeReservoir)
 
 
 def test_run_connectome_and_traces_dirs():
@@ -142,17 +148,32 @@ def test_run_connectome_and_traces_dirs():
 
 
 def test_build_model_reservoir_does_not_call_recurrent_encoder(monkeypatch):
-    from pdm.models import RecurrentEncoder, build_model
+    from pdm.models import FlyConnectomeReservoir, RecurrentEncoder, build_model
 
     def _boom(*_a, **_k):
         raise AssertionError("RecurrentEncoder must not see reservoir architecture strings")
 
-    monkeypatch.setattr("pdm.models.RecurrentEncoder", _boom)
-    with pytest.raises(NotImplementedError, match="Reservoir training not yet implemented"):
-        build_model(architecture="random_reservoir", input_size=4)
-    monkeypatch.setattr("pdm.models.RecurrentEncoder", RecurrentEncoder)
+    monkeypatch.setattr("pdm.models.recurrent.RecurrentEncoder", _boom)
+    graph = _cycle_graph(8)
+    model = build_model(
+        architecture="random_reservoir",
+        input_size=4,
+        graph=graph,
+        n_nodes=8,
+        seed=0,
+    )
+    assert model.n_nodes == 8
+    monkeypatch.setattr("pdm.models.recurrent.RecurrentEncoder", RecurrentEncoder)
     net = build_model(architecture="gru", input_size=4, hidden_size=8)
     assert net.encoder.architecture == "gru"
+    fly = build_model(
+        architecture="fly_connectome_reservoir",
+        input_size=4,
+        graph=graph,
+        n_nodes=8,
+        seed=1,
+    )
+    assert isinstance(fly, FlyConnectomeReservoir)
 
 
 def test_graph_orientation():
@@ -279,3 +300,304 @@ def test_random_reservoir_parent_graph_hash():
     for node in parent.nodes():
         assert parent.in_degree(node) == model.graph.in_degree(node)
         assert parent.out_degree(node) == model.graph.out_degree(node)
+
+
+def _prepare_tiny_bearings(tmp_path, monkeypatch, tiny_bearing_tables):
+    from pdm.data.prepare import write_processed_version
+    from pdm.splits import bearings_split
+
+    features, units = tiny_bearing_tables
+    split = bearings_split(units)
+    processed_root = tmp_path / "processed" / "bearings"
+    runs_root = tmp_path / "runs"
+    monkeypatch.setattr("pdm.data.prepare.dataset_processed", lambda _id: processed_root)
+    monkeypatch.setattr("pdm.paths.dataset_runs", lambda _id: runs_root / _id)
+    monkeypatch.setattr("pdm.train.dataset_runs", lambda _id: runs_root / _id)
+    write_processed_version(
+        "bearings", features, units, split, sensor_note="n", cfg={}, processed_root=processed_root
+    )
+    return features, units, split, runs_root
+
+
+def _train_tiny_reservoir(tmp_path, monkeypatch, tiny_bearing_tables, **kwargs):
+    _prepare_tiny_bearings(tmp_path, monkeypatch, tiny_bearing_tables)
+    params = {
+        "dataset_id": "bearings",
+        "architecture": "fly_connectome_reservoir",
+        "smoke": True,
+        "max_epochs": 1,
+        "history_length": 3,
+        "device_pref": "cpu",
+        "max_windows_per_unit": 8,
+        "n_nodes": 8,
+        "readout": "ridge",
+    }
+    params.update(kwargs)
+    return run_training(**params)
+
+
+def test_frozen_reservoir_weights_not_updated():
+    graph = _cycle_graph(8)
+    model = FlyConnectomeReservoir(graph, input_size=3, head="rul", seed=1)
+    w_before = model.W_res.detach().cpu().clone()
+    win_before = model.W_in.detach().cpu().clone()
+    b_before = model.b_res.detach().cpu().clone()
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    assert trainable
+    assert not model.W_res.requires_grad
+    opt = torch.optim.AdamW(trainable, lr=0.05)
+    x = torch.randn(4, 5, 3)
+    y = torch.rand(4)
+    pred = model(x)
+    loss = torch.nn.functional.smooth_l1_loss(pred, y)
+    loss.backward()
+    opt.step()
+    assert torch.equal(model.W_res.detach().cpu(), w_before)
+    assert torch.equal(model.W_in.detach().cpu(), win_before)
+    assert torch.equal(model.b_res.detach().cpu(), b_before)
+    assert any(p.grad is not None and torch.any(p.grad != 0) for p in trainable)
+
+
+def test_filters_ridge_raises_before_targets(monkeypatch):
+    consumed = {"targets": False, "processed": False}
+
+    def _no_processed(*_a, **_k):
+        consumed["processed"] = True
+        raise AssertionError("load_processed must not run before the filters+ridge raise")
+
+    class _SpyDataset(UnitWindowDataset):
+        def __getitem__(self, i):
+            consumed["targets"] = True
+            return super().__getitem__(i)
+
+    monkeypatch.setattr("pdm.train.load_processed", _no_processed)
+    monkeypatch.setattr("pdm.train.UnitWindowDataset", _SpyDataset)
+    with pytest.raises(ValueError, match="Ridge readout is not supported for filters"):
+        run_training(
+            "filters",
+            architecture="fly_connectome_reservoir",
+            readout="ridge",
+            n_nodes=8,
+        )
+    assert consumed["targets"] is False
+    assert consumed["processed"] is False
+
+
+def test_filters_censoring_not_rul_zero():
+    lam = torch.tensor([1.2, 1.2])
+    k = torch.tensor([1.8, 1.8])
+    duration = torch.tensor([10.0, 10.0])
+    nll_censored = weibull_nll(duration, torch.tensor([0.0, 0.0]), lam, k, 1.0)
+    nll_zero_event = weibull_nll(torch.zeros_like(duration), torch.tensor([1.0, 1.0]), lam, k, 1.0)
+    assert not torch.allclose(nll_censored, nll_zero_event)
+    windows = pd.DataFrame(
+        {
+            "unit_id": ["U1", "U1"],
+            "start_index": [0, 1],
+            "end_index": [2, 3],
+            "target_rul_s": [float("nan"), float("nan")],
+            "duration_s": [12.0, 18.0],
+            "event": [0, 0],
+        }
+    )
+    features = pd.DataFrame(
+        {
+            "unit_id": ["U1"] * 5,
+            "timestamp_s": [0.0, 1.0, 2.0, 3.0, 4.0],
+            "f0": [0.1, 0.2, 0.3, 0.4, 0.5],
+        }
+    )
+    ds = UnitWindowDataset(features, windows, ["f0"], "filters", time_scale_s=1.0)
+    for i in range(len(ds)):
+        item = ds[i]
+        assert int(item["event"].item()) == 0
+        assert not torch.isfinite(item["target"])
+        assert float(item["duration"]) > 0
+
+
+def test_ridge_uses_forward_states_kernel(tmp_path, monkeypatch, tiny_bearing_tables):
+    import pdm.models.reservoir as res_mod
+
+    calls = {"n": 0}
+    orig = res_mod.forward_states
+
+    def _wrapped(*args, **kwargs):
+        calls["n"] += 1
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(res_mod, "forward_states", _wrapped)
+    rec = _train_tiny_reservoir(tmp_path, monkeypatch, tiny_bearing_tables)
+    assert rec["status"] == "completed"
+    assert calls["n"] > 0
+
+
+def test_ridge_no_backward(tmp_path, monkeypatch, tiny_bearing_tables):
+    called = {"n": 0}
+    orig = torch.Tensor.backward
+
+    def _spy(self, *args, **kwargs):
+        called["n"] += 1
+        return orig(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "backward", _spy)
+    rec = _train_tiny_reservoir(tmp_path, monkeypatch, tiny_bearing_tables)
+    assert rec["status"] == "completed"
+    assert called["n"] == 0
+
+
+def test_ridge_writes_artifacts(tmp_path, monkeypatch, tiny_bearing_tables):
+    rec = _train_tiny_reservoir(tmp_path, monkeypatch, tiny_bearing_tables)
+    rdir = Path(rec["dir"])
+    assert (rdir / "best.pt").exists()
+    assert (rdir / "last.pt").exists()
+    assert (rdir / "status.json").exists()
+    assert (rdir / "experiment_snapshot.json").exists()
+    cdir = rdir / "connectome"
+    assert (cdir / "provenance.json").exists()
+    assert (cdir / "graph.json").exists()
+    assert (cdir / "weights.npz").exists()
+    weights = np.load(cdir / "weights.npz")
+    assert "W_in" in weights.files and "W_res" in weights.files and "b_res" in weights.files
+    snap = json.loads((rdir / "experiment_snapshot.json").read_text())
+    assert snap["model"]["architecture"] == "fly_connectome_reservoir"
+    assert snap["model"]["reservoir"]["n_nodes"] == 8
+    status = json.loads((rdir / "status.json").read_text())
+    assert status["status"] == "completed"
+    rec_rand = _train_tiny_reservoir(
+        tmp_path,
+        monkeypatch,
+        tiny_bearing_tables,
+        architecture="random_reservoir",
+    )
+    prov = json.loads(
+        (Path(rec_rand["dir"]) / "connectome" / "provenance.json").read_text()
+    )
+    assert prov["graph_mode"] == GRAPH_MODE_RANDOM_REWIRE
+    assert prov.get("parent_graph_hash")
+
+
+def test_ridge_stop_flag_sets_cancelled(tmp_path, monkeypatch, tiny_bearing_tables):
+    rec = _train_tiny_reservoir(
+        tmp_path,
+        monkeypatch,
+        tiny_bearing_tables,
+        should_stop=lambda: True,
+    )
+    assert rec["status"] == "cancelled"
+    status = json.loads((Path(rec["dir"]) / "status.json").read_text())
+    assert status["status"] == "cancelled"
+    assert status["status"] not in {"completed", "stopped"}
+
+
+def test_load_trained_model_missing_weights_npz_raises(tmp_path, monkeypatch, tiny_bearing_tables):
+    rec = _train_tiny_reservoir(tmp_path, monkeypatch, tiny_bearing_tables)
+    rdir = Path(rec["dir"])
+    (rdir / "connectome" / "weights.npz").unlink()
+    with pytest.raises(FileNotFoundError, match="will not rebuild from seed"):
+        load_trained_model(rdir, device="cpu")
+
+
+def test_n_nodes_mismatch_vs_weights_npz_raises(tmp_path, monkeypatch, tiny_bearing_tables):
+    rec = _train_tiny_reservoir(tmp_path, monkeypatch, tiny_bearing_tables, n_nodes=16)
+    rdir = Path(rec["dir"])
+    n8 = 8
+    np.savez(
+        rdir / "connectome" / "weights.npz",
+        W_in=np.zeros((n8, 2), dtype=np.float32),
+        W_res=np.eye(n8, dtype=np.float32),
+        b_res=np.zeros(n8, dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="n_nodes mismatch"):
+        load_trained_model(rdir, device="cpu")
+
+
+def test_dataset_checkpoint_isolation():
+    base = {
+        "dataset_id": "bearings",
+        "architecture": "fly_connectome_reservoir",
+        "history_length": 20,
+        "hidden_size": 64,
+        "recurrent_layers": 1,
+        "head": "rul",
+        "feature_names": ["horizontal_rms"],
+        "time_scale_s": 60.0,
+        "feature_pipeline_version": "v2_raw_first",
+        "categorical_maps_fingerprint": "abc",
+        "split_hash": "deadbeefdeadbeef",
+        "n_nodes": 8,
+        "graph_mode": "synthetic_fixture",
+        "graph_hash": "aaa",
+        "state_mode": "window_reset",
+        "leak": 0.2,
+        "spectral_radius": 0.9,
+        "input_scale": 0.1,
+        "seed": 42,
+        "readout": "ridge",
+    }
+    rand = {**base, "architecture": "random_reservoir", "graph_mode": "random_rewire"}
+    gru = {**base, "architecture": "gru"}
+    filters = {**base, "dataset_id": "filters", "head": "weibull"}
+    assert not checkpoints_compatible(base, rand)
+    assert not checkpoints_compatible(base, gru)
+    assert not checkpoints_compatible(base, filters)
+    other_hash = {**base, "graph_hash": "bbb"}
+    assert not checkpoints_compatible(base, other_hash)
+    assert checkpoints_compatible(base, dict(base))
+
+
+def test_split_preprocess_isolation(tmp_path, monkeypatch, tiny_bearing_tables):
+    from pdm.preprocessing import fit_preprocessor
+
+    features, units, split, _runs = _prepare_tiny_bearings(tmp_path, monkeypatch, tiny_bearing_tables)
+    rec = run_training(
+        "bearings",
+        architecture="fly_connectome_reservoir",
+        smoke=True,
+        max_epochs=1,
+        history_length=3,
+        device_pref="cpu",
+        max_windows_per_unit=8,
+        n_nodes=8,
+        readout="ridge",
+        seed=42,
+    )
+    rdir = Path(rec["dir"])
+    w_in = np.load(rdir / "connectome" / "weights.npz")["W_in"].copy()
+    model, prep, _meta = load_trained_model(rdir, device="cpu")
+    np.testing.assert_allclose(model.W_in.detach().cpu().numpy(), w_in)
+    cfg = load_dataset_config("bearings")
+    mutated = features.copy()
+    mutated.loc[mutated["unit_id"].isin(split["test"]), "horizontal_rms"] = 999.0
+    prep2, _ = fit_preprocessor("bearings", mutated, units, split, cfg)
+    np.testing.assert_allclose(prep.scaler_mean, prep2.scaler_mean)
+    rec_b = run_training(
+        "bearings",
+        architecture="fly_connectome_reservoir",
+        smoke=True,
+        max_epochs=1,
+        history_length=3,
+        device_pref="cpu",
+        max_windows_per_unit=8,
+        n_nodes=8,
+        readout="ridge",
+        seed=42,
+    )
+    w_b = np.load(Path(rec_b["dir"]) / "connectome" / "weights.npz")["W_res"]
+    np.testing.assert_allclose(np.load(rdir / "connectome" / "weights.npz")["W_res"], w_b)
+
+
+def test_predictor_works_with_reservoir(tmp_path, monkeypatch, tiny_bearing_tables):
+    rec = _train_tiny_reservoir(tmp_path, monkeypatch, tiny_bearing_tables)
+    rdir = Path(rec["dir"])
+    model, prep, meta = load_trained_model(rdir, device="cpu")
+    predictor = Predictor(model, prep, history_length=int(meta["history_length"]), device="cpu")
+    features, units = tiny_bearing_tables
+    uid = units["unit_id"].iloc[0]
+    hist = features[features["unit_id"] == uid].sort_values("timestamp_s").iloc[: int(meta["history_length"])]
+    hist = hist.copy()
+    hist.attrs["raw_features"] = True
+    out = predictor.predict_from_history(hist)
+    assert out["status"] in {"ok", "Collecting history"}
+    if out["status"] == "ok":
+        assert out["predicted_rul_s"] is not None
+        assert out["predicted_rul_s"] >= 0

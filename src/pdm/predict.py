@@ -1,13 +1,24 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 import torch
+from torch import nn
 
-from pdm.models import PDMNet
 from pdm.preprocessing import FEATURE_PIPELINE_VERSION, Preprocessor, raw_to_feature_frame
 from pdm.windows import recompute_filter_gap_before, resolve_filter_gap_params, valid_history_window
+
+
+@runtime_checkable
+class HasPredictedRUL(Protocol):
+    """Duck-typed forecast module: GRU/LSTM ``PDMNet`` or a reservoir."""
+
+    def eval(self) -> nn.Module: ...
+
+    def to(self, device: Any) -> nn.Module: ...
+
+    def predicted_rul_s(self, x: torch.Tensor) -> torch.Tensor: ...
 
 
 class Predictor:
@@ -15,7 +26,7 @@ class Predictor:
 
     def __init__(
         self,
-        model: PDMNet,
+        model: nn.Module | HasPredictedRUL,
         preprocessor: Preprocessor,
         history_length: int,
         device: str = "cpu",

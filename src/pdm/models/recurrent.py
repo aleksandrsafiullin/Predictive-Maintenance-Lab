@@ -4,7 +4,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from pdm.architectures import is_reservoir
 from pdm.losses import weibull_median_rul
 
 
@@ -113,22 +112,70 @@ def build_model(
     head: str = "rul",
     dropout: float = 0.1,
     time_scale_s: float = 1.0,
-) -> PDMNet:
-    """Construct a GRU/LSTM ``PDMNet``.
+    graph=None,
+    n_nodes: int | None = None,
+    leak: float = 0.2,
+    spectral_radius: float = 0.9,
+    input_scale: float = 0.1,
+    seed: int = 42,
+    state_mode: str = "window_reset",
+    provenance: dict | None = None,
+    parent_provenance: dict | None = None,
+    node_order=None,
+    frozen_weights=None,
+) -> nn.Module:
+    """Construct GRU/LSTM ``PDMNet`` or a fly/random reservoir.
 
-    Reservoir architecture strings still raise here. ``FlyConnectomeReservoir`` /
-    ``RandomReservoir`` can be constructed directly for unit tests; ``run_training``
-    remains blocked until subtask 02c.
+    Reservoirs require an in-memory ``graph`` (or ``frozen_weights`` from a saved
+    ``weights.npz``). ``W_in`` / ``W_res`` / ``b_res`` are never rebuilt from seed
+    when ``frozen_weights`` is set.
     """
     arch = str(architecture or "").strip().lower()
-    if is_reservoir(arch):
-        raise NotImplementedError("Reservoir training not yet implemented. Use gru or lstm.")
-    return PDMNet(
-        input_size=input_size,
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        architecture=arch,
-        head=head,
-        dropout=dropout,
-        time_scale_s=time_scale_s,
-    )
+    if arch in {"gru", "lstm"}:
+        return PDMNet(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            architecture=arch,
+            head=head,
+            dropout=dropout,
+            time_scale_s=time_scale_s,
+        )
+    if arch == "fly_connectome_reservoir":
+        from pdm.models.fly_reservoir import FlyConnectomeReservoir
+
+        return FlyConnectomeReservoir(
+            graph,
+            input_size,
+            head=head,
+            leak=float(leak),
+            spectral_radius=float(spectral_radius),
+            input_scale=float(input_scale),
+            seed=int(seed),
+            state_mode=state_mode,
+            time_scale_s=time_scale_s,
+            node_order=node_order,
+            n_nodes=n_nodes,
+            provenance=provenance,
+            frozen_weights=frozen_weights,
+        )
+    if arch == "random_reservoir":
+        from pdm.models.random_reservoir import RandomReservoir
+
+        return RandomReservoir(
+            graph,
+            input_size,
+            head=head,
+            leak=float(leak),
+            spectral_radius=float(spectral_radius),
+            input_scale=float(input_scale),
+            seed=int(seed),
+            state_mode=state_mode,
+            time_scale_s=time_scale_s,
+            node_order=node_order,
+            n_nodes=n_nodes,
+            provenance=provenance,
+            parent_provenance=parent_provenance,
+            frozen_weights=frozen_weights,
+        )
+    raise ValueError(f"Unknown architecture {architecture!r}")

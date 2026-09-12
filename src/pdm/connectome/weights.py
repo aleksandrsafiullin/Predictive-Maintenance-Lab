@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
 from collections.abc import Sequence
+from pathlib import Path
 
 import networkx as nx
 import numpy as np
 
 from pdm.connectome.graph import as_node_id
+from pdm.io_util import atomic_write_bytes
 
 # W_res[i, j] = weight of directed edge j → i. Never transpose to "fix" a plot.
 ORIENTATION = "W_res[i,j]=edge j→i"
@@ -95,3 +98,35 @@ def random_input_weights(
         float(input_scale),
         size=(int(n_nodes), int(input_size)),
     ).astype(np.float64)
+
+
+def save_reservoir_weights(
+    path: Path,
+    W_in: np.ndarray,
+    W_res: np.ndarray,
+    b_res: np.ndarray,
+) -> Path:
+    """Write frozen ``W_in``, ``W_res``, ``b_res``. Never transpose ``W_res``."""
+    path = Path(path)
+    buf = io.BytesIO()
+    np.savez(
+        buf,
+        W_in=np.asarray(W_in),
+        W_res=np.asarray(W_res),
+        b_res=np.asarray(b_res),
+    )
+    atomic_write_bytes(path, buf.getvalue())
+    return path
+
+
+def load_reservoir_weights(path: Path) -> dict[str, np.ndarray]:
+    path = Path(path)
+    with np.load(path, allow_pickle=False) as data:
+        missing = [k for k in ("W_in", "W_res", "b_res") if k not in data.files]
+        if missing:
+            raise ValueError(f"{path} missing arrays: {missing}")
+        return {
+            "W_in": np.array(data["W_in"], copy=True),
+            "W_res": np.array(data["W_res"], copy=True),
+            "b_res": np.array(data["b_res"], copy=True),
+        }

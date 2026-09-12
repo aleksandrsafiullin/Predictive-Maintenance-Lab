@@ -27,13 +27,13 @@ class FlyConnectomeReservoir(LeakyESN):
     """Connectome-structured leaky ESN. Frozen W_in / W_res / b_res; trainable readout.
 
     Accepts an ``nx.DiGraph`` or a square adjacency matrix already in j→i orientation.
-    ``run_training`` still raises until subtask 02c; this class is for unit tests and
-    direct construction.
+    Pass ``frozen_weights=(W_in, W_res, b_res)`` to load a saved run without rebuilding
+    from seed.
     """
 
     def __init__(
         self,
-        graph: nx.DiGraph | np.ndarray,
+        graph: nx.DiGraph | np.ndarray | None,
         input_size: int,
         *,
         head: str = "rul",
@@ -46,16 +46,28 @@ class FlyConnectomeReservoir(LeakyESN):
         node_order: Sequence[str] | None = None,
         n_nodes: int | None = None,
         provenance: dict[str, Any] | None = None,
+        frozen_weights: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     ) -> None:
-        w_in, w_res, b_res, meta = build_fly_reservoir_weights(
-            graph,
-            input_size=input_size,
-            spectral_radius=spectral_radius,
-            input_scale=input_scale,
-            seed=seed,
-            node_order=node_order,
-            n_nodes=n_nodes,
-        )
+        if frozen_weights is not None:
+            w_in, w_res, b_res, meta = _attach_frozen_weight_meta(
+                graph,
+                frozen_weights,
+                n_nodes=n_nodes,
+                node_order=node_order,
+                provenance=provenance,
+            )
+        else:
+            if graph is None:
+                raise ValueError("graph is required unless frozen_weights are provided")
+            w_in, w_res, b_res, meta = build_fly_reservoir_weights(
+                graph,
+                input_size=input_size,
+                spectral_radius=spectral_radius,
+                input_scale=input_scale,
+                seed=seed,
+                node_order=node_order,
+                n_nodes=n_nodes,
+            )
         super().__init__(
             torch.tensor(w_in, dtype=torch.float32),
             torch.tensor(w_res, dtype=torch.float32),
@@ -94,6 +106,44 @@ class FlyConnectomeReservoir(LeakyESN):
             self.provenance["graph_hash"] = self.graph_hash
         if "parent_graph_hash" not in self.provenance:
             self.provenance["parent_graph_hash"] = self.parent_graph_hash
+        self.architecture = "fly_connectome_reservoir"
+
+
+def _attach_frozen_weight_meta(
+    graph: nx.DiGraph | np.ndarray | None,
+    frozen_weights: tuple[np.ndarray, np.ndarray, np.ndarray],
+    *,
+    n_nodes: int | None,
+    node_order: Sequence[str] | None,
+    provenance: dict[str, Any] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Use saved ``W_in`` / ``W_res`` / ``b_res``. Never rebuild from seed."""
+    w_in = np.asarray(frozen_weights[0])
+    w_res = np.asarray(frozen_weights[1])
+    b_res = np.asarray(frozen_weights[2])
+    if w_res.ndim != 2 or w_res.shape[0] != w_res.shape[1]:
+        raise ValueError(f"frozen W_res must be square, got shape {w_res.shape}")
+    n_w = int(w_res.shape[0])
+    if n_nodes is not None and int(n_nodes) != n_w:
+        raise ValueError(
+            f"n_nodes mismatch: checkpoint has {int(n_nodes)}, weights.npz has {n_w}"
+        )
+    nx_graph: nx.DiGraph | None
+    if isinstance(graph, nx.DiGraph):
+        nx_graph = graph
+        n_graph = int(graph.number_of_nodes())
+        if n_graph != n_w:
+            raise ValueError(
+                f"n_nodes mismatch: graph.json has {n_graph}, weights.npz has {n_w}"
+            )
+        order = ordered_node_ids(graph, node_order)
+        graph_id = hash_graph(graph)
+    else:
+        nx_graph = None
+        order = [as_node_id(n) for n in (node_order if node_order is not None else range(n_w))]
+        graph_id = (provenance or {}).get("graph_hash")
+    meta = {"node_order": order, "graph": nx_graph, "graph_hash": graph_id}
+    return w_in, w_res, b_res, meta
 
 
 def build_fly_reservoir_weights(

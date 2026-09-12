@@ -70,11 +70,34 @@ class LinearReadout(nn.Module):
             self.b.copy_(torch.tensor(vec[-1:], dtype=self.b.dtype, device=self.b.device))
 
 
+def ridge_design_matrix(x_T: np.ndarray, u_T: np.ndarray) -> np.ndarray:
+    """``Z = [x_T | u_T | 1]`` last-step states concatenated with last input and intercept."""
+    x = np.asarray(x_T, dtype=np.float64)
+    u = np.asarray(u_T, dtype=np.float64)
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    if u.ndim == 1:
+        u = u.reshape(1, -1)
+    if x.shape[0] != u.shape[0]:
+        raise ValueError(f"x_T rows {x.shape[0]} != u_T rows {u.shape[0]}")
+    ones = np.ones((x.shape[0], 1), dtype=np.float64)
+    return np.concatenate([x, u, ones], axis=1)
+
+
+def freeze_readout(readout: LinearReadout) -> None:
+    for param in readout.parameters():
+        param.requires_grad_(False)
+
+
 def fit_ridge(Z: np.ndarray, y: np.ndarray, alpha: float = 0.001) -> tuple[np.ndarray, float]:
     """Solve ``(Z^T Z + alpha I) w = Z^T y``. Returns ``(w, residual_mean_sq)``.
 
     ``Z``: ``[N, n_nodes + input_size + 1]`` (state concat input concat 1).
-    ``y``: ``[N]`` normalized RUL (NOT raw ``target_rul_s``).
+    ``y``: ``[N]`` **normalized RUL** ``target_rul_s / time_scale_s`` — the same
+    space as Smooth L1 in ``_run_epoch``. This is **not** the contribution-identity
+    space: identity tests (subtask 03) sum intercept + input + neuron terms on the
+    pre-Softplus / pre-median / pre-``time_scale_s`` linear ``raw``. Bearings
+    ``forward()`` is ``relu(W_out @ state + b_out)`` with no extra Softplus.
     """
     z = np.asarray(Z, dtype=np.float64)
     if z.ndim != 2:

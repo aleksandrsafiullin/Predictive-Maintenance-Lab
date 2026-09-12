@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import networkx as nx
 import numpy as np
@@ -10,6 +11,7 @@ from pdm.connectome.provenance import (
     GRAPH_MODE_RANDOM_REWIRE,
     GRAPH_MODE_REAL,
     GRAPH_MODE_SYNTHETIC,
+    hash_graph,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -137,3 +139,47 @@ def rewire_directed(graph: nx.DiGraph, seed: int, n_swaps_multiplier: int = 10) 
         edge_list[int(j)] = new_cd
         swaps += 1
     return out
+
+
+def prepare_run_graph(
+    *,
+    architecture: str,
+    graph_mode: str,
+    n_nodes: int,
+    seed: int,
+) -> tuple[nx.DiGraph, dict[str, Any], int]:
+    """Sample a connected subgraph for training.
+
+    Returns ``(graph, parent_provenance, resolved_n_nodes)``. For
+    ``random_reservoir`` the graph is the **parent** (pre-rewire);
+    ``RandomReservoir`` performs the degree-preserving rewiring.
+    ``synthetic_fixture`` clamps; ``real_connectome`` validates range.
+    """
+    from pdm.connectome.sources import load_malemcns, load_synthetic_fixture
+
+    arch = str(architecture or "").strip().lower()
+    mode = str(graph_mode or GRAPH_MODE_SYNTHETIC).strip().lower()
+    parent_mode = GRAPH_MODE_SYNTHETIC
+    if mode == GRAPH_MODE_REAL:
+        parent_mode = GRAPH_MODE_REAL
+    elif arch != "random_reservoir" and mode == GRAPH_MODE_RANDOM_REWIRE:
+        parent_mode = GRAPH_MODE_SYNTHETIC
+
+    if parent_mode == GRAPH_MODE_REAL:
+        src = load_malemcns()
+        if src.is_synthetic:
+            parent_mode = GRAPH_MODE_SYNTHETIC
+    else:
+        src = load_synthetic_fixture()
+        parent_mode = GRAPH_MODE_SYNTHETIC
+
+    resolved = resolve_n_nodes(parent_mode, int(n_nodes), src.graph.number_of_nodes())
+    node_list = sample_connected_subgraph(src.graph, resolved, int(seed))
+    subgraph = induced_subgraph(src.graph, node_list)
+    provenance = dict(src.provenance)
+    provenance["n_nodes"] = int(subgraph.number_of_nodes())
+    provenance["n_edges"] = int(subgraph.number_of_edges())
+    provenance["seed"] = int(seed)
+    provenance["graph_hash"] = hash_graph(subgraph)
+    provenance["graph_mode"] = parent_mode
+    return subgraph, provenance, resolved

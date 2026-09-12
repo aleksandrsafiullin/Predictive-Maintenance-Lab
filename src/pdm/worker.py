@@ -117,6 +117,7 @@ def run_job(job: dict) -> None:
                 max_windows_per_unit=mw,
                 n_nodes=job.get("n_nodes"),
                 graph_mode=job.get("graph_mode"),
+                readout=job.get("readout"),
             )
         elif kind in {"evaluate", "replay_predict"}:
             from pdm.evaluate import evaluate_run

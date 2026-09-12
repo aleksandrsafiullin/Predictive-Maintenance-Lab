@@ -45,7 +45,33 @@ class RandomReservoir(FlyConnectomeReservoir):
         provenance: dict[str, Any] | None = None,
         parent_provenance: dict[str, Any] | None = None,
         n_swaps_multiplier: int = 10,
+        frozen_weights: tuple | None = None,
     ) -> None:
+        if frozen_weights is not None:
+            # Saved artifacts are already rewired; do not rebuild or re-rewire from seed.
+            if graph is not None and not isinstance(graph, nx.DiGraph):
+                raise TypeError("RandomReservoir frozen load expects an nx.DiGraph or None")
+            super().__init__(
+                graph,
+                input_size,
+                head=head,
+                leak=leak,
+                spectral_radius=spectral_radius,
+                input_scale=input_scale,
+                seed=seed,
+                state_mode=state_mode,
+                time_scale_s=time_scale_s,
+                node_order=node_order,
+                n_nodes=n_nodes,
+                provenance=provenance,
+                frozen_weights=frozen_weights,
+            )
+            self.graph_mode = GRAPH_MODE_RANDOM_REWIRE
+            self.provenance["graph_mode"] = GRAPH_MODE_RANDOM_REWIRE
+            self.parent_graph_hash = (provenance or {}).get("parent_graph_hash")
+            self.provenance["parent_graph_hash"] = self.parent_graph_hash
+            self.architecture = "random_reservoir"
+            return
         if not isinstance(graph, nx.DiGraph):
             raise TypeError("RandomReservoir requires a parent nx.DiGraph")
         parent_hash = hash_graph(graph)
@@ -97,6 +123,7 @@ class RandomReservoir(FlyConnectomeReservoir):
         self.provenance["graph_mode"] = GRAPH_MODE_RANDOM_REWIRE
         self.provenance["parent_graph_hash"] = parent_hash
         self.is_synthetic = parent_is_synthetic
+        self.architecture = "random_reservoir"
 
 
 def _parent_is_synthetic(parent_meta: dict[str, Any] | None) -> bool:
