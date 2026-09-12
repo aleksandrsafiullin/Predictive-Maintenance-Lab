@@ -679,7 +679,7 @@ def screen_train(dataset_id: str) -> None:
 
 def _render_architecture_comparison(dataset_id: str) -> None:
     """One canonical comparison table. Synthetic rows never share the real section."""
-    st.subheader("Architecture comparison")
+    st.markdown("**Architecture comparison**")
     try:
         table = build_comparison_table(dataset_id)
     except Exception as exc:  # noqa: BLE001
