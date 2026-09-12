@@ -1182,7 +1182,7 @@ def test_demo_instructions_use_n_nodes_8():
     assert "not a biological connectome" in readme
     demo_doc = (project_root() / "docs" / "fly_connectome_demo.md").read_text(encoding="utf-8")
     assert "--n-nodes 8" in demo_doc
-    assert "not a quality" in demo_doc.lower()
+    assert "quality benchmark" in demo_doc.lower()
 
 
 def test_cli_train_help_has_source_path_and_n_nodes(capsys):

@@ -8,7 +8,11 @@ import numpy as np
 
 from pdm.connectome.provenance import SYNTHETIC_DISCLAIMER
 from pdm.paths import project_root
-from pdm.visualization.explorer import EXPLORER_DISCLAIMER, RESERVOIR_REQUIRED_MESSAGE, build_explorer_payload
+from pdm.visualization.explorer import (
+    EXPLORER_DISCLAIMER,
+    RESERVOIR_REQUIRED_MESSAGE,
+    build_explorer_payload,
+)
 
 FRONTEND = project_root() / "src" / "pdm" / "visualization" / "component" / "frontend"
 CDN_HOSTS = ("unpkg", "cdn.jsdelivr", "cdnjs", "googleapis")
