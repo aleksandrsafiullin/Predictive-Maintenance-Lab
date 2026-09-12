@@ -1537,3 +1537,34 @@ def test_stop_flag_sets_cancelled_not_completed(monkeypatch, tmp_path):
     status = read_status()["status"]
     assert status == "cancelled"
     assert status not in {"completed", "stopped"}
+
+
+def test_app_explorer_comparison_by_label_no_exception():
+    """Explorer + comparison widgets must not raise; screens stay selectable by label."""
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.paths import project_root
+    from pdm.visualization.explorer import EXPLORER_DISCLAIMER
+
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    assert not at.exception
+    radio = _screen_radio(at)
+    opts = list(radio.options)
+    assert "Data" in opts
+    assert "Train" in opts
+    assert "Test & Replay" in opts
+    assert "Neural Activity Explorer" in opts
+    radio.set_value("Neural Activity Explorer")
+    at.run()
+    assert not at.exception
+    parts = []
+    for attr in ("caption", "markdown", "info", "warning", "error", "title", "header"):
+        for widget in getattr(at, attr, []):
+            parts.append(str(getattr(widget, "value", widget)))
+    text = "\n".join(parts)
+    assert EXPLORER_DISCLAIMER in text
+    assert "Architecture comparison" in text
+    radio.set_value("Test & Replay")
+    at.run()
+    assert not at.exception

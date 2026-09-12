@@ -298,3 +298,27 @@ def test_frontend_vendor_files_present():
     assert "setComponentReady" in bridge
     assert "onRender" in bridge
     assert Path(FRONTEND / "index.html").is_file()
+
+
+def test_explorer_comparison_widget_no_exception(monkeypatch, tmp_path, tiny_bearing_tables):
+    """Comparison table and demo button render without raising."""
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.connectome.provenance import SYNTHETIC_DISCLAIMER
+
+    _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    assert not at.exception
+    _open_explorer(at)
+    assert not at.exception
+    text = _app_text(at)
+    assert "Architecture comparison" in text
+    assert SYNTHETIC_DISCLAIMER in text
+    assert any("Load demo scenario" in b.label for b in at.button)
+    assert any("Build trace" in b.label for b in at.button)
+    demo = next(b for b in at.button if "Load demo scenario" in b.label)
+    demo.click()
+    at.run()
+    assert not at.exception
+    assert SYNTHETIC_DISCLAIMER in _app_text(at)

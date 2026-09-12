@@ -946,3 +946,204 @@ def test_trace_job_stop_flag_sets_cancelled(monkeypatch, tmp_path):
     status = read_status()["status"]
     assert status == "cancelled"
     assert status not in {"completed", "stopped"}
+
+
+def _comparison_run(**overrides) -> dict:
+    row = {
+        "run_id": "fly_real",
+        "architecture": "fly_connectome_reservoir",
+        "graph_mode": "real_connectome",
+        "is_synthetic": False,
+        "parent_graph_hash": None,
+        "graph_hash": "flyhash",
+        "n_nodes": 8,
+        "split_hash": "splitA",
+        "dataset_id": "bearings",
+        "best_metric": 1.0,
+        "head": "rul",
+        "smoke": False,
+        "leak": 0.2,
+        "spectral_radius": 0.9,
+        "state_mode": "window_reset",
+        "history_length": 5,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_synthetic_excluded_from_biological_comparison():
+    from pdm.visualization.comparison import filter_synthetic_runs
+
+    real = _comparison_run(run_id="real", is_synthetic=False, graph_mode="real_connectome")
+    synth = _comparison_run(
+        run_id="synth",
+        is_synthetic=True,
+        graph_mode="synthetic_fixture",
+        graph_hash="synthhash",
+    )
+    real_runs, synthetic_runs = filter_synthetic_runs([real, synth])
+    real_ids = {r["run_id"] for r in real_runs}
+    synth_ids = {r["run_id"] for r in synthetic_runs}
+    assert "synth" not in real_ids
+    assert "synth" in synth_ids
+    assert "real" in real_ids
+    assert "real" not in synth_ids
+
+
+def test_matched_control_check():
+    from pdm.visualization.comparison import check_matched_control
+
+    fly = _comparison_run()
+    matched_random = _comparison_run(
+        run_id="rand_ok",
+        architecture="random_reservoir",
+        graph_mode="random_rewire",
+        graph_hash="randhash",
+        parent_graph_hash="flyhash",
+    )
+    ok, warn = check_matched_control(fly, matched_random)
+    assert ok is True
+    assert warn == ""
+
+    mismatched = dict(matched_random)
+    mismatched["parent_graph_hash"] = "otherhash"
+    ok2, warn2 = check_matched_control(fly, mismatched)
+    assert ok2 is False
+    assert "parent_graph_hash" in warn2
+
+
+def test_comparison_table_labels_synthetic():
+    from pdm.visualization.comparison import (
+        SYNTHETIC_LABEL,
+        SYNTHETIC_SECTION,
+        build_comparison_table,
+        comparison_sections,
+    )
+
+    runs = [
+        _comparison_run(run_id="gru1", architecture="gru", graph_mode="", n_nodes=None),
+        _comparison_run(run_id="fly_real"),
+        _comparison_run(
+            run_id="fly_synth",
+            graph_mode="synthetic_fixture",
+            is_synthetic=True,
+            graph_hash="synthhash",
+        ),
+        _comparison_run(
+            run_id="filters_gru",
+            architecture="gru",
+            dataset_id="filters",
+            graph_mode="",
+            n_nodes=None,
+        ),
+    ]
+    table = build_comparison_table("bearings", runs=runs)
+    assert "filters_gru" not in set(table["run_id"].astype(str))
+    real, synth = comparison_sections(table)
+    assert "fly_synth" not in set(real["run_id"].astype(str))
+    assert "fly_synth" in set(synth["run_id"].astype(str))
+    assert "gru1" in set(real["run_id"].astype(str))
+    synth_labels = " ".join(synth["label"].astype(str))
+    assert SYNTHETIC_LABEL in synth_labels
+    assert all(row == SYNTHETIC_SECTION for row in synth["section"].tolist())
+    assert SYNTHETIC_SECTION not in set(real["section"].tolist())
+
+
+def test_alert_jump_uses_prefix():
+    from pdm.visualization.explorer import (
+        causal_prefix_rows,
+        slice_trace_to_alert,
+        stored_alert_prediction,
+    )
+
+    frame_map = [
+        {"frame_index": 0, "timestamp_s": 10.0, "unit_id": "U1"},
+        {"frame_index": 1, "timestamp_s": 20.0, "unit_id": "U1"},
+        {"frame_index": 2, "timestamp_s": 30.0, "unit_id": "U1"},
+    ]
+    states = np.array([[0.0, 0.0], [1.0, 1.0], [9.0, 9.0]], dtype=float)
+    trace = {
+        "frame_map": frame_map,
+        "states": states,
+        "predicted_rul_s": 99.0,
+        "node_order": ["0", "1"],
+    }
+    episode = {
+        "unit_id": "U1",
+        "timestamp_s": 20.0,
+        "predicted_rul_s": 12.5,
+        "type": "horizon_warning",
+    }
+    sliced = slice_trace_to_alert(trace, episode)
+    assert all(float(frm["timestamp_s"]) <= 20.0 for frm in sliced["frame_map"])
+    assert sliced["states"].shape[0] == 2
+    assert 30.0 not in [float(frm["timestamp_s"]) for frm in sliced["frame_map"]]
+    assert sliced["predicted_rul_s"] == 12.5
+    assert stored_alert_prediction(episode) == 12.5
+    meas = pd.DataFrame(
+        {"unit_id": ["U1", "U1", "U1"], "timestamp_s": [10.0, 20.0, 30.0], "x": [1, 2, 3]}
+    )
+    prefix = causal_prefix_rows(meas, 20.0)
+    assert float(prefix["timestamp_s"].max()) <= 20.0
+    assert 30.0 not in prefix["timestamp_s"].tolist()
+
+
+def test_list_runs_exposes_graph_identity(tmp_path, monkeypatch):
+    from pdm.experiments import list_runs
+    from pdm.io_util import atomic_write_json
+
+    monkeypatch.setattr("pdm.experiments.dataset_runs", lambda ds: tmp_path / ds)
+    rdir = tmp_path / "bearings" / "bearings_fly_demo"
+    rdir.mkdir(parents=True)
+    (rdir / "last.pt").write_bytes(b"ckpt")
+    atomic_write_json(
+        rdir / "status.json",
+        {"status": "completed", "run_id": "bearings_fly_demo", "smoke": True},
+    )
+    atomic_write_json(
+        rdir / "experiment_snapshot.json",
+        {
+            "model": {
+                "architecture": "fly_connectome_reservoir",
+                "head": "rul",
+                "history_length": 5,
+                "reservoir": {
+                    "graph_mode": "synthetic_fixture",
+                    "n_nodes": 8,
+                    "graph_hash": "abc",
+                    "leak": 0.2,
+                    "spectral_radius": 0.9,
+                    "state_mode": "window_reset",
+                },
+            }
+        },
+    )
+    (rdir / "connectome").mkdir()
+    atomic_write_json(
+        rdir / "connectome" / "provenance.json",
+        {
+            "graph_mode": "synthetic_fixture",
+            "is_synthetic": True,
+            "graph_hash": "abc",
+            "parent_graph_hash": None,
+        },
+    )
+    atomic_write_json(rdir / "dataset_fingerprint.json", {"split_hash": "deadbeefdeadbeef"})
+    rows = list_runs("bearings")
+    assert len(rows) == 1
+    rec = rows[0]
+    assert rec["architecture"] == "fly_connectome_reservoir"
+    assert rec["graph_mode"] == "synthetic_fixture"
+    assert rec["is_synthetic"] is True
+    assert rec["graph_hash"] == "abc"
+    assert rec["split_hash"] == "deadbeefdeadbeef"
+    assert rec["n_nodes"] == 8
+
+
+def test_demo_instructions_use_n_nodes_8():
+    from pdm.visualization.demo import get_demo_instructions
+
+    text = get_demo_instructions()
+    assert "--arch fly_connectome_reservoir" in text
+    assert "--smoke" in text
+    assert "--n-nodes 8" in text

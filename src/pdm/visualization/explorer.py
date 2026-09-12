@@ -10,6 +10,7 @@ import pandas as pd
 
 from pdm.connectome.provenance import GRAPH_MODE_SYNTHETIC, SYNTHETIC_DISCLAIMER
 from pdm.io_util import read_json
+from pdm.replay import slice_predictions_to_replay_time
 
 EXPLORER_DISCLAIMER = (
     "Computational activity in a connectome-based reservoir. "
@@ -181,9 +182,118 @@ def collect_alert_rows(rdir: Path, unit_id: str | None) -> list[dict[str, Any]]:
         if unit_id and "unit_id" in frame.columns:
             frame = frame[frame["unit_id"].astype(str) == str(unit_id)]
         for rec in frame.to_dict(orient="records"):
-            key = (rec.get("timestamp_s"), rec.get("type") or rec.get("alert_status"))
+            key = (
+                rec.get("unit_id"),
+                rec.get("timestamp_s"),
+                rec.get("type") or rec.get("alert_status"),
+            )
             if key in seen:
                 continue
             seen.add(key)
             rows.append(rec)
     return rows
+
+
+def causal_prefix_rows(frame: pd.DataFrame, timestamp_s: float) -> pd.DataFrame:
+    """Keep rows with timestamp_s ≤ T. No future measurements or predictions."""
+    if frame is None or getattr(frame, "empty", True) or "timestamp_s" not in frame.columns:
+        return frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    ts = pd.to_numeric(frame["timestamp_s"], errors="coerce")
+    return frame.loc[ts <= float(timestamp_s)].copy()
+
+
+def alert_jump_target(episode: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Read-only unit + timestamp + stored predicted RUL from an alert episode."""
+    if not episode:
+        return None
+    ts = episode.get("timestamp_s")
+    if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+        return None
+    rul = episode.get("predicted_rul_s")
+    stored = None
+    try:
+        if rul is not None and not (isinstance(rul, float) and pd.isna(rul)):
+            stored = float(rul)
+    except (TypeError, ValueError):
+        stored = None
+    unit = episode.get("unit_id")
+    return {
+        "unit_id": None if unit is None else str(unit),
+        "timestamp_s": float(ts),
+        "predicted_rul_s": stored,
+    }
+
+
+def stored_alert_prediction(
+    episode: Mapping[str, Any] | None,
+    predictions: pd.DataFrame | None = None,
+    *,
+    unit_id: str | None = None,
+    timestamp_s: float | None = None,
+) -> float | None:
+    """Stored predicted_rul_s at ≤ T. Never a rescore that uses future rows."""
+    target = alert_jump_target(episode)
+    if target and target.get("predicted_rul_s") is not None:
+        return float(target["predicted_rul_s"])
+    t = timestamp_s if timestamp_s is not None else (target or {}).get("timestamp_s")
+    uid = unit_id if unit_id is not None else (target or {}).get("unit_id")
+    if predictions is None or t is None:
+        return None
+    pred = predictions
+    if uid is not None and "unit_id" in pred.columns:
+        pred = pred[pred["unit_id"].astype(str) == str(uid)]
+    sliced = slice_predictions_to_replay_time(pred, float(t))
+    if sliced.empty or "predicted_rul_s" not in sliced.columns:
+        return None
+    val = sliced.iloc[-1].get("predicted_rul_s")
+    try:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return None
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def slice_trace_to_alert(
+    trace: Mapping[str, Any] | None,
+    episode: Mapping[str, Any] | None,
+    *,
+    timestamp_s: float | None = None,
+    predictions: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """Restrict a saved trace to frames with timestamp_s ≤ alert time.
+
+    Predicted RUL is the stored evaluation/alert value, not a rescore from future rows.
+    """
+    rec = dict(trace or {})
+    target = alert_jump_target(episode) or {}
+    t = timestamp_s if timestamp_s is not None else target.get("timestamp_s")
+    frames = list(rec.get("frame_map") or [])
+    if t is None:
+        rec["frame_map"] = [dict(f) for f in frames]
+        rec["predicted_rul_s"] = stored_alert_prediction(
+            episode, predictions, timestamp_s=t, unit_id=target.get("unit_id")
+        )
+        return rec
+    t = float(t)
+    keep_idx = [
+        i
+        for i, frm in enumerate(frames)
+        if frm.get("timestamp_s") is not None and float(frm["timestamp_s"]) <= t
+    ]
+    rec["frame_map"] = [dict(frames[i]) for i in keep_idx]
+    states = rec.get("states")
+    arr = np.asarray(states) if states is not None else None
+    if arr is not None and arr.ndim == 2 and arr.shape[0] == len(frames):
+        rec["states"] = arr[keep_idx] if keep_idx else arr[0:0]
+    inputs = rec.get("inputs")
+    inp = np.asarray(inputs) if inputs is not None else None
+    if inp is not None and inp.ndim == 2 and inp.shape[0] == len(frames):
+        rec["inputs"] = inp[keep_idx] if keep_idx else inp[0:0]
+    rec["predicted_rul_s"] = stored_alert_prediction(
+        episode,
+        predictions,
+        timestamp_s=t,
+        unit_id=target.get("unit_id"),
+    )
+    return rec

@@ -68,17 +68,28 @@ from pdm.train import (
     selection_metric_spec,
     training_mode_label,
 )
+from pdm.visualization.comparison import (
+    BIOLOGICAL_SECTION,
+    SMOKE_NOTE,
+    SYNTHETIC_SECTION,
+    build_comparison_table,
+    comparison_sections,
+)
 from pdm.visualization.component import neural_activity_explorer
+from pdm.visualization.demo import get_demo_instructions, load_demo_scenario
 from pdm.visualization.explorer import (
     EXPLORER_DISCLAIMER,
     EXPLORER_MODES,
     INLINE_TRACE_MAX_NODES,
     RESERVOIR_REQUIRED_MESSAGE,
     WORKER_BUSY_MESSAGE,
+    alert_jump_target,
     build_explorer_payload,
     collect_alert_rows,
     fallback_positions,
     load_scene_from_run,
+    slice_trace_to_alert,
+    stored_alert_prediction,
     synthetic_banner_required,
 )
 from pdm.visualization.export import load_trace
@@ -95,6 +106,7 @@ REPLAY_MODE_RESEARCH = "Research"
 REPLAY_MODES = (REPLAY_MODE_VALIDATION, REPLAY_MODE_TEST, REPLAY_MODE_RESEARCH)
 REPLAY_PLAY_INTERVAL_S = 0.4
 _REPLAY_VIEW_KEY = "_replay_view"
+_EXPLORER_DEMO_KEY = "_explorer_demo_run"
 _REPLAY_SESSION_KEYS = (
     "replay_cache",
     "replay_alert_episodes",
@@ -665,6 +677,37 @@ def screen_train(dataset_id: str) -> None:
             st.json(vm)
 
 
+def _render_architecture_comparison(dataset_id: str) -> None:
+    """One canonical comparison table. Synthetic rows never share the real section."""
+    st.subheader("Architecture comparison")
+    try:
+        table = build_comparison_table(dataset_id)
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"Comparison table unavailable ({exc}).")
+        return
+    real, synth = comparison_sections(table)
+    if real.empty and synth.empty:
+        st.caption("No finished runs to compare on this dataset.")
+        return
+    if not real.empty:
+        st.markdown(f"**{BIOLOGICAL_SECTION}**")
+        st.caption(
+            "Same dataset split / evaluation mask. Synthetic fixture graphs are excluded. "
+            "Never mix bearings and filters checkpoints."
+        )
+        if bool(real["smoke"].any()) if "smoke" in real.columns else False:
+            st.caption(SMOKE_NOTE)
+        st.dataframe(real, width="stretch", hide_index=True)
+    st.markdown(f"**{SYNTHETIC_SECTION}**")
+    if synth.empty:
+        st.caption("No synthetic-fixture runs on this dataset.")
+    else:
+        st.caption("These rows are not a biological connectome and are not averaged with real runs.")
+        if bool(synth["smoke"].any()) if "smoke" in synth.columns else False:
+            st.caption(SMOKE_NOTE)
+        st.dataframe(synth, width="stretch", hide_index=True)
+
+
 def screen_explorer(dataset_id: str) -> None:
     st.header(f"Neural Activity Explorer — {LABELS[dataset_id]}")
     st.caption(EXPLORER_DISCLAIMER)
@@ -674,11 +717,25 @@ def screen_explorer(dataset_id: str) -> None:
     selector_rows = reservoir_rows if reservoir_rows else table
     if not selector_rows:
         st.warning("No saved model. Train a reservoir run first.")
+        _render_architecture_comparison(dataset_id)
         return
+
+    if st.button("Load demo scenario"):
+        demo = load_demo_scenario(dataset_id)
+        if demo is None:
+            st.info(get_demo_instructions())
+            st.caption(SYNTHETIC_DISCLAIMER)
+        else:
+            st.session_state[_EXPLORER_DEMO_KEY] = str(demo.get("run_id") or "")
+            st.warning(SYNTHETIC_DISCLAIMER)
+            st.caption("Demo uses a synthetic test graph — not a biological connectome.")
+            st.rerun()
 
     view = st.session_state.get(_REPLAY_VIEW_KEY) or {}
     run_ids = [str(r["run_id"]) for r in selector_rows]
-    preferred_run = str(view.get("run_id") or "")
+    preferred_run = str(
+        st.session_state.get(_EXPLORER_DEMO_KEY) or view.get("run_id") or ""
+    )
     run_index = run_ids.index(preferred_run) if preferred_run in run_ids else 0
     run_id = st.selectbox("Run", run_ids, index=run_index)
     rec = next((r for r in selector_rows if str(r.get("run_id")) == str(run_id)), {})
@@ -711,19 +768,35 @@ def screen_explorer(dataset_id: str) -> None:
         st.warning("Prepare data first.")
 
     alert_ts = None
+    alert_episode = None
     if mode == "Alert inspection":
-        rows = collect_alert_rows(rdir, uid)
+        rows = collect_alert_rows(rdir, None)
         if not rows:
+            st.caption("Select an alert to view its trace")
             st.caption(
-                "No alert episodes for this unit. Alert inspection reads existing alerts.csv when present."
+                "No alert episodes for this run. Alert inspection reads existing alerts.csv when present."
             )
         else:
             labels = [
-                f"{rec.get('timestamp_s')} ({rec.get('type') or rec.get('alert_status') or 'alert'})"
-                for rec in rows
+                (
+                    f"{item.get('unit_id')} @ {item.get('timestamp_s')} "
+                    f"({item.get('type') or item.get('alert_status') or 'alert'})"
+                )
+                for item in rows
             ]
             pick = st.selectbox("Alert episode", labels)
-            alert_ts = rows[labels.index(pick)].get("timestamp_s")
+            alert_episode = rows[labels.index(pick)]
+            jump = alert_jump_target(alert_episode) or {}
+            alert_ts = jump.get("timestamp_s")
+            jump_unit = jump.get("unit_id")
+            if jump_unit:
+                uid = str(jump_unit)
+            st.caption(
+                "Predicted RUL is the stored evaluation prediction, not a rescore from future rows."
+            )
+            stored = stored_alert_prediction(alert_episode)
+            if stored is not None:
+                st.metric("Stored predicted RUL (s)", f"{stored:.4g}")
 
     n_nodes = int(rec.get("n_nodes") or len(scene.get("nodes") or []) or 0)
     if st.button("Build trace"):
@@ -758,10 +831,14 @@ def screen_explorer(dataset_id: str) -> None:
             st.rerun()
         _auto_refresh()
 
+    _render_architecture_comparison(dataset_id)
+
     if not uid:
         return
     tdir = run_traces_dir(dataset_id, str(run_id), str(uid))
     if not (tdir / "meta.json").exists():
+        if mode == "Alert inspection":
+            st.caption("Select an alert to view its trace")
         st.caption("No trace yet. Click Build trace.")
         return
     try:
@@ -772,6 +849,11 @@ def screen_explorer(dataset_id: str) -> None:
     if str(trace.get("status") or "").startswith("traces require"):
         st.info(RESERVOIR_REQUIRED_MESSAGE)
         return
+
+    if mode == "Alert inspection" and alert_episode is not None:
+        trace = slice_trace_to_alert(trace, alert_episode, timestamp_s=alert_ts)
+    elif mode == "Alert inspection" and alert_episode is None:
+        st.caption("Select an alert to view its trace")
 
     node_order = [str(n) for n in (trace.get("node_order") or scene.get("nodes") or [])]
     scene = load_scene_from_run(rdir, node_order=node_order)
@@ -792,6 +874,7 @@ def screen_explorer(dataset_id: str) -> None:
             "is_synthetic": is_synthetic,
             "graph_mode": graph_mode,
             "architecture": arch,
+            "stored_predicted_rul_s": trace.get("predicted_rul_s"),
         },
     )
     neural_activity_explorer(**payload, key="neural_activity_explorer")
