@@ -6,6 +6,24 @@ from pdm.evaluate import METRICS_VERSION
 from pdm.worker import read_status, worker_alive
 
 
+def _dataset_radio(at):
+    """Find the Dataset radio by its options, not sidebar index."""
+    for radio in at.sidebar.radio:
+        opts = list(radio.options)
+        if "Bearings" in opts and "Filters" in opts:
+            return radio
+    raise AssertionError("Dataset radio not found")
+
+
+def _screen_radio(at):
+    """Find the Screen radio by its options containing known screen names."""
+    for radio in at.sidebar.radio:
+        opts = list(radio.options)
+        if "Data" in opts and "Train" in opts and "Test & Replay" in opts:
+            return radio
+    raise AssertionError("Screen radio not found")
+
+
 def test_worker_not_alive_without_pid():
     # No duplicate training on UI rerun: spawn_worker refuses if worker_alive().
     assert worker_alive() in {True, False}
@@ -32,7 +50,7 @@ def test_app_filters_data_shows_time_scale_warning():
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    at.sidebar.radio[0].set_value("Filters")
+    _dataset_radio(at).set_value("Filters")
     at.run()
     assert not at.exception
     texts = [str(w.value) for w in at.warning]
@@ -137,7 +155,7 @@ def test_app_data_screen_reads_cached_counts_not_build_windows(monkeypatch, tiny
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    at.sidebar.radio[0].set_value("Filters")
+    _dataset_radio(at).set_value("Filters")
     at.run()
     assert not at.exception
 
@@ -269,7 +287,7 @@ def test_app_train_screen_smoke_off_clears_window_cap(monkeypatch, tmp_path, tin
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    at.sidebar.radio[1].set_value("Train")
+    _screen_radio(at).set_value("Train")
     at.run()
     assert not at.exception
 
@@ -333,9 +351,9 @@ def test_app_train_screen_filters_shows_val_nll(monkeypatch, tiny_filter_tables)
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    at.sidebar.radio[0].set_value("Filters")
+    _dataset_radio(at).set_value("Filters")
     at.run()
-    at.sidebar.radio[1].set_value("Train")
+    _screen_radio(at).set_value("Train")
     at.run()
     assert not at.exception
     captions = "\n".join(str(w.value) for w in at.caption)
@@ -384,7 +402,7 @@ def test_app_train_resume_keeps_full_not_form_smoke(monkeypatch, tmp_path, tiny_
 
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
-    at.sidebar.radio[1].set_value("Train")
+    _screen_radio(at).set_value("Train")
     at.run()
     assert not at.exception
     markdown = "\n".join(str(w.value) for w in at.markdown)
@@ -518,7 +536,7 @@ def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    at.sidebar.radio[1].set_value("Test & Replay")
+    _screen_radio(at).set_value("Test & Replay")
     at.run()
     assert not at.exception
     mode = next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options))
@@ -738,9 +756,9 @@ def test_app_filters_evaluation_shows_prefix_end_official_rul(
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    at.sidebar.radio[0].set_value("Filters")
+    _dataset_radio(at).set_value("Filters")
     at.run()
-    at.sidebar.radio[1].set_value("Test & Replay")
+    _screen_radio(at).set_value("Test & Replay")
     at.run()
     assert not at.exception
     next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options)).set_value(
@@ -804,7 +822,7 @@ def test_app_replay_screen_loads_without_eval(monkeypatch, tmp_path, tiny_bearin
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    at.sidebar.radio[1].set_value("Test & Replay")
+    _screen_radio(at).set_value("Test & Replay")
     at.run()
     assert not at.exception
     errors = "\n".join(str(w.value) for w in at.error)
@@ -896,7 +914,7 @@ def test_app_replay_legacy_predictions_unlock_play(monkeypatch, tmp_path, tiny_b
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    at.sidebar.radio[1].set_value("Test & Replay")
+    _screen_radio(at).set_value("Test & Replay")
     at.run()
     assert not at.exception
     next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options)).set_value(
@@ -928,7 +946,7 @@ def test_replay_play_advances_without_clicks(monkeypatch, tmp_path, tiny_bearing
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    at.sidebar.radio[1].set_value("Test & Replay")
+    _screen_radio(at).set_value("Test & Replay")
     at.run()
     assert not at.exception
     next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options)).set_value(
@@ -983,7 +1001,7 @@ def _set_replay_mode(at, mode: str):
 
 
 def _open_replay_screen(at, *, mode: str | None = None):
-    at.sidebar.radio[1].set_value("Test & Replay")
+    _screen_radio(at).set_value("Test & Replay")
     at.run()
     assert not at.exception
     if mode and mode != "Validation":

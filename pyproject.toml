@@ -17,6 +17,8 @@ pdm-lab = "pdm.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"pdm.visualization.component.frontend" = ["*.html", "*.js", "*.txt"]
+"pdm.visualization.component.frontend.vendor" = ["*.js", "*.txt"]
 "pdm.connectome.fixtures" = ["*.json", "*.csv"]
 
 [tool.pytest.ini_options]
