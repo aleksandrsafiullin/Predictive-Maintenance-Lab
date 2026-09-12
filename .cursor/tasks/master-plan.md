@@ -1,107 +1,154 @@
-# Master Plan: Review patch 45a45968 (Predictive Maintenance Lab)
+# Master Plan: Fly Connectome Reservoir + Neural Activity Explorer
 
-**Source of truth:** `Predictive_Maintenance_Lab_Update_Review_45a45968.md` against commit `45a45968c4b2688b374db207b072b5bce8fa74ba`  
-**Repo:** `src/pdm/` · **Stack:** Python ≥3.11 · PyTorch · Streamlit · Plotly · pytest · ruff  
-**Date:** 2026-09-11 (revised after plan-review **REVISE**, then remaining Warnings)  
-**Replaces:** previous sprint plan (P0/P1 preprocessing, fingerprints, immutable eval, replay UI). That sprint is done. This file is a **new patch**, not a continuation of those subtask numbers.
+**Repo:** `/workspace` · package `src/pdm/` · **Stack:** Python ≥3.11 · PyTorch · Streamlit · Plotly · numpy/pandas/scipy · scikit-learn · pyarrow · networkx · pytest · ruff  
+**Branch:** `cursor/fly-connectome-reservoir-a7e4`  
+**Date:** 2026-09-12  
+**Replaces:** previous review-patch plan (sampler / causal gaps / alert scoring). That patch is already on this branch. This file is a **new epic**, not a continuation of those subtask numbers.
+
+**Source of truth for this epic:** this plan + `Cursor_Predictive_Maintenance_MVP_Spec.md` (existing PDM leakage/split/loss rules). Reservoir architectures and the Neural Activity Explorer are an **explicit scoped exception** to the MVP “GRU/LSTM only” line: add **exactly two** new architecture strings and keep GRU/LSTM as defaults. Do not add Transformers, CNNs, extra RNN cells, FastAPI, React SPAs, Docker, MLflow, or live SCADA.
+
+`--smoke` is not a quality claim. Do not run Full 30-epoch training as an acceptance gate. Real data only; do not invent MAT/CSV/connectome fields. UI English.
 
 ## Overview
 
-Close remaining train/eval/replay discrepancies **without** changing split protocol, architectures, or enabling `filters_full_history`. No FastAPI/React/Docker/MLflow/Transformers. No Full 30-epoch training as an acceptance gate. `--smoke` is not a quality claim. Real data only; do not invent MAT/CSV fields. UI English.
+Add a leaky Echo State Network whose recurrent matrix comes from a fly connectome subgraph (or a matched random rewiring), train **only** a linear readout on existing bearings/filters windows, and visualize **real** reservoir states in a local WebGL explorer.
 
-| ID | Priority | Theme |
-|----|----------|--------|
-| R1 | HIGH | `UnitBalancedSampler` repeats the same with-replacement draw every epoch |
-| R2 | HIGH | Prepare uses full-file median Δt; inference uses causal → eligibility mismatch. Stale parquet must not keep training on full-file flags. |
-| R3 | HIGH | Replay UI tunes H/K on test while Freeze writes `source='validation_ui'`. Research/first-eval must not freeze H/K. |
-| R4 | HIGH | Truncated history scored as `miss` too early. v1 coverage = last-admissible bound on `observation_end_s` only. |
-| R5 | MEDIUM | Sensor-limit / prediction status dropped on `predictions.csv`; UI rescore must not default to 600. |
-| R6 | SECOND | Run snapshot missing resolved task config; live YAML still used at evaluate; `--force` hash |
-| R7 | OUT | Do **not** Full-train or rewrite quality numbers. Optional one-line note that old smoke hashes are not quality |
+Existing product stays intact:
+
+- `PDMNet` + `RecurrentEncoder` still implement **GRU and LSTM only**
+- Bearings head remains `rul` + Smooth L1; filters head remains `weibull` + right-censored NLL
+- Splits stay bearings **9/3/3** and filters **40/10/50** (author test 50 held out)
+- Worker still owns heavy jobs; Streamlit still binds `127.0.0.1:8501`
+- `filters_full_history` stays disabled
+
+| ID | Phase | Theme |
+|----|-------|--------|
+| A | 01 | Integration points, synthetic graph, provenance, config/CLI hooks |
+| B | 02 | Leaky ESN core, fly + random, readout, train/eval for both datasets |
+| C | 03 | `predict_with_trace`, contributions, lazy artifacts, parity |
+| D | 04 | Neural Activity Explorer (WebGL component + Streamlit page) |
+| E | 05 | Comparison table, alerts inspection, demo hooks |
+| F | 06 | Full suite, docs, validation notes, ruff |
 
 ### Product constraints (non-negotiable)
 
-- Splits stay bearings **9/3/3** and filters **40/10/50** (author test 50 held out). Do not retune splits to improve numbers.
-- GRU or LSTM only; never mix bearings/filters checkpoints.
-- No leakage: train-only scalers; whole-unit splits; predictor never sees future rows or reference RUL.
-- `filters_full_history` stays disabled.
-- Heavy jobs stay in `pdm.worker`. AppTest is the UI gate; browser playback is optional follow-up, not a gate.
+1. **Never break GRU/LSTM** code paths or `tests/test_spec_invariants.py` / `tests/test_worker_and_app.py`.
+2. **Orientation:** `W_res[i,j]` = edge **j→i**. Unit-test it. Never “fix” orientation with a silent transpose.
+3. **Filters censoring:** gradient Weibull NLL (or the same censored loss already used). Never ridge/MSE with censored end as `RUL=0`.
+4. **`synthetic_fixture`** always displays: `Synthetic test graph — not a biological connectome`. Never use it as the real connectome in fly-vs-random comparisons.
+5. **MaleCNS in CI:** if the feather file is not downloadable, ship loader + local-path import + synthetic fallback + provenance. Document real-data steps. Do not fake MaleCNS weights.
+6. **`predict` and `predict_with_trace` share one state-update implementation.**
+7. **Contribution identity:** intercept + input contributions + neuron contributions = raw prediction (tolerance `1e-5`).
+8. **Cancel:** stop.flag → status `cancelled` (existing `stopped` remains an interrupt synonym). Never rewrite an interrupted job as `completed`.
+9. Ruff clean; all tests green.
+10. **No CDN** in the WebGL component; vendor Three.js locally.
+
+### Layout decision (`models.py` vs `models/`)
+
+`src/pdm/models.py` is a **module** today. The requested files `src/pdm/models/reservoir.py` etc. require a **package**.
+
+**Do this in Phase B, step 0:** move the current module to `src/pdm/models/recurrent.py` and add `src/pdm/models/__init__.py` that re-exports `PDMNet`, `RecurrentEncoder`, `RULHead`, `WeibullHead` unchanged so every existing `from pdm.models import PDMNet` keeps working. Then add reservoir modules beside it.
+
+Do **not** leave both `src/pdm/models.py` and `src/pdm/models/` on disk.
+
+Connectome + visualization packages are new and do not collide:
+
+```
+src/pdm/connectome/          # graph IO, sampling, weights, layout
+src/pdm/models/              # package: recurrent GRU/LSTM + reservoirs + readout
+src/pdm/visualization/       # traces, contributions, export, Streamlit component
+```
 
 ---
 
 ## Phases
 
-### Phase 1 — Train coverage + causal eligibility (R1, R2)
+### Phase A — Integration points + graph artifact + synthetic fixture + provenance
 
-Fix what windows actually get gradients, and make offline/online window legality identical **even if this patch never re-prepares real data**.
+Create the connectome package, a tiny **labeled** synthetic graph used by tests/UI, provenance/manifest schema, YAML defaults, architecture constants, CLI/UI choice strings, and run-directory layout (`runs/<run_id>/connectome/`). GRU/LSTM training still constructs `PDMNet` via a new `build_model()` that is a pass-through for `gru`/`lstm`.
 
-1. **R1 sampler** — `set_epoch(epoch)` **inside** the 1-based epoch loop with `seed + epoch`. Do not iterate with default epoch 0 (`seed+0` ≠ epoch 1). Log `n_unique_sampled_windows` **per epoch**. Replacement sampling stays. Resume must not restart the schedule at epoch 0.
-2. **R2 gaps** — prepare writes **causal** `gap_before`. Full-file median is diagnostic-only. **Belt-and-suspenders:** `build_windows` / `count_window_eligibility` recompute causal gaps from timestamps (same helper as inference) so stored full-file flags cannot drive train eligibility. **Gate train and eval** against expected constant `GAP_RULE_VERSION` (`"causal_v1"`): missing ≠ expected is incompatible (`fingerprint_mismatches` field-to-field equality is not enough). Plan fingerprint bump; **do not** run prepare on real datasets in this patch.
+Reservoir **training math is not in this phase.** `pdm train --arch fly_connectome_reservoir` may refuse with a clear error until Phase B implements the ESN. CLI/UI must still list the new names.
 
-**Deliverables:** Subtasks 01–02  
-**Risk:** Existing local processed dirs lack `gap_rule_version`. Train/eval must refuse them until the next human prepare. Data screen may still load. Tests use synthetic timestamps only.
+**Deliverable:** `subtask-01-integration-points.md`  
+**Risk:** inventing MaleCNS column names; silent synthetic→real relabel; breaking `--arch` default `gru`.
 
-### Phase 2 — Alert scoring contract (R4, R5)
+### Phase B — Reservoir core + train/eval
 
-Make miss/coverage and replay/CSV/UI rescore mean the same thing.
+Leaky ESN update, frozen `W_in` / `W_res` / `b_res`, trainable linear readout, `fly_connectome_reservoir` and `random_reservoir` (degree-preserving directed rewiring, same N/E). Wire `run_training`, `load_trained_model`, `evaluate_run`, `Predictor`. Bearings may use ridge **or** gradient linear readout. Filters **must** use gradient censored loss. CPU unit tests for orientation, hand-calculated update, seeds, isolation, censoring.
 
-3. **R4 coverage (v1)** — observability through `event_time - minimum_action_lead_time` inclusive, scored from unit `observation_end_s` only. `H_trigger` is not the coverage bound. `min_lead==0` requires a timestamp **strictly before** the event. Interior-gap / K-sample coverage is a **documented caveat**, not this patch. Bump `METRICS_VERSION`. **Rewrite** `test_insufficient_coverage_not_false_miss` (keep `official_rul_overlay` as eval annotation, not a 600 Pa event).
-4. **R5 sensor state** — persist H/K-independent observed fields; one rescore contract; thread `pressure_limit_pa` through `alerts_from_predictions`, `rescore_replay_alerts`, **and** the `app.py` UI call. Tests use 500 vs 550. Never a 600-only path in the UI.
+**Deliverable:** `subtask-02-reservoir-core.md`  
+**Depends on:** A (graph + config + `build_model` hook)  
+**Risk:** silent transpose; ridge on censored filters; optimizer updating frozen reservoir weights; mixing dataset checkpoints.
 
-**Deliverables:** Subtasks 03–04  
-**Depends on:** Phase 1 preferred (tests file + replay/eval touch points). R4/R5 share `alerts.py` / `evaluate.py` / `replay.py` — sequential. R5 also edits `app.py` (pressure limit only; modes stay in 06).
+### Phase C — predict_with_trace + contributions + lazy artifacts
 
-### Phase 3 — Validation vs test policy workflow (R3)
+One state-update kernel used by both `predict` and `predict_with_trace`. Per-frame states, per-frame contributions, window/frame maps for replay. Traces computed only when requested. Save/load under `runs/<run_id>/traces/<unit_id>/`. Parity, window-reset, edge-drive, contribution-sum, postprocess, artifact-reload tests.
 
-Stop labeling test-tuned policies as validation. Freeze is the only writer of `source='validation_ui'` and the only creator of `alert_policy.json`. **Validation Evaluate** is `policy_mode='research'` (or write-identical `'validation'`): widget H/K allowed, `blind_benchmark: false`, **never** `ensure_alert_policy`. CLI `pdm evaluate` with no H/K flags is `frozen` (fail if no file). Test Evaluate with no freeze **fails** and must **not** `spawn_worker`. Default replay mode = **Validation**. Eval summary tables use `evaluate_mask.unit_ids`, not hardcoded `split['test']`.
+**Deliverable:** `subtask-03-predict-trace.md`  
+**Depends on:** B  
+**Risk:** duplicated update loops; traces that do not match displayed RUL; computing traces on every eval.
 
-**Deliverables:** Subtasks 05 (backend) → 06 (UI AppTest)  
-**Depends on:** Phase 2 so rescore/export fields exist before UI modes rely on them.  
-**07 (R6) depends on 05**, not 06 (`evaluate_run` API). 06 is UI-only relative to 07 except `app.py` pressure-limit source (07 reads snapshot when present).
+### Phase D — Neural Activity Explorer
 
-### Phase 4 — Experiment snapshot (R6) + suite
+New Streamlit screen in `app.py`. Local Streamlit custom component under `src/pdm/visualization/component/` with **vendored** Three.js (no CDN). Browser-side animation (not Streamlit rerun-per-frame). States from the same inference as prediction. Required caption + synthetic-graph banner. Modes: Overview, Equipment replay, Inside prediction window, Alert inspection. Network topological layout required; anatomical 3D only if coords exist.
 
-Persist resolved config / preprocessing hash / commit / metric-policy version. Resume must not silently replace saved preprocessing. `--force` records **actual** checkpoint bytes. Distinguish data-incompatible vs evaluation-method-changed. Full pytest + ruff. AppTest fixtures use `METRICS_VERSION`, not hardcoded `"v0"`. Optional report note (no fake metrics).
+**Deliverable:** `subtask-04-neural-explorer.md`  
+**Depends on:** C (trace artifacts + mappings). Heavy trace jobs still go through `pdm.worker`.  
+**Risk:** CDN URLs; fake flashes; AppTest regressions on the three existing screens.
 
-**Deliverables:** Subtasks 07–08  
-**Depends on:** 07 ← 05; 08 ← 01–07. Sequential 06 then 07 only if a merge conflict appears; prefer 07 after 05 while 06 is in flight or after 06 solely to serialize `evaluate.py` edits.
+### Phase E — Comparison table + alerts + demo hooks
+
+Same-split comparison of GRU/LSTM vs fly vs random (matched N/E) vs baselines. Synthetic fixture **excluded** from biological connectome comparisons. Alert-inspection jumps to the triggering window’s real trace. Demo scenario hooks documented and callable from UI/CLI without pretending MaleCNS was used.
+
+**Deliverable:** `subtask-05-comparison-alerts.md`  
+**Depends on:** D for explorer modes; B for metrics; C for traces. Sequential after D because `app.py` is shared.
+
+### Phase F — Suite, docs, validation, ruff
+
+`tests/test_reservoir.py` and `tests/test_neural_explorer.py` complete (acceptance tests 1–14). Docs under `docs/`. README only gains **working** commands. Full `pytest` + `ruff`. No smoke metrics presented as quality.
+
+**Deliverable:** `subtask-06-tests-docs.md`  
+**Depends on:** A–E.
 
 ---
 
 ## Dependencies (DAG)
 
 ```text
-01 (R1 sampler) ──┐
-                  ├──→ 03 (R4 coverage) → 04 (R5 export + app.py limit)
-02 (R2 causal)  ──┘         │
-                            ↓
-                     05 (R3 backend) ──→ 06 (R3 UI)
-                            │
-                            └──→ 07 (R6 snapshot) ──→ 08 (suite + R7 note)
-                                       ↑
-                                  06 does not block 07
+01 Phase A (graph, provenance, config, CLI/UI choices, build_model passthrough)
+        │
+        ▼
+02 Phase B (ESN + readout + train/eval)
+        │
+        ▼
+03 Phase C (predict_with_trace, contributions, artifacts)
+        │
+        ▼
+04 Phase D (WebGL explorer page)
+        │
+        ▼
+05 Phase E (comparison + alerts + demo)
+        │
+        ▼
+06 Phase F (full suite + docs)
 ```
 
-01 and 02 do not share production files (`train.py` vs `filters.py`/`windows.py`/`prepare.py`) but **both edit** `tests/test_spec_invariants.py`. Run **01 then 02** under orchestration. Do not parallelize 03/04 or 05/06. **07 depends on 05**, not 06. If 06 and 07 would both touch `evaluate.py`, run 06 then 07; otherwise 07 may follow 05 immediately.
+Do **not** parallelize. Shared files: `src/pdm/models/` (B+C), `src/pdm/train.py` (A+B), `src/pdm/predict.py` (B+C), `src/pdm/app.py` (A, D, E), `src/pdm/worker.py` (B, C, D), `tests/test_worker_and_app.py` (A, D, E).
 
 ---
 
 ## Execution order
 
-| # | Subtask file | Est. |
-|---|--------------|------|
-| 1 | `subtask-01-sampler-epoch-rng.md` | 1 h |
-| 2 | `subtask-02-causal-gap-eligibility.md` | 1.5–2 h |
-| 3 | `subtask-03-alert-coverage-horizon.md` | 1.5 h |
-| 4 | `subtask-04-sensor-state-export.md` | 1.5–2 h |
-| 5 | `subtask-05-validation-policy-backend.md` | 1.5–2 h |
-| 6 | `subtask-06-replay-modes-ui.md` | 1.5–2 h |
-| 7 | `subtask-07-experiment-snapshot.md` | 1–1.5 h |
-| 8 | `subtask-08-regression-and-report-note.md` | 1 h |
+| # | Subtask file | Scope |
+|---|--------------|--------|
+| 1 | `subtask-01-integration-points.md` | Connectome IO, synthetic fixture, YAML/CLI/UI strings, run layout, `build_model` passthrough |
+| 2 | `subtask-02-reservoir-core.md` | Convert `models.py` → package; ESN; fly/random; train/eval both datasets |
+| 3 | `subtask-03-predict-trace.md` | Shared update kernel, traces, contributions, lazy export |
+| 4 | `subtask-04-neural-explorer.md` | Custom WebGL component + new Streamlit screen |
+| 5 | `subtask-05-comparison-alerts.md` | Comparison table, alert jump, demo hooks |
+| 6 | `subtask-06-tests-docs.md` | Close 1–14 tests, four docs, README commands, ruff |
 
-**Total estimated effort:** ~11–15 hours (implementation + review cycles)
-
-Orchestration serial order stays 01…08 so `evaluate.py` / `app.py` / `test_spec_invariants.py` do not fork. DAG permission: 07 may start after 05 if 06 has not started editing `evaluate.py`.
+Phases B and D are the invasive subsystems (train factory + ESN math; vendored WebGL). Orchestration still runs them as one subtask each, as named above.
 
 ---
 
@@ -114,43 +161,119 @@ Orchestration serial order stays 01…08 so `evaluate.py` / `app.py` / `test_spe
 
 | Area | Gate |
 |------|------|
-| Leakage / sampler / gaps / coverage / export / policy | `tests/test_spec_invariants.py` |
-| UI modes, Freeze provenance, eval picker | `tests/test_worker_and_app.py` AppTest |
-| Env (only if env-related) | `.venv/bin/python -m pdm doctor` |
-| Browser | Optional follow-up on `http://127.0.0.1:8501` — **not** an acceptance gate |
-| Smoke / Full train | **Not** a quality gate. Do not treat `--smoke` metrics as quality. Do not run Full 30-epoch as acceptance. |
-| Real prepare | **Not** required this patch. Missing `gap_rule_version` **refuses train/eval** until the next human prepare. |
+| Existing leakage / GRU/LSTM / censoring / checkpoints | `tests/test_spec_invariants.py` |
+| Existing UI / worker | `tests/test_worker_and_app.py` |
+| Reservoir math, orientation, traces, contributions | `tests/test_reservoir.py` (created A–C, completed F) |
+| Explorer page, caption, synthetic banner, no CDN | `tests/test_neural_explorer.py` (created D, completed F) |
+| Env | `.venv/bin/python -m pdm doctor` if CLI/env touched |
+| Browser | Exercise explorer on `http://127.0.0.1:8501` in D/E if tools exist; AppTest is the merge gate |
+| Smoke / Full train | **Not** a quality gate |
+
+After **each** subtask the full existing suite must still pass. Do not merge a phase that reds GRU tests.
 
 ---
 
-## Leakage & gotchas (carry through all subtasks)
+## Leakage, isolation, and math (carry through all subtasks)
 
-- Fit encoder, imputer, scaler, `time_scale_s` on **train units only**; persist with the run.
-- `unit_id`, `event_time_s`, `RUL`, split labels, official filter RUL are never model inputs. `official_rul_overlay` is eval annotation, not a 600 Pa event.
-- Predictor receives **raw** rows ≤ t; evaluator joins GT afterward.
-- `observed_limit_reached`, `differential_pressure`, `prediction_status`, `valid_history_reason` are **current** sensor/model state, not future ground truth. Allowed in `predictions.csv`.
-- `alert_status` / warning_active remain H/K-dependent — **drop** from prediction export.
-- `fingerprint_mismatches` equality of missing fields is **not** a version gate. Compare to expected `GAP_RULE_VERSION`.
-- `ensure_alert_policy(overwrite=False)` is still a **write**. Research, Validation Evaluate, and CLI-with-flags must not call it. CLI with no flags is `frozen` (fail if missing), not a first-write.
-- `_render_evaluation_panel` / `metrics_by_unit_display_frame` must use selected eval `evaluate_mask.unit_ids`, not always `split['test']`.
-- Changing gap rules or coverage definition invalidates old processed data / old alert denominators. Version them (`gap_rule_version`, `METRICS_VERSION`). Do not silently reuse old smoke hashes as the new pipeline’s quality.
-- Never load a bearings checkpoint into filters.
-- `split_hash` remains canonical; loaders still accept legacy `split_fingerprint`.
+- Fit encoder / imputer / scaler / `time_scale_s` on **train units only**; persist with the run. Reservoir `W_in` is fixed from `seed`, not fit on test units.
+- `unit_id`, `event_time_s`, `RUL`, split labels, official filter RUL are never model inputs.
+- Predictor receives **raw** rows ≤ t; evaluator joins GT afterward. Traces use that same prefix.
+- Never load a bearings checkpoint into filters. `checkpoints_compatible` must include `architecture` **and**, for reservoirs, `n_nodes`, `graph_mode`, `graph_hash`, `state_mode`, `leak`, `spectral_radius`, `input_scale`, `seed`.
+- `W_res @ x` uses **row i, column j = edge j→i**. Test with a one-edge graph; do not transpose if a plot looks wrong.
+- Default `state_mode=window_reset`: `x=0` at the start of every window. Step t uses `x[t-1]` from **this** window.
+- Filters: `event=0` stays censored in `weibull_nll`. Ridge readout is bearings-only (or any fully observed RUL head). No `duration_s=0` hack.
+- `synthetic_fixture` sets `graph_mode=synthetic_fixture` and `is_synthetic=true` in every manifest, checkpoint `compat`, and UI string.
+- Linear readout raw output is the contribution identity. Display RUL (`softplus` / Weibull median / `time_scale_s`) is postprocessing (test 11).
+
+---
+
+## Defaults (YAML `model.reservoir`)
+
+| Key | Default | Notes |
+|-----|---------|--------|
+| `n_nodes` | 1000 | Range 500–2000 for real graphs; tests use tiny graphs |
+| `smoke_n_nodes` | 300 | Smoke only |
+| `leak` / `alpha` | 0.2 | Same symbol; store as `leak` in YAML, `alpha` in code alias |
+| `spectral_radius` | 0.9 | Scale `W_res` after `log1p` |
+| `input_scale` | 0.1 | `W_in` |
+| `ridge_alpha` | 0.001 | Bearings ridge only; ignored for filters |
+| `seed` | 42 | Graph sample + `W_in` + rewiring |
+| `state_mode` | `window_reset` | |
+| `graph_mode` | `synthetic_fixture` until a local MaleCNS file exists; `real_connectome` when provenance says so | Never auto-promote synthetic |
+| `readout` | `ridge` bearings / `gradient` filters | Filters cannot select ridge |
+
+Weight policy: `A[i,j] = log1p(synapse_count of edge j→i)`, then scale so the spectral radius of `A` equals `spectral_radius`.
+
+State update (single implementation):
+
+```text
+x[t] = (1 - alpha) * x[t-1] + alpha * tanh(W_res @ x[t-1] + W_in @ u[t] + b_res)
+```
+
+Readout (raw):
+
+```text
+raw = W_x @ x[T] + W_u @ u[T] + b
+```
+
+Display: bearings `softplus(raw) * time_scale_s` (or equivalent non-negative map already used); filters `weibull_median_rul` on `softplus` λ, k.
+
+---
+
+## Artifact layout
+
+```
+runs/<dataset_id>/<run_id>/
+  connectome/
+    provenance.json          # source, hashes, graph_mode, disclaimer
+    graph.json               # node_id (str), edges, optional xyz
+    weights.npz              # W_in, W_res, b_res (frozen)
+    layout.json              # 2D/3D coordinates for explorer
+  traces/<unit_id>/          # created only when a trace is requested
+    meta.json
+    states.npz               # [frames, n_nodes]
+    contributions.npz
+    frame_map.json           # window ↔ replay step ↔ frame
+  best.pt / last.pt          # includes readout; reservoir weights frozen
+```
+
+---
+
+## Acceptance tests (map)
+
+Implemented in `tests/test_reservoir.py` unless noted. Explorer-facing checks also in `tests/test_neural_explorer.py`.
+
+| # | Test | Primary subtask |
+|---|------|-----------------|
+| 1 | Graph orientation `W_res[i,j] = j→i` | 02 (adjacency convention starts in 01) |
+| 2 | State update vs hand calculation | 02 |
+| 3 | Validation errors (wrong `n_nodes`, dataset isolation) | 02 |
+| 4 | Seed reproducibility | 02 |
+| 5 | Split/preprocess isolation (no leakage) | 02 |
+| 6 | Causality (no future frames) | 03 |
+| 7 | predict / trace parity | 03 |
+| 8 | Window reset at window boundary | 03 |
+| 9 | Edge drive uses previous state in the same window | 03 |
+| 10 | Contribution sum within `1e-5` | 03 |
+| 11 | Postprocessing raw vs display | 03 |
+| 12 | Censoring not RUL=0 | 02 |
+| 13 | Artifact reload recovers predictions | 03 |
+| 14 | Synthetic labeling | 01 (graph) + 04 (UI) + 05 (comparisons) |
 
 ---
 
 ## Out of scope
 
-- R7 Full training, grouped CV, demo split, new NN architectures
-- Enabling `filters_full_history` or inventing MATLAB fields
-- Changing `time_to_seconds` or split counts
-- FastAPI / React / Docker / MLflow / Transformers / live SCADA
-- Rewriting `reports/implementation_report.md` with new quality numbers
-- Browser-only verification as a gate
-- R4 v1 interior-gap / K-sample coverage scoring (documented caveat)
+- FastAPI / React SPA / Docker / MLflow / TensorFlow / Transformers / OpenAI SDK
+- Additional NN architectures beyond GRU, LSTM, `fly_connectome_reservoir`, `random_reservoir`
+- Enabling `filters_full_history` or inventing MATLAB / MaleCNS fields
+- Changing split protocol or `time_to_seconds`
+- Bundling the full MaleCNS feather in git
+- Treating `--smoke` metrics or explorer pretty pictures as model quality
+- Downloading GCS objects in CI as a merge requirement
 
 ---
 
 ## Next step
 
-Re-run **plan-reviewer** on `.cursor/tasks/`, then `/orchestration` (planner → reviewer → per-subtask developer → code-reviewer).
+Run **plan-reviewer** on `.cursor/tasks/`, then `/orchestration` (planner → reviewer → per-subtask developer → code-reviewer).
