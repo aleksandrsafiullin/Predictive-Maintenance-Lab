@@ -114,7 +114,12 @@ def build_model(
     dropout: float = 0.1,
     time_scale_s: float = 1.0,
 ) -> PDMNet:
-    """Construct a GRU/LSTM ``PDMNet``. Reservoir architectures are not trainable yet."""
+    """Construct a GRU/LSTM ``PDMNet``.
+
+    Reservoir architecture strings still raise here. ``FlyConnectomeReservoir`` /
+    ``RandomReservoir`` can be constructed directly for unit tests; ``run_training``
+    remains blocked until subtask 02c.
+    """
     arch = str(architecture or "").strip().lower()
     if is_reservoir(arch):
         raise NotImplementedError("Reservoir training not yet implemented. Use gru or lstm.")

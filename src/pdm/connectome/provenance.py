@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from pathlib import Path
 from typing import Any
 
+import networkx as nx
+
+from pdm.connectome.graph import as_node_id
 from pdm.io_util import atomic_write_json, read_json, sha256_file
 
 ORIENTATION_CONVENTION = "W_res[i,j]=edge j→i"
 WEIGHT_POLICY = "log1p(synapse_count)"
 NODE_ID_DTYPE = "string"
 SYNTHETIC_DISCLAIMER = "Synthetic test graph — not a biological connectome"
+RANDOM_REWIRE_DISCLAIMER = (
+    "Degree-preserving directed rewiring (graph_mode=random_rewire) — not a biological connectome"
+)
 GRAPH_MODE_SYNTHETIC = "synthetic_fixture"
 GRAPH_MODE_REAL = "real_connectome"
 GRAPH_MODE_RANDOM_REWIRE = "random_rewire"
@@ -31,6 +39,27 @@ REQUIRED_FIELDS = (
     "weight_policy",
     "disclaimer",
 )
+
+OPTIONAL_FIELDS = ("parent_graph_hash",)
+
+
+def hash_graph(graph: nx.DiGraph) -> str:
+    """Canonical SHA-256 of sorted node ids and directed weighted edges."""
+    nodes = sorted(as_node_id(n) for n in graph.nodes())
+    edges = []
+    for src, dst, data in graph.edges(data=True):
+        payload = data or {}
+        weight = payload.get("synapse_count", payload.get("weight", 1.0))
+        edges.append(
+            {
+                "src": as_node_id(src),
+                "dst": as_node_id(dst),
+                "weight": float(weight),
+            }
+        )
+    edges.sort(key=lambda e: (e["src"], e["dst"], e["weight"]))
+    blob = json.dumps({"nodes": nodes, "edges": edges}, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def utc_now() -> str:
@@ -59,6 +88,7 @@ def build_provenance(
     retrieved_at: str | None = None,
     column_names_read: list[str] | None = None,
     seed: int | None = None,
+    parent_graph_hash: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     rec: dict[str, Any] = {
@@ -76,6 +106,7 @@ def build_provenance(
         "orientation": ORIENTATION_CONVENTION,
         "weight_policy": WEIGHT_POLICY,
         "disclaimer": disclaimer,
+        "parent_graph_hash": parent_graph_hash,
     }
     if extra:
         rec.update(extra)

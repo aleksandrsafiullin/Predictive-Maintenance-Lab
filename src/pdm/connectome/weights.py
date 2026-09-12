@@ -39,7 +39,59 @@ def log1p_adjacency(
     return adj
 
 
+_RHO_EPS = 1e-12
+
+
+def scale_to_spectral_radius(A: np.ndarray, target_sr: float = 0.9) -> np.ndarray:
+    """Scale A so its largest absolute eigenvalue equals ``target_sr``.
+
+    Empty or all-zero matrices raise. If the spectral radius is ~0 but A is not
+    identically zero (nilpotent / DAG), scale by the largest singular value so a
+    one-edge graph keeps a finite, orientation-preserving ``W_res``. Never
+    transposes A.
+    """
+    mat = np.array(A, dtype=np.float64, copy=True)
+    if mat.ndim != 2 or mat.shape[0] != mat.shape[1]:
+        raise ValueError(f"adjacency must be square, got shape {mat.shape}")
+    if mat.size == 0 or not np.any(np.abs(mat) > 0):
+        raise ValueError("Cannot scale an empty or all-zero adjacency matrix to a spectral radius")
+    target = float(target_sr)
+    if not np.isfinite(target) or target <= 0.0:
+        raise ValueError(f"target spectral radius must be positive and finite, got {target_sr}")
+    rho = float(np.max(np.abs(np.linalg.eigvals(mat))))
+    if not np.isfinite(rho) or rho < _RHO_EPS:
+        svals = np.linalg.svd(mat, compute_uv=False)
+        rho = float(svals[0]) if svals.size else 0.0
+    if not np.isfinite(rho) or rho < _RHO_EPS:
+        raise ValueError("Cannot scale an empty or all-zero adjacency matrix to a spectral radius")
+    return mat * (target / rho)
+
+
 def scale_spectral_radius(matrix: np.ndarray, spectral_radius: float = 0.9) -> np.ndarray:
-    """Stub: return a copy. Actual spectral-radius scaling is implemented in subtask 02b."""
-    del spectral_radius
-    return np.array(matrix, dtype=np.float64, copy=True)
+    """Alias for :func:`scale_to_spectral_radius`."""
+    return scale_to_spectral_radius(matrix, spectral_radius)
+
+
+def w_res_from_graph(
+    graph: nx.DiGraph,
+    spectral_radius: float = 0.9,
+    node_order: Sequence[str] | None = None,
+) -> np.ndarray:
+    """``log1p`` adjacency in j→i orientation, scaled to ``spectral_radius``. Never transposes."""
+    adj = log1p_adjacency(graph, node_order)
+    return scale_to_spectral_radius(adj, spectral_radius)
+
+
+def random_input_weights(
+    n_nodes: int,
+    input_size: int,
+    input_scale: float,
+    seed: int,
+) -> np.ndarray:
+    """Dense ``W_in`` of shape ``[n_nodes, input_size]`` uniform in ``[-input_scale, input_scale]``."""
+    rng = np.random.default_rng(int(seed))
+    return rng.uniform(
+        -float(input_scale),
+        float(input_scale),
+        size=(int(n_nodes), int(input_size)),
+    ).astype(np.float64)
