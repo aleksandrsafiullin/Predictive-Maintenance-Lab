@@ -119,13 +119,23 @@ def main(argv: list[str] | None = None) -> int:
 
     p_tr = sub.add_parser("train")
     p_tr.add_argument("--dataset", required=True, choices=["bearings", "filters"])
-    p_tr.add_argument("--arch", default="gru", choices=["gru", "lstm"])
+    p_tr.add_argument(
+        "--arch",
+        default="gru",
+        choices=["gru", "lstm", "fly_connectome_reservoir", "random_reservoir"],
+    )
     p_tr.add_argument("--epochs", type=int, default=None)
     p_tr.add_argument("--history", type=int, default=None)
     p_tr.add_argument("--smoke", action="store_true")
     p_tr.add_argument("--resume", default=None)
     p_tr.add_argument("--device", default="auto")
     p_tr.add_argument("--max-windows-per-unit", type=int, default=None)
+    p_tr.add_argument("--n-nodes", type=int, default=None)
+    p_tr.add_argument(
+        "--graph-mode",
+        default=None,
+        choices=["synthetic_fixture", "real_connectome", "random_rewire"],
+    )
 
     p_ev = sub.add_parser("evaluate")
     p_ev.add_argument("--dataset", required=True, choices=["bearings", "filters"])
@@ -210,6 +220,8 @@ def main(argv: list[str] | None = None) -> int:
             device_pref=args.device,
             log=lambda m: print(m, flush=True),
             max_windows_per_unit=args.max_windows_per_unit,
+            n_nodes=args.n_nodes,
+            graph_mode=args.graph_mode,
         )
         print(json.dumps(rec, indent=2, default=str))
         return 0

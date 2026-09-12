@@ -13,6 +13,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
+from pdm.architectures import is_reservoir
 from pdm.config import load_dataset_config, model_defaults
 from pdm.data.prepare import dataset_fingerprint_for_run, load_processed
 from pdm.device import resolve_device
@@ -26,7 +27,7 @@ from pdm.io_util import (
     sha256_file,
 )
 from pdm.losses import smooth_l1, weibull_nll
-from pdm.models import PDMNet
+from pdm.models import PDMNet, build_model
 from pdm.paths import dataset_runs, project_root
 from pdm.preprocessing import (
     Preprocessor,
@@ -449,6 +450,8 @@ def run_training(
     status_cb: Callable[[dict[str, Any]], None] | None = None,
     max_windows_per_unit: int | None = None,
     seed: int | None = None,
+    n_nodes: int | None = None,
+    graph_mode: str | None = None,
 ) -> dict[str, Any]:
     def _log(msg: str) -> None:
         if log:
@@ -457,6 +460,17 @@ def run_training(
     cfg = load_dataset_config(dataset_id)
     mcfg = model_defaults(cfg)
     mcfg["architecture"] = architecture.lower()
+    reservoir = dict(mcfg.get("reservoir") or {})
+    if n_nodes is not None:
+        reservoir["n_nodes"] = int(n_nodes)
+    if graph_mode is not None:
+        reservoir["graph_mode"] = str(graph_mode)
+    if reservoir:
+        mcfg["reservoir"] = reservoir
+    if is_reservoir(mcfg["architecture"]):
+        raise NotImplementedError(
+            "Reservoir training not yet implemented in run_training. This guard is removed in Phase B."
+        )
     if history_length is not None:
         mcfg["history_length"] = int(history_length)
     if seed is not None:
@@ -637,15 +651,19 @@ def run_training(
     )
     sel_spec = selection_metric_spec(dataset_id)
 
-    model = PDMNet(
+    model = build_model(
+        architecture=mcfg["architecture"],
         input_size=len(prep.feature_names),
         hidden_size=int(mcfg["hidden_size"]),
         num_layers=int(mcfg["recurrent_layers"]),
-        architecture=mcfg["architecture"],
         head=head,
         dropout=float(mcfg["dropout"]),
         time_scale_s=prep.time_scale_s,
     ).to(device)
+    if is_reservoir(mcfg["architecture"]):
+        raise NotImplementedError(
+            "Reservoir training not yet implemented in run_training. This guard is removed in Phase B."
+        )
     opt = torch.optim.AdamW(
         model.parameters(),
         lr=float(mcfg["learning_rate"]),
@@ -729,7 +747,7 @@ def run_training(
     try:
         for epoch in range(start_epoch, int(mcfg["max_epochs"]) + 1):
             if should_stop and should_stop():
-                last_status = "stopped"
+                last_status = "cancelled"
                 _log(f"Stop requested at epoch {epoch}")
                 break
             sampler.set_epoch(epoch)
@@ -852,7 +870,7 @@ def run_training(
             if bad >= patience:
                 _log(f"Early stopping at epoch {epoch}, best_epoch={best_epoch}")
                 break
-        if last_status != "stopped":
+        if last_status != "cancelled":
             last_status = "completed"
     except Exception as exc:  # noqa: BLE001
         last_status = "failed"
