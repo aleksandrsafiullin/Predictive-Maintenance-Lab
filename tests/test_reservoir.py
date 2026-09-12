@@ -764,7 +764,7 @@ def test_no_future_frames(tiny_bearing_tables):
 def test_window_reset(tiny_bearing_tables):
     features, _units = tiny_bearing_tables
     prep = _bearings_prep()
-    model = _tiny_fly(prep, seed=4, leak=1.0)
+    model = _tiny_fly(prep, seed=4, leak=0.2)
     hist, uid = _unit_history(features, 8)
     w1 = hist.iloc[:4].copy()
     w1.attrs["raw_features"] = True
