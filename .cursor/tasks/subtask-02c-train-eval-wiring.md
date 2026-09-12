@@ -6,7 +6,7 @@ Wire `fly_connectome_reservoir` and `random_reservoir` through `run_training`, `
 
 ## Context
 
-Phase B part 3. 02b produced frozen ESN weights, `forward_states`, and `forward()` contracts that match `_run_epoch`. Today `run_training()` still errors on reservoir strings (01), always does `AdamW(model.parameters())`, and `compatibility_dict()` writes only GRU keys (`dataset_id`, `architecture`, `history_length`, `hidden_size`, `recurrent_layers`, `head`, `feature_names`, `time_scale_s`, `split_hash`, plus optional `dataset_version` / `features_hash` / `units_hash`). `load_trained_model` always constructs `PDMNet`. Worker evaluate already checks `stop.flag` from 01.
+Phase B part 3. 02b produced frozen ESN weights, `forward_states`, and `forward()` contracts that match `_run_epoch`. Today `run_training()` still errors on reservoir strings (01), always does `AdamW(model.parameters())`, and `compatibility_dict()` writes GRU keys (`dataset_id`, `architecture`, `history_length`, `hidden_size`, `recurrent_layers`, `head`, `feature_names`, `time_scale_s`, `split_hash`, `feature_pipeline_version`, `categorical_maps_fingerprint`, plus optional `dataset_version` / `features_hash` / `units_hash`). `load_trained_model` always constructs `PDMNet`. Worker evaluate already checks `stop.flag` from 01. Completion currently uses `if last_status != "stopped": last_status = "completed"` — that guard must become `!= 'cancelled'` so a cancelled emit is not overwritten.
 
 ## Acceptance Criteria
 
@@ -19,13 +19,14 @@ Phase B part 3. 02b produced frozen ESN weights, `forward_states`, and `forward(
   - Ridge path does **not** call `loss.backward()`.
   - Ridge still writes `best.pt`, `last.pt`, `status.json`, `experiment_snapshot.json`, `connectome/` artifacts (`provenance.json`, `graph.json`, `weights.npz`, `layout.json`).
   - `should_stop()` on the ridge path emits **`cancelled`**, not `completed`, not `stopped`.
-  - Tests: `test_ridge_uses_forward_states_kernel`, `test_ridge_no_backward`, `test_ridge_writes_artifacts`, `test_ridge_stop_flag_sets_cancelled`.
+  - At `train.py` completion: `if last_status != 'cancelled': last_status = 'completed'` — do not use `!= 'stopped'` guard which would overwrite a `cancelled` emit.
+  - Tests: `test_ridge_uses_forward_states_kernel`, `test_ridge_no_backward`, `test_ridge_writes_artifacts`, `test_ridge_stop_flag_sets_cancelled`, `test_ridge_bearings_no_double_softplus`.
 
 - [ ] **Filters readout:** gradient + `weibull_nll` only. `readout=ridge` (YAML, CLI, or kwargs) **raises before any target is used** (before `UnitWindowDataset` targets are consumed / before `nan` filling). Clear message, e.g. ridge is unsupported for censored filters. Test: `test_filters_ridge_raises_before_targets`. `configs/filters.yaml` still has **no** `readout: ridge`. `model_defaults()` sets filters readout to `gradient`.
 
 - [ ] **Never** `nan_to_num` censored `target_rul_s` to 0 for filters. Censored rows stay `event=0`; duration remains the observed prefix length. Test: `test_filters_censoring_not_rul_zero` (test 12) — a censored batch with `event=0` does not equal treating `target=0` as an observed failure.
 
-- [ ] `compatibility_dict` / `_save_ckpt` `compat`: extra keys `n_nodes`, `graph_mode`, `graph_hash`, `state_mode`, `leak`, `spectral_radius`, `input_scale`, `seed` are **written only** when `architecture` is `fly_connectome_reservoir` or `random_reservoir`. GRU/LSTM blobs remain **bit-compatible** with today’s fixtures in `tests/test_spec_invariants.py` (same key set as now).
+- [ ] `compatibility_dict` / `_save_ckpt` `compat`: extra keys `n_nodes`, `graph_mode`, `graph_hash`, `state_mode`, `leak`, `spectral_radius`, `input_scale`, `seed`, `readout` are **written only** when `architecture` is `fly_connectome_reservoir` or `random_reservoir`. GRU/LSTM blobs remain **bit-compatible** with today’s fixtures in `tests/test_spec_invariants.py` (same key set as now). Do NOT drop any existing GRU keys (`feature_pipeline_version`, `categorical_maps_fingerprint` included).
 
 - [ ] `checkpoints_compatible(saved, current)` compares reservoir keys **only if both** saved and current architectures are reservoir (same optional pattern as `dataset_version` / `features_hash`: compare when present on **both** **and** both are reservoir). A GRU saved blob vs a current dict that happens to contain YAML reservoir defaults remains compatible. Test in `tests/test_spec_invariants.py`: **`test_gru_checkpoint_compat_ignores_reservoir_yaml_defaults`**. Also: `load_trained_model` still loads a GRU `best.pt` after `model_defaults()` has reservoir keys in YAML.
 
@@ -75,6 +76,7 @@ Phase B part 3. 02b produced frozen ESN weights, `forward_states`, and `forward(
 - **Ridge (bearings only):** last-step `[x; u]` from `forward_states` on `UnitWindowDataset` **train split only**. `y` is **normalized RUL** (`target_rul_s / time_scale_s`). Do **not** use val/test windows to fit. Then freeze readout buffers.
 - **Do not** `loss.backward()`; do not step AdamW on the ridge path. Optional eval of val MAE after solve to fill `best.pt` metrics is fine (`torch.no_grad`).
 - Still emit `status.json`, write snapshot, `best.pt`/`last.pt`. If `should_stop()` fires, final status **`cancelled`**.
+- At `train.py` completion: `if last_status != 'cancelled': last_status = 'completed'` — do not use `!= 'stopped'` guard which would overwrite a `cancelled` emit.
 - **Gradient:** `nn.Linear` on concatenated `[x; u]`; `requires_grad` only there; reuse `_run_epoch` and existing losses. `forward()` already matches RULHead / WeibullHead from 02b.
 
 ### Filters ridge (C3.3, W3)
@@ -86,6 +88,8 @@ Raise at the start of `run_training` / `model_defaults` / readout factory when `
 `UnitWindowDataset` already keeps `target` as NaN when `target_rul_s` is missing (`src/pdm/train.py` ~76) and uses `event`. Do **not** add `nan_to_num(target, nan=0)`. Test 12 compares `event=0` NLL vs a counterfactual `event=1` and `target=0`.
 
 ### GRU compat (C2)
+
+Do NOT drop any existing keys from `compatibility_dict()`. Current keys as of main: `dataset_id`, `architecture`, `history_length`, `hidden_size`, `recurrent_layers`, `head`, `feature_names`, `time_scale_s`, `split_hash`, `feature_pipeline_version`, `categorical_maps_fingerprint`, plus optional `dataset_version`, `features_hash`, `units_hash`. Add reservoir keys (`n_nodes`, `graph_mode`, `graph_hash`, `state_mode`, `leak`, `spectral_radius`, `input_scale`, `seed`, `readout`) inside `if architecture in {fly_connectome_reservoir, random_reservoir}`. Never drop `feature_pipeline_version` or `categorical_maps_fingerprint`. Preserve `resolve_split_hash` legacy behavior.
 
 ```text
 # compatibility_dict
@@ -125,7 +129,7 @@ if is_reservoir(meta["architecture"]):
 
 **Write this distinction into code comments on the ridge solver and readout:**
 
-Ridge closed-form fits **normalized RUL** (`y = target_rul_s / time_scale_s`), matching Smooth L1 in `_run_epoch`. The contribution identity test (03) does **not** use that display/loss space; it sums intercept + input + neuron terms on the **pre-Softplus / pre-median / pre-`time_scale_s` linear `raw`**. `forward()` still returns the `_run_epoch` contract (bearings: non-negative normalized RUL after Softplus; filters: `(lam, k)` after Softplus). Do not mix the two spaces in assertions.
+Ridge closed-form fits **normalized RUL** (`y = target_rul_s / time_scale_s`), matching Smooth L1 in `_run_epoch`. The contribution identity test (03) does **not** use that display/loss space; it sums intercept + input + neuron terms on the **pre-Softplus / pre-median / pre-`time_scale_s` linear `raw`**. Bearings ridge `forward()` returns `relu(W_out @ state + b_out)` (no extra Softplus; see 02b `test_ridge_bearings_no_double_softplus`). Filters `forward()` still returns `(lam, k)` after Softplus. Do not mix the two spaces in assertions.
 
 ### Leakage
 
@@ -162,3 +166,4 @@ Skip in CI if data missing. Never omit `--n-nodes` and assume 300 fixture nodes.
 - `synthetic_fixture` clamp from 01 still applies; smoke uses `--n-nodes 8`.
 - Do not transpose `W_res`.
 - Cancel/stop during train still must not emit `completed` or `stopped`.
+- At `train.py` completion: `if last_status != 'cancelled': last_status = 'completed'` — do not use `!= 'stopped'` guard which would overwrite a `cancelled` emit.

@@ -10,7 +10,7 @@ Phase F. Phases A–E implemented graph, package split, ESN, train wiring, trace
 
 ## Acceptance Criteria
 
-- [ ] `tests/test_reservoir.py` implements tests **1–14** listed in the master plan (14 may be split with explorer tests). Names should be grep-able (`test_graph_orientation`, `test_state_update_hand_calculation`, `test_wrong_n_nodes_raises`, `test_dataset_checkpoint_isolation`, `test_seed_reproducibility`, `test_split_preprocess_isolation`, `test_no_future_frames`, `test_predict_trace_parity`, `test_window_reset`, `test_edge_drive_previous_state`, `test_contribution_sum`, `test_raw_vs_display_postprocess`, `test_filters_censoring_not_rul_zero`, `test_trace_artifact_reload`, `test_synthetic_fixture_label`).
+- [ ] `tests/test_reservoir.py` implements tests **1–14** listed in the master plan (14 may be split with explorer tests). Names should be grep-able (`test_graph_orientation`, `test_state_update_hand_calculation`, `test_n_nodes_mismatch_vs_weights_npz_raises`, `test_dataset_checkpoint_isolation`, `test_seed_reproducibility`, `test_split_preprocess_isolation`, `test_no_future_frames`, `test_predict_trace_parity`, `test_window_reset`, `test_edge_drive_previous_state`, `test_contribution_sum`, `test_raw_vs_display_postprocess`, `test_filters_censoring_not_rul_zero`, `test_trace_artifact_reload`, `test_synthetic_fixture_label`). `synthetic_fixture` oversize CLAMPS (`test_synthetic_n_nodes_clamps_not_raises`); only artifact/checkpoint size mismatch raises. Do not test that synthetic + n_nodes > fixture.N raises.
 
 - [ ] Review extras are present (implement here only if a prior subtask skipped them):
   - `test_synthetic_n_nodes_clamps_not_raises` (01)
@@ -18,7 +18,9 @@ Phase F. Phases A–E implemented graph, package split, ESN, train wiring, trace
   - `test_gru_checkpoint_compat_ignores_reservoir_yaml_defaults` in `tests/test_spec_invariants.py` (02c, C2)
   - `test_filters_ridge_raises_before_targets` (02c)
   - `test_ridge_uses_forward_states_kernel` / `test_ridge_no_backward` (02c, W2)
+  - `test_ridge_bearings_no_double_softplus` (02b: bearings `forward()` is ReLU, no extra Softplus; ridge residual ≤ 1e-3)
   - `test_load_trained_model_missing_weights_npz_raises` (02c, W8)
+  - `test_n_nodes_mismatch_vs_weights_npz_raises` (02c test 3; artifact/checkpoint size mismatch only — not synthetic oversize)
   - `test_predict_and_trace_share_update_function` (03, W2)
   - `test_random_reservoir_parent_graph_hash` (02b, W8)
   - frontend CDN grep including component bridge (04, W5)
@@ -121,6 +123,8 @@ Do not replace the GRU quickstart. Add a short “Connectome reservoir (optional
 
 If a prior subtask skipped a numbered or named test, implement it here with tiny synthetic graphs and in-memory windows (reuse `tiny_bearing_tables` / `tiny_filter_tables` from `tests/conftest.py`). Do not require XJTU-SY or HSE files. Tests pass `n_nodes=8` or `16` explicitly.
 
+Test 3 is `test_n_nodes_mismatch_vs_weights_npz_raises` (not `test_wrong_n_nodes_raises`). `synthetic_fixture` oversize CLAMPS (`test_synthetic_n_nodes_clamps_not_raises`); only artifact/checkpoint size mismatch raises. Do not test that synthetic + n_nodes > fixture.N raises.
+
 Filters test 12: train or call loss with `event=0` vs a counterfactual `event=1` and `duration=0` / `RUL=0`; assert the implementation does not use the counterfactual. Ridge must be unreachable for filters (`test_filters_ridge_raises_before_targets`). No `nan_to_num` to 0.
 
 ## Dependencies
@@ -150,3 +154,4 @@ Optional help check:
 - Do not treat explorer visuals or smoke MAE as model quality.
 - GRU/LSTM remain the default path documented first in README.
 - Never raise on synthetic `n_nodes`; clamp. Never put reservoir keys on GRU `compat`. Never CDN. Never `else: screen_replay()`. Never `readout: ridge` in `filters.yaml`.
+- Test 3 name is `test_n_nodes_mismatch_vs_weights_npz_raises`. `synthetic_fixture` oversize CLAMPS (`test_synthetic_n_nodes_clamps_not_raises`); only artifact/checkpoint size mismatch raises. Do not test that synthetic + n_nodes > fixture.N raises.

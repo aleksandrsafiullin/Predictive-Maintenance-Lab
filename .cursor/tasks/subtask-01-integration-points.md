@@ -27,10 +27,10 @@ Builds on current `src/pdm/config.py` `model_defaults()`, `src/pdm/cli.py`, `src
 - [ ] Do **not** document or implement synthetic smoke as `smoke_n_nodes=300`. CLI grows `--n-nodes` (and `--graph-mode` if needed). Tests and later README smoke commands pass **explicit** `--n-nodes 8` (or 8–16).
 - [ ] Architecture constants live in one module (e.g. `src/pdm/architectures.py`): `gru`, `lstm`, `fly_connectome_reservoir`, `random_reservoir`. CLI `--arch` and Train selectbox list all four. Default remains `gru`.
 - [ ] `build_model(...)` for `gru`/`lstm` returns today’s `PDMNet` with the same constructor arguments. Existing `test_gru_lstm_both_heads_change_weights` still passes without edits to its assertions.
-- [ ] For reservoir architecture strings, `build_model` / `run_training` **must not** call `RecurrentEncoder` (that class still only accepts gru/lstm). Until 02c, attempting to train a reservoir raises a dedicated, explicit error (not `architecture must be gru or lstm`).
+- [ ] For reservoir architecture strings, `build_model` / `run_training` **must not** call `RecurrentEncoder` (that class still only accepts gru/lstm). Until 02c, attempting to train a reservoir raises a dedicated, explicit error (not `architecture must be gru or lstm`). Put the 'reservoir not yet trainable' error in `run_training()` (before optimizer construction), not only in `build_model()`. This prevents AdamW from being created on reservoir weights before Phase B wires the training path. Phase B (02c) then deletes this guard.
 - [ ] Helpers create `runs/<dataset_id>/<run_id>/connectome/` and document `traces/<unit_id>/` (directories may be empty until 02c/03).
 - [ ] `"cancelled"` is added to `pdm.STATUSES`. `"stopped"` remains in the tuple **only** so old `status.json` files still parse. **New** writes that see `stop.flag` / `should_stop()` use **`cancelled`**, never `completed`, never `stopped`.
-- [ ] `run_training`: `should_stop()` sets final status `cancelled` (today it is `stopped` at `src/pdm/train.py` ~732/855). Successful GRU completion still `completed`.
+- [ ] `run_training`: `should_stop()` sets final status `cancelled` (today it is `stopped` at `src/pdm/train.py` ~732/855). At completion: `if last_status != 'cancelled': last_status = 'completed'` — do not keep `!= 'stopped'`, which would overwrite a `cancelled` emit. Successful GRU completion still `completed`.
 - [ ] Worker **evaluate** (and any other `kind`) checks `stop.flag` **before** writing `completed`. If the flag is set, write `cancelled`.
 - [ ] Test `test_stop_flag_sets_cancelled_not_completed` in `tests/test_worker_and_app.py`: with `stop.flag` present (or `should_stop` true), worker/train status is `cancelled` and is not `completed` or `stopped`.
 - [ ] No MaleCNS bulk file is committed. No FastAPI. No `filters_full_history`. GRU tests green; ruff clean.
@@ -58,8 +58,8 @@ Builds on current `src/pdm/config.py` `model_defaults()`, `src/pdm/cli.py`, `src
 - `src/pdm/config.py` — `model_defaults()` copies reservoir keys; sets `readout` from `cfg["dataset_id"]`; does **not** inject reservoir keys into GRU training `compat` (compat wiring is 02c)
 - `src/pdm/cli.py` — `--arch` choices include the two new names; `--n-nodes` int optional; optional `--graph-mode`; do **not** add connectome to `download --dataset` choices
 - `src/pdm/app.py` — Train architecture selectbox includes the two new names; default still `gru`; do **not** add a fourth screen here
-- `src/pdm/models.py` — add `build_model()` that dispatches gru/lstm → `PDMNet`; reservoir → explicit not-yet-trained error. Do **not** convert to a package (02a)
-- `src/pdm/train.py` — `run_training` uses `build_model` for GRU/LSTM construction; `should_stop()` → emit **`cancelled`**; pass through `--n-nodes` into `mcfg["reservoir"]` without writing those keys onto GRU `compat`
+- `src/pdm/models.py` — add `build_model()` that dispatches gru/lstm → `PDMNet`; reservoir may error here too, but that is **not** the only guard. Do **not** convert to a package (02a)
+- `src/pdm/train.py` — `run_training` uses `build_model` for GRU/LSTM construction; **before optimizer construction**, raise dedicated 'reservoir not yet trainable' (02c deletes this guard); `should_stop()` → emit **`cancelled`**; pass through `--n-nodes` into `mcfg["reservoir"]` without writing those keys onto GRU `compat`
 - `src/pdm/paths.py` — `run_connectome_dir(dataset_id, run_id)`, `run_traces_dir(...)`
 - `src/pdm/__init__.py` — add `"cancelled"` to `STATUSES`
 - `src/pdm/worker.py` — `evaluate` / `replay_predict` / other kinds: if `stop.flag` exists when the job would complete, write `cancelled` not `completed`
@@ -102,6 +102,8 @@ Tests pass `n_nodes=8` or `16` explicitly. Do not special-case “smoke ⇒ 300�
 
 Keep `RecurrentEncoder` raising `architecture must be gru or lstm`. New names never enter that class. Train default architecture remains `gru` so `test_spec_invariants.py` jobs that pass `architecture="gru"` are untouched. `--n-nodes` on a GRU train is ignored for the network and **must not** appear in GRU `compat`.
 
+Put the 'reservoir not yet trainable' error in `run_training()` (before optimizer construction), not only in `build_model()`. This prevents AdamW from being created on reservoir weights before Phase B wires the training path. Phase B (02c) then deletes this guard.
+
 ### Cancel vs completed (W1)
 
 Today `run_training` sets `last_status = "stopped"` then emits it; worker `evaluate` always writes `completed` after `evaluate_run`. Change both:
@@ -109,6 +111,7 @@ Today `run_training` sets `last_status = "stopped"` then emits it; worker `evalu
 - `should_stop()` / `stop.flag` → **`cancelled`**
 - Do not write `stopped` for new interrupts
 - Do not rewrite an interrupted job as `completed`
+- At `train.py` completion: `if last_status != 'cancelled': last_status = 'completed'` — do not use `!= 'stopped'` guard which would overwrite a `cancelled` emit
 - UI chips that list statuses should treat `cancelled` (and legacy `stopped` if read from disk) as interrupt
 
 ### Leakage / isolation
@@ -148,4 +151,5 @@ Manual: Train screen still defaults to `gru`; selecting a reservoir architecture
 - NEVER download/commit MaleCNS as a merge requirement.
 - NEVER enable `filters_full_history`.
 - NEVER map `stop.flag` to `completed` or (for new writes) `stopped`.
+- Put the 'reservoir not yet trainable' error in `run_training()` (before optimizer construction), not only in `build_model()`. Phase B (02c) then deletes this guard.
 - Smoke training is not required for this subtask; any later smoke command must pass `--n-nodes 8`.
