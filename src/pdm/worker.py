@@ -118,6 +118,7 @@ def run_job(job: dict) -> None:
                 n_nodes=job.get("n_nodes"),
                 graph_mode=job.get("graph_mode"),
                 readout=job.get("readout"),
+                source_path=job.get("source_path"),
             )
         elif kind in {"evaluate", "replay_predict"}:
             from pdm.evaluate import evaluate_run

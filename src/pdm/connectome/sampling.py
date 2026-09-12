@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import networkx as nx
@@ -147,6 +148,7 @@ def prepare_run_graph(
     graph_mode: str,
     n_nodes: int,
     seed: int,
+    source_path: str | Path | None = None,
 ) -> tuple[nx.DiGraph, dict[str, Any], int]:
     """Sample a connected subgraph for training.
 
@@ -154,6 +156,7 @@ def prepare_run_graph(
     ``random_reservoir`` the graph is the **parent** (pre-rewire);
     ``RandomReservoir`` performs the degree-preserving rewiring.
     ``synthetic_fixture`` clamps; ``real_connectome`` validates range.
+    ``source_path`` is the local MaleCNS feather used only for ``real_connectome``.
     """
     from pdm.connectome.sources import load_malemcns, load_synthetic_fixture
 
@@ -166,7 +169,7 @@ def prepare_run_graph(
         parent_mode = GRAPH_MODE_SYNTHETIC
 
     if parent_mode == GRAPH_MODE_REAL:
-        src = load_malemcns()
+        src = load_malemcns(source_path)
         if src.is_synthetic:
             parent_mode = GRAPH_MODE_SYNTHETIC
     else:

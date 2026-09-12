@@ -12,7 +12,7 @@ import torch
 from pdm.config import load_dataset_config, model_defaults
 from pdm.connectome.graph import graph_from_edges, graph_from_payload
 from pdm.connectome.provenance import GRAPH_MODE_RANDOM_REWIRE, hash_graph
-from pdm.connectome.sampling import resolve_n_nodes, sample_connected_subgraph
+from pdm.connectome.sampling import prepare_run_graph, resolve_n_nodes, sample_connected_subgraph
 from pdm.connectome.sources import load_malemcns, load_synthetic_fixture
 from pdm.connectome.weights import log1p_adjacency
 from pdm.losses import weibull_nll
@@ -51,12 +51,31 @@ def test_synthetic_label_in_metadata():
     assert src.graph.number_of_nodes() >= 50
 
 
+def test_synthetic_fixture_label():
+    """Grep-able acceptance test 14: fixture is labeled synthetic, not biology."""
+    src = load_synthetic_fixture()
+    assert src.is_synthetic is True
+    assert src.label == SYNTHETIC_LABEL
+    assert src.payload.get("is_synthetic") is True
+    assert src.payload.get("label") == SYNTHETIC_LABEL
+
+
 def test_synthetic_n_nodes_clamps_not_raises():
     src = load_synthetic_fixture()
     available = src.graph.number_of_nodes()
     assert resolve_n_nodes("synthetic_fixture", 1000, available) == available
     assert resolve_n_nodes("synthetic_fixture", 8, available) == 8
     assert resolve_n_nodes("synthetic_fixture", available * 10, available) == available
+    graph, prov, resolved = prepare_run_graph(
+        architecture="fly_connectome_reservoir",
+        graph_mode="synthetic_fixture",
+        n_nodes=1000,
+        seed=0,
+    )
+    assert resolved == available
+    assert graph.number_of_nodes() == available
+    assert prov.get("graph_mode") == "synthetic_fixture"
+    assert prov.get("is_synthetic") is True
 
 
 def test_real_connectome_n_nodes_out_of_range_raises():
@@ -94,6 +113,16 @@ def test_missing_malemens_fallback_does_not_raise(tmp_path):
     assert got.provenance.get("graph_mode") == "synthetic_fixture"
     assert got.label == SYNTHETIC_LABEL
     assert got.graph.number_of_nodes() >= 50
+    graph, prov, resolved = prepare_run_graph(
+        architecture="fly_connectome_reservoir",
+        graph_mode="real_connectome",
+        n_nodes=8,
+        seed=1,
+        source_path=missing,
+    )
+    assert prov.get("graph_mode") == "synthetic_fixture"
+    assert resolved == 8
+    assert graph.number_of_nodes() == 8
 
 
 def test_yaml_reservoir_defaults_parse():
@@ -1141,9 +1170,75 @@ def test_list_runs_exposes_graph_identity(tmp_path, monkeypatch):
 
 
 def test_demo_instructions_use_n_nodes_8():
+    from pdm.paths import project_root
     from pdm.visualization.demo import get_demo_instructions
 
     text = get_demo_instructions()
     assert "--arch fly_connectome_reservoir" in text
     assert "--smoke" in text
     assert "--n-nodes 8" in text
+    readme = (project_root() / "README.md").read_text(encoding="utf-8")
+    assert "--arch fly_connectome_reservoir --smoke --n-nodes 8" in readme
+    assert "not a biological connectome" in readme
+    demo_doc = (project_root() / "docs" / "fly_connectome_demo.md").read_text(encoding="utf-8")
+    assert "--n-nodes 8" in demo_doc
+    assert "not a quality" in demo_doc.lower()
+
+
+def test_cli_train_help_has_source_path_and_n_nodes(capsys):
+    from pdm.cli import main
+
+    with pytest.raises(SystemExit) as exited:
+        main(["train", "--help"])
+    assert exited.value.code == 0
+    text = capsys.readouterr().out
+    assert "--n-nodes" in text
+    assert "--source-path" in text
+    assert "--graph-mode" in text
+
+
+def test_acceptance_test_names_present():
+    """Subtask 06 gate: numbered tests 1–14 and named extras stay grep-able."""
+    from pdm.paths import project_root
+
+    root = project_root() / "tests"
+    blob = "\n".join(
+        (root / name).read_text(encoding="utf-8")
+        for name in (
+            "test_reservoir.py",
+            "test_neural_explorer.py",
+            "test_spec_invariants.py",
+            "test_worker_and_app.py",
+        )
+    )
+    required = [
+        "test_graph_orientation",
+        "test_state_update_hand_calculation",
+        "test_n_nodes_mismatch_vs_weights_npz_raises",
+        "test_dataset_checkpoint_isolation",
+        "test_seed_reproducibility",
+        "test_split_preprocess_isolation",
+        "test_no_future_frames",
+        "test_predict_trace_parity",
+        "test_window_reset",
+        "test_edge_drive_previous_state",
+        "test_contribution_sum",
+        "test_raw_vs_display_postprocess",
+        "test_filters_censoring_not_rul_zero",
+        "test_trace_artifact_reload",
+        "test_synthetic_fixture_label",
+        "test_synthetic_n_nodes_clamps_not_raises",
+        "test_stop_flag_sets_cancelled_not_completed",
+        "test_gru_checkpoint_compat_ignores_reservoir_yaml_defaults",
+        "test_filters_ridge_raises_before_targets",
+        "test_ridge_bearings_no_double_softplus",
+        "test_load_trained_model_missing_weights_npz_raises",
+        "test_predict_and_trace_share_update_function",
+        "test_random_reservoir_parent_graph_hash",
+        "test_frozen_reservoir_weights_not_updated",
+        "test_ridge_uses_forward_states_kernel",
+        "test_ridge_no_backward",
+        "test_gru_run_does_not_show_fake_biological_activity",
+    ]
+    missing = [name for name in required if f"def {name}(" not in blob]
+    assert missing == []

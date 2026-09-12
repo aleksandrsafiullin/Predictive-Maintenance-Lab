@@ -48,3 +48,20 @@ Do not commit `data/`, `runs/`, or `.venv/`.
 
 Wang et al., IEEE Transactions on Reliability, 2020 (XJTU-SY).  
 Hagmeyer, Mauthe, Zeiler, IJPHM 2021 (HSE filters), CC BY 4.0.
+
+## Connectome Reservoir (optional)
+
+Two experimental architectures extend the lab with leaky Echo State Networks.
+The default architecture remains `gru`.
+
+**Smoke demo (synthetic graph, not biological):**
+```bash
+.venv/bin/python -m pdm train --dataset bearings --arch fly_connectome_reservoir --smoke --n-nodes 8
+```
+
+> Note: The default graph is a **synthetic test graph — not a biological connectome**.
+> For real MaleCNS data, see [docs/fly_connectome.md](docs/fly_connectome.md).
+> Smoke runs are not quality benchmarks.
+
+For full documentation, see [docs/fly_connectome_demo.md](docs/fly_connectome_demo.md).
+

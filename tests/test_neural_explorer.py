@@ -8,7 +8,7 @@ import numpy as np
 
 from pdm.connectome.provenance import SYNTHETIC_DISCLAIMER
 from pdm.paths import project_root
-from pdm.visualization.explorer import EXPLORER_DISCLAIMER, build_explorer_payload
+from pdm.visualization.explorer import EXPLORER_DISCLAIMER, RESERVOIR_REQUIRED_MESSAGE, build_explorer_payload
 
 FRONTEND = project_root() / "src" / "pdm" / "visualization" / "component" / "frontend"
 CDN_HOSTS = ("unpkg", "cdn.jsdelivr", "cdnjs", "googleapis")
@@ -116,7 +116,7 @@ def _open_explorer(at):
 
 
 def test_explorer_screen_present_in_app():
-    """Neural Activity Explorer appears in screen radio options."""
+    """Neural Activity Explorer appears in the explicit 4-way screen radio."""
     from streamlit.testing.v1 import AppTest
 
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
@@ -124,10 +124,7 @@ def test_explorer_screen_present_in_app():
     assert not at.exception
     radio = _screen_radio(at)
     opts = list(radio.options)
-    assert "Neural Activity Explorer" in opts
-    assert "Data" in opts
-    assert "Train" in opts
-    assert "Test & Replay" in opts
+    assert opts == ["Data", "Train", "Test & Replay", "Neural Activity Explorer"]
 
 
 def test_explorer_caption_present(monkeypatch, tmp_path, tiny_bearing_tables):
@@ -156,6 +153,40 @@ def test_synthetic_banner_present(monkeypatch, tmp_path, tiny_bearing_tables):
     captions = "\n".join(str(w.value) for w in at.caption)
     assert SYNTHETIC_DISCLAIMER in warnings or SYNTHETIC_DISCLAIMER in captions
     assert SYNTHETIC_DISCLAIMER in _app_text(at)
+
+
+def test_gru_run_does_not_show_fake_biological_activity(monkeypatch, tmp_path, tiny_bearing_tables):
+    """GRU/LSTM runs show the reservoir-required note, not fake fly activity."""
+    from streamlit.testing.v1 import AppTest
+
+    inline = {"n": 0}
+
+    def _no_inline(*_a, **_k):
+        inline["n"] += 1
+        raise AssertionError("GRU runs must not invent reservoir traces")
+
+    _explorer_harness(
+        monkeypatch,
+        tmp_path,
+        tiny_bearing_tables,
+        architecture="gru",
+        graph_mode="",
+        is_synthetic=False,
+    )
+    monkeypatch.setattr("pdm.visualization.trace.predict_with_trace", _no_inline)
+    monkeypatch.setattr("pdm.app.run_trace_job", _no_inline)
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.run()
+    _open_explorer(at)
+    text = _app_text(at)
+    assert EXPLORER_DISCLAIMER in text
+    assert RESERVOIR_REQUIRED_MESSAGE in text
+    btn = next(b for b in at.button if "Build trace" in b.label)
+    btn.click()
+    at.run()
+    assert not at.exception
+    assert RESERVOIR_REQUIRED_MESSAGE in _app_text(at)
+    assert inline["n"] == 0
 
 
 def test_worker_busy_shows_error_not_inline(monkeypatch, tmp_path, tiny_bearing_tables):
@@ -198,23 +229,33 @@ def test_worker_busy_shows_error_not_inline(monkeypatch, tmp_path, tiny_bearing_
 
 
 def test_no_cdn_in_frontend():
-    """No https:// script/module src in frontend HTML/JS."""
+    """No https:// script/module src in frontend HTML/JS, including the component bridge."""
     html_files = list(FRONTEND.rglob("*.html"))
-    js_files = [p for p in FRONTEND.rglob("*.js") if "vendor" not in p.parts]
+    js_files = list(FRONTEND.rglob("*.js"))
     assert html_files
     assert js_files
+    vendor_bridge = FRONTEND / "vendor" / "streamlit-component-lib.js"
+    assert vendor_bridge.is_file()
     for path in html_files + js_files:
         text = path.read_text(encoding="utf-8")
         for host in CDN_HOSTS:
             assert host not in text, f"{path} contains CDN host {host}"
-        assert SCRIPT_HTTPS_SRC.search(text) is None, f"{path} has https script src"
-        assert MODULE_HTTPS.search(text) is None, f"{path} has https module import"
-        assert 'src="https://' not in text
-        assert "src='https://" not in text
-        assert "src=`https://" not in text
+        if "vendor" not in path.parts:
+            assert SCRIPT_HTTPS_SRC.search(text) is None, f"{path} has https script src"
+            assert MODULE_HTTPS.search(text) is None, f"{path} has https module import"
+            assert 'src="https://' not in text
+            assert "src='https://" not in text
+            assert "src=`https://" not in text
+        else:
+            assert SCRIPT_HTTPS_SRC.search(text) is None, f"{path} has https script src"
+            assert 'src="https://' not in text
+            assert "src='https://" not in text
     main_js = (FRONTEND / "main.js").read_text(encoding="utf-8")
     assert "Math.random" not in main_js
     assert "requestAnimationFrame" in main_js
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    assert "./vendor/three.min.js" in html
+    assert "./vendor/streamlit-component-lib.js" in html
 
 
 def test_component_payload_has_states(tiny_bearing_tables):

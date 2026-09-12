@@ -477,6 +477,7 @@ def run_training(
     n_nodes: int | None = None,
     graph_mode: str | None = None,
     readout: str | None = None,
+    source_path: str | None = None,
 ) -> dict[str, Any]:
     def _log(msg: str) -> None:
         if log:
@@ -496,6 +497,8 @@ def run_training(
         reservoir["graph_mode"] = str(graph_mode)
     if readout is not None:
         reservoir["readout"] = str(readout).strip().lower()
+    if source_path is not None:
+        reservoir["source_path"] = str(source_path)
     if reservoir:
         mcfg["reservoir"] = reservoir
     _assert_filters_ridge_forbidden(dataset_id, (mcfg.get("reservoir") or {}).get("readout"))
@@ -1205,6 +1208,7 @@ def _build_reservoir_model(mcfg: dict, *, input_size: int, head: str, time_scale
         graph_mode=graph_mode,
         n_nodes=requested,
         seed=seed,
+        source_path=res.get("source_path"),
     )
     model = build_model(
         architecture=mcfg["architecture"],

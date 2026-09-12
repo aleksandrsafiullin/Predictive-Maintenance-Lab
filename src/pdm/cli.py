@@ -20,6 +20,7 @@ def _python() -> str:
 def doctor() -> dict:
     import platform
 
+    import networkx
     import numpy
     import pandas
     import plotly
@@ -30,6 +31,7 @@ def doctor() -> dict:
     import torch
     import yaml
 
+    from pdm.connectome.sources import default_malemcns_path
     from pdm.models import PDMNet
 
     info = resolve_device("auto")
@@ -69,6 +71,8 @@ def doctor() -> dict:
         "pyarrow": pyarrow.__version__,
         "pyyaml": yaml.__version__,
         "pytest": pytest.__version__,
+        "networkx": networkx.__version__,
+        "malemcns_present": default_malemcns_path().is_file(),
         "device": info.name,
         "device_fallback": info.fallback_reason,
         "forward_backward_ok": fwd_ok and grad_ok,
@@ -137,6 +141,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=["synthetic_fixture", "real_connectome", "random_rewire"],
     )
     p_tr.add_argument("--readout", default=None, choices=["ridge", "gradient"])
+    p_tr.add_argument(
+        "--source-path",
+        default=None,
+        help="Local MaleCNS feather for --graph-mode real_connectome. Not required in CI.",
+    )
 
     p_ev = sub.add_parser("evaluate")
     p_ev.add_argument("--dataset", required=True, choices=["bearings", "filters"])
@@ -232,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
             n_nodes=args.n_nodes,
             graph_mode=args.graph_mode,
             readout=args.readout,
+            source_path=args.source_path,
         )
         print(json.dumps(rec, indent=2, default=str))
         return 0
