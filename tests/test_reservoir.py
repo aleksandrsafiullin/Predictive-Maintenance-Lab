@@ -248,7 +248,8 @@ def test_ridge_bearings_no_double_softplus():
     z = np.concatenate([x_t, u_t, np.ones((x_t.shape[0], 1), dtype=np.float64)], axis=1)
     rng = np.random.default_rng(0)
     w_true = rng.normal(scale=0.05, size=z.shape[1])
-    y_norm = np.abs(z @ w_true) + 0.1
+    # y_norm = z @ w_true is exactly in the column space; ridge with tiny alpha should recover w_true closely
+    y_norm = z @ w_true + 0.5  # positive offset so relu doesn't mask all output
     w, residual_mean_sq = fit_ridge(z, y_norm, alpha=1e-8)
     assert residual_mean_sq < 1e-3
     model.readout.load_ridge_vector(w)
