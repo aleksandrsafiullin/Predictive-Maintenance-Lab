@@ -115,6 +115,8 @@ def _status_chip() -> dict:
     alive = worker_alive()
     st.sidebar.write("Worker:", "running" if alive else "idle")
     st.sidebar.json({k: st_.get(k) for k in ("status", "dataset_id", "run_id", "epoch", "message", "error") if k in st_ or st_.get(k)})
+    if st_.get("status") in {"cancelled", "stopped"}:
+        st.sidebar.caption(f"Job interrupted ({st_.get('status')})")
     return st_
 
 
@@ -456,7 +458,11 @@ def screen_train(dataset_id: str) -> None:
     if int(st.session_state.get(cap_key) or 0) != next_cap:
         st.session_state[cap_key] = next_cap
     st.session_state[prev_key] = smoke
-    arch = st.selectbox("Architecture", ["gru", "lstm"], index=0)
+    arch = st.selectbox(
+        "Architecture",
+        ["gru", "lstm", "fly_connectome_reservoir", "random_reservoir"],
+        index=0,
+    )
     epochs = st.number_input("Epochs", min_value=1, max_value=200, value=int(mcfg["max_epochs"]))
     hist = st.number_input(
         "History length (measurements)", min_value=2, max_value=128, value=int(mcfg["history_length"])
@@ -520,6 +526,8 @@ def screen_train(dataset_id: str) -> None:
         _auto_refresh()
     if ws.get("status") == "failed":
         st.error(ws.get("error"))
+    if ws.get("status") in {"cancelled", "stopped"}:
+        st.info(f"Job interrupted ({ws.get('status')})")
     st.subheader("Experiments")
     table = list_runs(dataset_id)
     if not table:

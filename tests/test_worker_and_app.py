@@ -1502,3 +1502,20 @@ def test_app_replay_research_evaluate_job_is_test_research(
     assert not (rdir / "alert_policy.json").exists()
     unit_box = next(s for s in at.selectbox if s.label == "Unit")
     assert split["validation"][0] not in list(unit_box.options)
+
+
+def test_stop_flag_sets_cancelled_not_completed(monkeypatch, tmp_path):
+    from pdm.worker import read_status, run_job, stop_path
+
+    def fake_eval(dataset_id, run_id, **kwargs):
+        stop_path().write_text("stop\n", encoding="utf-8")
+        return {"eval_id": "e1", "eval_dir": str(tmp_path / "e1")}
+
+    wdir = tmp_path / "worker"
+    wdir.mkdir()
+    monkeypatch.setattr("pdm.worker.worker_dir", lambda: wdir)
+    monkeypatch.setattr("pdm.evaluate.evaluate_run", fake_eval)
+    run_job({"kind": "evaluate", "dataset_id": "bearings", "run_id": "r1"})
+    status = read_status()["status"]
+    assert status == "cancelled"
+    assert status not in {"completed", "stopped"}

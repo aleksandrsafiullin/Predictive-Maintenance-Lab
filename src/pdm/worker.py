@@ -115,6 +115,8 @@ def run_job(job: dict) -> None:
                 should_stop=stopped,
                 status_cb=status_cb,
                 max_windows_per_unit=mw,
+                n_nodes=job.get("n_nodes"),
+                graph_mode=job.get("graph_mode"),
             )
         elif kind in {"evaluate", "replay_predict"}:
             from pdm.evaluate import evaluate_run
@@ -142,9 +144,10 @@ def run_job(job: dict) -> None:
                 if key in job:
                     eval_kwargs[key] = job[key]
             metrics = evaluate_run(job["dataset_id"], job["run_id"], **eval_kwargs)
+            final = "cancelled" if stop_path().exists() else "completed"
             write_status(
                 {
-                    "status": "completed",
+                    "status": final,
                     "kind": kind,
                     "dataset_id": job["dataset_id"],
                     "run_id": job["run_id"],

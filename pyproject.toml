@@ -16,6 +16,9 @@ pdm-lab = "pdm.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"pdm.connectome.fixtures" = ["*.json", "*.csv"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

@@ -12,6 +12,7 @@ STATUSES = (
     "ready",
     "training",
     "completed",
-    "stopped",
+    "cancelled",
+    "stopped",  # legacy status.json files only; new interrupts write cancelled
     "failed",
 )

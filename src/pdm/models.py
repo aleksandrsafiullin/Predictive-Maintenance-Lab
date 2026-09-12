@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from pdm.architectures import is_reservoir
 from pdm.losses import weibull_median_rul
 
 
@@ -101,3 +102,28 @@ class PDMNet(nn.Module):
             return norm * self.time_scale_s
         lam, k = self.forward(x)
         return weibull_median_rul(lam, k, self.time_scale_s)
+
+
+def build_model(
+    *,
+    architecture: str,
+    input_size: int,
+    hidden_size: int = 64,
+    num_layers: int = 1,
+    head: str = "rul",
+    dropout: float = 0.1,
+    time_scale_s: float = 1.0,
+) -> PDMNet:
+    """Construct a GRU/LSTM ``PDMNet``. Reservoir architectures are not trainable yet."""
+    arch = str(architecture or "").strip().lower()
+    if is_reservoir(arch):
+        raise NotImplementedError("Reservoir training not yet implemented. Use gru or lstm.")
+    return PDMNet(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        architecture=arch,
+        head=head,
+        dropout=dropout,
+        time_scale_s=time_scale_s,
+    )

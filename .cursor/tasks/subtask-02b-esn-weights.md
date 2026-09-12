@@ -28,9 +28,11 @@ Reservoir `forward()` **must** match those shapes **before** 02c reuses `_run_ep
 - [ ] Weight policy: `A[i,j] = log1p(synapse_count j→i)`, then scale so spectral radius equals `spectral_radius` (default 0.9). Empty/zero graphs fail loudly.
 
 - [ ] `forward()` contracts (test both; these names should exist in `tests/test_reservoir.py`):
-  - bearings / `head=rul`: 1D `[B]` **non-negative normalized RUL** (same as `RULHead`: Softplus of linear raw, squeezed).
+  - bearings / `head=rul`: 1D `[B]` **non-negative normalized RUL**. For ridge, `forward()` is `relu(W_out @ state + b_out)` with **no extra Softplus** (diverges from `RULHead`; see Ridge vs Softplus below). Filters unchanged.
   - filters / `head=weibull`: **tuple** `(lam, k)` after Softplus (same as `WeibullHead`).
   - Tests: `test_forward_bearings_returns_1d_nonneg_norm_rul`, `test_forward_filters_returns_lam_k_tuple`.
+
+- [ ] Ridge vs Softplus (bearings only). Ridge readout for bearings: targets are `y_norm = target_rul_s / time_scale_s` (same space as Smooth L1). `forward()` returns `relu(W_out @ state + b_out)` (no extra Softplus). This makes the ridge solution exact. Document clearly in code comment that this diverges from RULHead's Softplus. Add test `test_ridge_bearings_no_double_softplus`: confirm `forward(x)` is non-negative and ridge residual is zero on training states to within 1e-3.
 
 - [ ] Linear readout **raw** (used later by contributions): `raw = W_x @ x[T] + W_u @ u[T] + b`. Direct input term required. Identity tests in 03 use this raw **before** Softplus / Weibull median / `time_scale_s`.
 
@@ -42,7 +44,7 @@ Reservoir `forward()` **must** match those shapes **before** 02c reuses `_run_ep
 
 - [ ] `build_model()` **may** construct reservoir modules for unit tests, but `run_training` still raises the 01 dedicated error until 02c (so no accidental AdamW-on-everything train). If `build_model` starts returning reservoirs, document that train is still blocked.
 
-- [ ] Tests in `tests/test_reservoir.py`: `test_graph_orientation`, `test_state_update_hand_calculation`, `test_seed_reproducibility`, `test_random_reservoir_parent_graph_hash`, the two `forward()` contract tests, plus 01 clamp/label tests still pass. GRU suite still green. Ruff clean.
+- [ ] Tests in `tests/test_reservoir.py`: `test_graph_orientation`, `test_state_update_hand_calculation`, `test_seed_reproducibility`, `test_random_reservoir_parent_graph_hash`, the two `forward()` contract tests, `test_ridge_bearings_no_double_softplus`, plus 01 clamp/label tests still pass. GRU suite still green. Ruff clean.
 
 ## Key Files to Create/Modify
 
@@ -83,13 +85,17 @@ Contribution identity (03) uses **pre-display raw** `W_x @ x + W_u @ u + b` **be
 So this subtask must expose both:
 
 1. `raw` affine output (vector length 1 for bearings, 2 for filters)
-2. `forward()` after the same non-negative maps as today’s heads (`softplus` / `WeibullHead`)
+2. `forward()` after a non-negative map: bearings **ridge** uses `relu` (no extra Softplus; see below); filters use Softplus like `WeibullHead`
 
 Do not implement contribution tests here beyond making `raw` accessible (e.g. `forward_raw`). Do not `nan_to_num` targets (no training loop yet).
 
 ### Random rewiring (W8)
 
 Directed Maslov–Sneppen / degree-preserving swaps with a seeded RNG. Preserve in- and out-degree sequences as far as the algorithm guarantees; document if self-loops/parallels are forbidden. Rebuild `log1p` + spectral scale on the rewired edges — do not copy `W_res` from the fly graph. Always store `parent_graph_hash` and `graph_mode=random_rewire`. If the parent was synthetic, **both** disclaimers apply.
+
+### Ridge vs Softplus (bearings only)
+
+Ridge readout for bearings: targets are `y_norm = target_rul_s / time_scale_s` (same space as Smooth L1). `forward()` returns `relu(W_out @ state + b_out)` (no extra Softplus). This makes the ridge solution exact. Document clearly in code comment that this diverges from RULHead's Softplus. Add test `test_ridge_bearings_no_double_softplus`: confirm `forward(x)` is non-negative and ridge residual is zero on training states to within 1e-3.
 
 ### Isolation (partial; train isolation is 02c)
 
@@ -124,3 +130,4 @@ Do **not** run `pdm train --arch fly_connectome_reservoir` as a quality gate her
 - `random_reservoir` always records `parent_graph_hash` + `graph_mode=random_rewire`.
 - Do not wire ridge into filters; do not call `run_training` for reservoirs yet.
 - One tanh kernel only — 03 will bind `predict_with_trace` to this same function object.
+- Ridge vs Softplus (bearings only): `forward()` is `relu(W_out @ state + b_out)` with no extra Softplus; test `test_ridge_bearings_no_double_softplus`.

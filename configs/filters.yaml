@@ -57,6 +57,15 @@ model:
   num_workers: 0
   smoke_max_epochs: 5
   smoke_max_windows_per_unit: 32
+  reservoir:
+    n_nodes: 1000
+    leak: 0.2
+    spectral_radius: 0.9
+    input_scale: 0.1
+    ridge_alpha: 0.001
+    seed: 42
+    state_mode: window_reset
+    graph_mode: synthetic_fixture
 
 alerts:
   confirmation_count: 3
