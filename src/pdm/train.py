@@ -1235,7 +1235,7 @@ def _write_connectome_artifacts(rdir: Path, model) -> None:
     graph = getattr(model, "graph", None)
     provenance = dict(getattr(model, "provenance", {}) or {})
     if graph is not None:
-        payload = graph_to_payload(graph)
+        payload = graph_to_payload(graph, node_order=list(getattr(model, "node_order", []) or []))
         write_graph_artifact(cdir, payload, provenance)
         try:
             positions = layout_positions(graph, seed=int(getattr(model, "seed", 42)))
@@ -1255,6 +1255,23 @@ def _write_connectome_artifacts(rdir: Path, model) -> None:
     )
 
 
+def _saved_node_order(run_path: Path, graph_payload: dict | None) -> list[str] | None:
+    """W_res row labels stored with the run. Never NetworkX insertion order alone."""
+    from pdm.io_util import read_json
+
+    payload = graph_payload or {}
+    order = payload.get("node_order")
+    if order:
+        return [str(n) for n in order]
+    layout_path = Path(run_path) / "connectome" / "layout.json"
+    if layout_path.exists():
+        rec = read_json(layout_path)
+        order = rec.get("node_order")
+        if order:
+            return [str(n) for n in order]
+    return None
+
+
 def _load_reservoir_from_artifacts(run_path: Path, blob: dict, meta: dict, device):
     from pdm.connectome.graph import graph_from_payload
     from pdm.connectome.weights import load_reservoir_weights
@@ -1271,9 +1288,11 @@ def _load_reservoir_from_artifacts(run_path: Path, blob: dict, meta: dict, devic
             f"n_nodes mismatch: checkpoint has {int(meta_n)}, weights.npz has {n_w}"
         )
     graph = None
+    graph_payload: dict = {}
     graph_path = Path(run_path) / "connectome" / "graph.json"
     if graph_path.exists():
-        graph = graph_from_payload(read_json(graph_path))
+        graph_payload = read_json(graph_path)
+        graph = graph_from_payload(graph_payload)
         n_graph = int(graph.number_of_nodes())
         if n_graph != n_w:
             raise ValueError(
@@ -1283,6 +1302,7 @@ def _load_reservoir_from_artifacts(run_path: Path, blob: dict, meta: dict, devic
     prov_path = Path(run_path) / "connectome" / "provenance.json"
     if prov_path.exists():
         provenance = read_json(prov_path)
+    node_order = _saved_node_order(run_path, graph_payload)
     model = build_model(
         architecture=meta["architecture"],
         input_size=int(arrays["W_in"].shape[1]),
@@ -1296,6 +1316,7 @@ def _load_reservoir_from_artifacts(run_path: Path, blob: dict, meta: dict, devic
         seed=int(meta.get("seed", 42)),
         state_mode=str(meta.get("state_mode", "window_reset")),
         provenance=provenance,
+        node_order=node_order,
         frozen_weights=(arrays["W_in"], arrays["W_res"], arrays["b_res"]),
     )
     readout_sd = {

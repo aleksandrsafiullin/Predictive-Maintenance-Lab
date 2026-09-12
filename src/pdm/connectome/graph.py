@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import networkx as nx
@@ -34,16 +34,34 @@ def graph_from_edges(
 
 
 def graph_from_payload(payload: Mapping[str, Any]) -> nx.DiGraph:
-    return graph_from_edges(payload.get("edges") or [], payload.get("nodes"))
+    """Rebuild a graph. Prefer stored ``node_order`` (W_res row indices) over insertion order."""
+    nodes = payload.get("node_order") or payload.get("nodes")
+    return graph_from_edges(payload.get("edges") or [], nodes)
 
 
-def graph_to_payload(graph: nx.DiGraph) -> dict[str, Any]:
-    nodes = [as_node_id(n) for n in graph.nodes()]
+def graph_to_payload(
+    graph: nx.DiGraph,
+    node_order: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Serialize graph. ``node_order`` is the W_res row index list when provided."""
+    if node_order is not None:
+        nodes = [as_node_id(n) for n in node_order]
+        seen = set(nodes)
+        for n in graph.nodes():
+            nid = as_node_id(n)
+            if nid not in seen:
+                nodes.append(nid)
+                seen.add(nid)
+    else:
+        nodes = [as_node_id(n) for n in graph.nodes()]
     edges = []
     for src, dst, data in graph.edges(data=True):
         weight = data.get("synapse_count", data.get("weight", 1.0))
         edges.append({"src": as_node_id(src), "dst": as_node_id(dst), "weight": float(weight)})
-    return {"nodes": nodes, "edges": edges}
+    payload: dict[str, Any] = {"nodes": nodes, "edges": edges}
+    if node_order is not None:
+        payload["node_order"] = [as_node_id(n) for n in node_order]
+    return payload
 
 
 def node_ids(graph: nx.DiGraph) -> list[str]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 import torch
 
 from pdm.config import load_dataset_config, model_defaults
-from pdm.connectome.graph import graph_from_edges
+from pdm.connectome.graph import graph_from_edges, graph_from_payload
 from pdm.connectome.provenance import GRAPH_MODE_RANDOM_REWIRE, hash_graph
 from pdm.connectome.sampling import resolve_n_nodes, sample_connected_subgraph
 from pdm.connectome.sources import load_malemcns, load_synthetic_fixture
@@ -19,7 +20,11 @@ from pdm.models import FlyConnectomeReservoir, LeakyESN, RandomReservoir
 from pdm.models.readout import fit_ridge
 from pdm.paths import configs_root
 from pdm.predict import Predictor
+from pdm.preprocessing import Preprocessor
 from pdm.train import UnitWindowDataset, checkpoints_compatible, load_trained_model, run_training
+from pdm.visualization.export import load_trace, save_trace
+from pdm.visualization.trace import predict_with_trace
+from pdm.windows import BEARINGS_RAW_NUMERIC_COLUMNS
 
 SYNTHETIC_LABEL = "Synthetic test graph — not a biological connectome"
 
@@ -601,3 +606,343 @@ def test_predictor_works_with_reservoir(tmp_path, monkeypatch, tiny_bearing_tabl
     if out["status"] == "ok":
         assert out["predicted_rul_s"] is not None
         assert out["predicted_rul_s"] >= 0
+
+
+def _bearings_prep(feature_names=None, time_scale_s: float = 1.0) -> Preprocessor:
+    names = list(feature_names or BEARINGS_RAW_NUMERIC_COLUMNS)
+    return Preprocessor(
+        feature_names=names,
+        log1p_features=[],
+        scaler_mean=[0.0] * len(names),
+        scaler_scale=[1.0] * len(names),
+        time_scale_s=float(time_scale_s),
+        fill_values={name: 0.0 for name in names},
+        dataset_id="bearings",
+    )
+
+
+def _unit_history(features: pd.DataFrame, n: int, unit_id: str | None = None) -> tuple[pd.DataFrame, str]:
+    uid = str(unit_id or features["unit_id"].iloc[0])
+    hist = features[features["unit_id"] == uid].sort_values("timestamp_s").iloc[: int(n)].copy()
+    hist.attrs["raw_features"] = True
+    return hist, uid
+
+
+def _tiny_fly(prep: Preprocessor, *, n_nodes: int = 8, head: str = "rul", seed: int = 0, leak: float = 0.2, **kwargs):
+    graph = _cycle_graph(n_nodes)
+    return FlyConnectomeReservoir(
+        graph,
+        input_size=len(prep.feature_names),
+        head=head,
+        seed=seed,
+        leak=leak,
+        time_scale_s=float(prep.time_scale_s),
+        n_nodes=n_nodes,
+        **kwargs,
+    )
+
+
+def test_graph_json_stores_node_order(tmp_path):
+    from pdm.io_util import read_json
+    from pdm.train import _saved_node_order, _write_connectome_artifacts
+
+    order = ["c", "a", "b"]
+    edges = [
+        {"src": "c", "dst": "a", "weight": 2.0},
+        {"src": "a", "dst": "b", "weight": 1.0},
+        {"src": "b", "dst": "c", "weight": 1.0},
+    ]
+    graph = graph_from_edges(edges, order)
+    model = FlyConnectomeReservoir(graph, input_size=2, seed=0, node_order=order)
+    _write_connectome_artifacts(tmp_path, model)
+    payload = read_json(tmp_path / "connectome" / "graph.json")
+    assert payload["node_order"] == order
+    assert payload["nodes"][:3] == order
+    assert _saved_node_order(tmp_path, payload) == order
+    restored = FlyConnectomeReservoir(
+        graph_from_payload(payload),
+        input_size=2,
+        frozen_weights=(
+            model.W_in.detach().cpu().numpy(),
+            model.W_res.detach().cpu().numpy(),
+            model.b_res.detach().cpu().numpy(),
+        ),
+        node_order=_saved_node_order(tmp_path, payload),
+        n_nodes=3,
+        provenance=model.provenance,
+    )
+    assert restored.node_order == order
+    np.testing.assert_allclose(
+        restored.W_res.detach().cpu().numpy(),
+        model.W_res.detach().cpu().numpy(),
+    )
+
+
+def test_predict_trace_parity(tiny_bearing_tables):
+    features, _units = tiny_bearing_tables
+    prep = _bearings_prep(time_scale_s=4.0)
+    model = _tiny_fly(prep, seed=1)
+    hist, uid = _unit_history(features, 5)
+    trace = predict_with_trace(hist, uid, model, prep, history_length=5)
+    assert trace["status"] == "predicted"
+    x = torch.from_numpy(np.ascontiguousarray(trace["inputs"])).unsqueeze(0)
+    with torch.no_grad():
+        pred = model.predicted_rul_s(x)
+        states = model.forward_states(x)
+        raw = model.forward_raw(states[:, -1, :], x[:, -1, :])
+    np.testing.assert_allclose(
+        float(trace["predicted_rul_s"]),
+        float(pred.detach().cpu().reshape(-1)[0]),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(trace["raw_prediction"]).reshape(-1),
+        raw.detach().cpu().numpy().reshape(-1),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    live = Predictor(model, prep, history_length=5).predict_from_history(hist)
+    np.testing.assert_allclose(
+        float(trace["predicted_rul_s"]),
+        float(live["predicted_rul_s"]),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_predict_and_trace_share_update_function(tiny_bearing_tables, monkeypatch):
+    from pdm.models.reservoir import forward_states
+    from pdm.visualization import trace as trace_mod
+
+    assert trace_mod.leaky_forward_states is forward_states
+    source = Path(trace_mod.__file__).read_text(encoding="utf-8")
+    assert "tanh" not in source
+    assert "forward_states" in inspect.getsource(trace_mod.predict_with_trace)
+    features, _units = tiny_bearing_tables
+    prep = _bearings_prep()
+    model = _tiny_fly(prep, seed=2)
+    hist, uid = _unit_history(features, 5)
+    calls = {"n": 0}
+    orig = LeakyESN.forward_states
+
+    def _wrapped(self, *args, **kwargs):
+        calls["n"] += 1
+        return orig(self, *args, **kwargs)
+
+    monkeypatch.setattr(LeakyESN, "forward_states", _wrapped)
+    trace = predict_with_trace(hist, uid, model, prep, history_length=5)
+    assert calls["n"] >= 1
+    x = torch.from_numpy(np.ascontiguousarray(trace["inputs"])).unsqueeze(0)
+    with torch.no_grad():
+        states = orig(model, x)
+    np.testing.assert_array_equal(
+        trace["states"],
+        states.squeeze(0).detach().cpu().numpy().astype(np.float32),
+    )
+
+
+def test_no_future_frames(tiny_bearing_tables):
+    features, _units = tiny_bearing_tables
+    prep = _bearings_prep()
+    model = _tiny_fly(prep, seed=3)
+    hist, uid = _unit_history(features, 8)
+    prefix = hist.iloc[:5].copy()
+    prefix.attrs["raw_features"] = True
+    p1 = predict_with_trace(prefix, uid, model, prep, history_length=5)
+    mutated = hist.copy()
+    mutated.loc[mutated.index[5:], "horizontal_rms"] = 9999.0
+    still_prefix = mutated.iloc[:5].copy()
+    still_prefix.attrs["raw_features"] = True
+    p2 = predict_with_trace(still_prefix, uid, model, prep, history_length=5)
+    np.testing.assert_allclose(p1["states"], p2["states"], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(p1["contributions"]["raw"], p2["contributions"]["raw"], atol=1e-6)
+    np.testing.assert_allclose(p1["predicted_rul_s"], p2["predicted_rul_s"], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(p1["raw_prediction"], p2["raw_prediction"], atol=1e-6)
+
+
+def test_window_reset(tiny_bearing_tables):
+    features, _units = tiny_bearing_tables
+    prep = _bearings_prep()
+    model = _tiny_fly(prep, seed=4, leak=1.0)
+    hist, uid = _unit_history(features, 8)
+    w1 = hist.iloc[:4].copy()
+    w1.attrs["raw_features"] = True
+    both = hist.iloc[:8].copy()
+    both.attrs["raw_features"] = True
+    t1 = predict_with_trace(w1, uid, model, prep, history_length=4)
+    t2 = predict_with_trace(both, uid, model, prep, history_length=4)
+    cont = predict_with_trace(both, uid, model, prep, history_length=8)
+    x0 = torch.from_numpy(np.ascontiguousarray(t2["inputs"][:1])).unsqueeze(0)
+    with torch.no_grad():
+        from_zeros = model.forward_states(x0).squeeze(0)[0].detach().cpu().numpy()
+    np.testing.assert_allclose(t2["states"][0], from_zeros, rtol=1e-5, atol=1e-5)
+    assert not np.allclose(t2["states"][0], cont["states"][4], atol=1e-4)
+    assert not np.allclose(t2["states"][0], t1["states"][-1], atol=1e-4)
+
+
+def test_edge_drive_previous_state(tiny_bearing_tables):
+    features, _units = tiny_bearing_tables
+    prep = _bearings_prep(feature_names=["horizontal_rms"])
+    graph = graph_from_edges([{"src": "src", "dst": "dst", "weight": 4.0}], nodes=["src", "dst"])
+    model = FlyConnectomeReservoir(
+        graph,
+        input_size=1,
+        seed=0,
+        node_order=["src", "dst"],
+        leak=1.0,
+        time_scale_s=1.0,
+    )
+    with torch.no_grad():
+        model.W_in.zero_()
+        model.W_in[0, 0] = 1.0
+        model.b_res.zero_()
+    hist, uid = _unit_history(features, 2)
+    hist = hist.copy()
+    hist["horizontal_rms"] = [1.0, 0.0]
+    hist.attrs["raw_features"] = True
+    trace = predict_with_trace(hist, uid, model, prep, history_length=2)
+    src_i = model.node_order.index("src")
+    dst_i = model.node_order.index("dst")
+    w = float(model.W_res[dst_i, src_i])
+    assert w != 0.0
+    assert abs(float(trace["inputs"][1, 0])) < 1e-8
+    assert abs(float(trace["states"][0, dst_i])) < 1e-5
+    expected = float(np.tanh(w * float(trace["states"][0, src_i])))
+    np.testing.assert_allclose(float(trace["states"][1, dst_i]), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_contribution_sum(tiny_bearing_tables):
+    features, _units = tiny_bearing_tables
+    prep = _bearings_prep()
+    hist, uid = _unit_history(features, 5)
+    for head in ("rul", "weibull"):
+        model = _tiny_fly(prep, head=head, seed=5)
+        trace = predict_with_trace(hist, uid, model, prep, history_length=5)
+        contrib = trace["contributions"]
+        recon = (
+            contrib["intercept"][None, :]
+            + contrib["input"].sum(axis=1)
+            + contrib["neuron"].sum(axis=1)
+        )
+        np.testing.assert_allclose(recon, contrib["raw"], atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(
+            recon[-1],
+            np.asarray(trace["raw_prediction"]).reshape(-1),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+def test_raw_vs_display_postprocess(tiny_bearing_tables):
+    features, _units = tiny_bearing_tables
+    prep = _bearings_prep(time_scale_s=1.0)
+    model = _tiny_fly(prep, seed=6)
+    with torch.no_grad():
+        model.readout.W_x.zero_()
+        model.readout.W_u.zero_()
+        model.readout.b.fill_(1.5)
+    hist, uid = _unit_history(features, 5)
+    model.time_scale_s = 2.0
+    t1 = predict_with_trace(hist, uid, model, prep, history_length=5)
+    raw = float(np.asarray(t1["raw_prediction"]).reshape(-1)[0])
+    np.testing.assert_allclose(t1["predicted_rul_s"], max(0.0, raw) * 2.0, rtol=1e-5, atol=1e-5)
+    contrib = t1["contributions"]
+    recon = contrib["intercept"] + contrib["input"][-1].sum(axis=0) + contrib["neuron"][-1].sum(axis=0)
+    np.testing.assert_allclose(recon.reshape(-1), t1["raw_prediction"].reshape(-1), atol=1e-5)
+    model.time_scale_s = 8.0
+    t2 = predict_with_trace(hist, uid, model, prep, history_length=5)
+    np.testing.assert_allclose(t2["raw_prediction"], t1["raw_prediction"], atol=1e-6)
+    np.testing.assert_allclose(t2["predicted_rul_s"], max(0.0, raw) * 8.0, rtol=1e-5, atol=1e-5)
+    assert t2["predicted_rul_s"] != t1["predicted_rul_s"]
+
+
+def test_trace_artifact_reload(tiny_bearing_tables, tmp_path):
+    features, _units = tiny_bearing_tables
+    prep = _bearings_prep(time_scale_s=3.0)
+    model = _tiny_fly(prep, seed=7)
+    hist, uid = _unit_history(features, 5)
+    trace = predict_with_trace(hist, uid, model, prep, history_length=5)
+    dest = tmp_path / "runs" / "bearings" / "run1" / "traces" / uid
+    save_trace(
+        dest,
+        unit_id=uid,
+        run_id="run1",
+        dataset_id="bearings",
+        architecture=model.architecture,
+        graph_hash=model.graph_hash,
+        n_nodes=model.n_nodes,
+        history_length=5,
+        graph_mode=model.graph_mode,
+        is_synthetic=bool(model.is_synthetic),
+        states=trace["states"],
+        inputs=trace["inputs"],
+        contributions=trace["contributions"],
+        frame_map=trace["frame_map"],
+        node_order=trace["node_order"],
+        predicted_rul_s=trace["predicted_rul_s"],
+        raw_prediction=trace["raw_prediction"],
+        status=trace["status"],
+        time_scale_s=model.time_scale_s,
+        head=model.head_type,
+    )
+    loaded = load_trace(dest)
+    np.testing.assert_allclose(loaded["states"], trace["states"], atol=1e-6)
+    np.testing.assert_allclose(loaded["inputs"], trace["inputs"], atol=1e-6)
+    np.testing.assert_allclose(loaded["contributions"]["raw"], trace["contributions"]["raw"], atol=1e-6)
+    np.testing.assert_allclose(loaded["contributions"]["neuron"], trace["contributions"]["neuron"], atol=1e-6)
+    np.testing.assert_allclose(loaded["raw_prediction"], trace["raw_prediction"], atol=1e-6)
+    live = Predictor(model, prep, history_length=5).predict_from_history(hist)
+    np.testing.assert_allclose(
+        float(loaded["predicted_rul_s"]),
+        float(live["predicted_rul_s"]),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    meta = json.loads((dest / "meta.json").read_text(encoding="utf-8"))
+    assert meta["is_synthetic"] is True
+    assert meta["n_nodes"] == 8
+
+
+def test_predict_with_trace_gru_note(tiny_bearing_tables):
+    from pdm.models import PDMNet
+
+    features, _units = tiny_bearing_tables
+    prep = _bearings_prep()
+    hist, uid = _unit_history(features, 5)
+    gru = PDMNet(len(prep.feature_names), hidden_size=8, architecture="gru", head="rul", time_scale_s=1.0)
+    out = predict_with_trace(hist, uid, gru, prep, history_length=5)
+    assert out["status"] == "traces require reservoir model"
+    pred = Predictor(gru, prep, history_length=5).predict_from_history(hist, with_trace=True)
+    assert pred.get("trace_note") == "traces require reservoir model"
+    assert pred["status"] in {"ok", "Collecting history", "No valid prediction"}
+    assert "states" not in pred or pred["status"] != "predicted"
+
+
+def test_lazy_skips_per_neuron(tiny_bearing_tables):
+    features, _units = tiny_bearing_tables
+    prep = _bearings_prep()
+    model = _tiny_fly(prep, seed=8)
+    hist, uid = _unit_history(features, 5)
+    full = predict_with_trace(hist, uid, model, prep, history_length=5, lazy=False)
+    lazy = predict_with_trace(hist, uid, model, prep, history_length=5, lazy=True)
+    assert full["contributions"]["neuron"].shape[1] == model.n_nodes
+    assert lazy["contributions"]["neuron"].shape[1] == 0
+    np.testing.assert_allclose(full["predicted_rul_s"], lazy["predicted_rul_s"], rtol=1e-6, atol=1e-6)
+
+
+def test_trace_job_stop_flag_sets_cancelled(monkeypatch, tmp_path):
+    from pdm.worker import read_status, run_job, stop_path
+
+    def fake_trace(*_a, **_k):
+        stop_path().write_text("stop\n", encoding="utf-8")
+        return {"status": "cancelled"}
+
+    wdir = tmp_path / "worker"
+    wdir.mkdir()
+    monkeypatch.setattr("pdm.worker.worker_dir", lambda: wdir)
+    monkeypatch.setattr("pdm.visualization.trace.run_trace_job", fake_trace)
+    run_job({"kind": "trace", "dataset_id": "bearings", "run_id": "r1", "unit_id": "U1"})
+    status = read_status()["status"]
+    assert status == "cancelled"
+    assert status not in {"completed", "stopped"}

@@ -141,6 +141,7 @@ def run_job(job: dict) -> None:
                 "confirmation_count",
                 "minimum_action_lead_time",
                 "max_useful_horizon_s",
+                "with_trace",
             ):
                 if key in job:
                     eval_kwargs[key] = job[key]
@@ -155,6 +156,41 @@ def run_job(job: dict) -> None:
                     "eval_id": metrics.get("eval_id"),
                     "eval_dir": metrics.get("eval_dir"),
                     "metrics_keys": list(metrics),
+                }
+            )
+        elif kind == "trace":
+            from pdm.visualization.trace import run_trace_job
+
+            write_status(
+                {
+                    "status": "training",
+                    "dataset_id": job["dataset_id"],
+                    "kind": kind,
+                    "run_id": job["run_id"],
+                    "unit_id": job.get("unit_id"),
+                }
+            )
+            rec = run_trace_job(
+                job["dataset_id"],
+                job["run_id"],
+                job.get("unit_id"),
+                should_stop=stopped,
+                lazy=bool(job.get("lazy", False)),
+                device=job.get("device", "cpu"),
+            )
+            final = (
+                "cancelled"
+                if stop_path().exists() or rec.get("status") == "cancelled"
+                else "completed"
+            )
+            write_status(
+                {
+                    "status": final,
+                    "kind": kind,
+                    "dataset_id": job["dataset_id"],
+                    "run_id": job["run_id"],
+                    "unit_id": job.get("unit_id"),
+                    "trace_dir": rec.get("trace_dir"),
                 }
             )
         elif kind == "download":

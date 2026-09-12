@@ -177,6 +177,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Evaluate even if dataset/split fingerprints do not match the run snapshot (not used by the UI)",
     )
     p_ev.add_argument(
+        "--with-trace",
+        action="store_true",
+        help=(
+            "Also write reservoir traces under runs/<dataset>/<run>/traces/<unit>/. "
+            "Off by default; does not change predictions.csv."
+        ),
+    )
+    p_ev.add_argument(
         "--list",
         action="store_true",
         help="List evaluations for --run-id without creating a new evaluation",
@@ -249,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             minimum_action_lead_time=args.min_action_lead_s,
             max_useful_horizon_s=args.max_useful_horizon_s,
             force=bool(args.force),
+            with_trace=bool(args.with_trace),
         )
         print(json.dumps(rec, indent=2, default=str))
         return 0
