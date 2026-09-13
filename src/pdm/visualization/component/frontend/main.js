@@ -3,25 +3,36 @@
 
     var canvas = document.getElementById("canvas");
     var controls = document.getElementById("controls");
+    var hudBanner = document.getElementById("hud-banner");
+    var hudLine = document.getElementById("hud-line");
+    var hudHint = document.getElementById("hud-hint");
 
     var nodes = [];
     var edges = [];
     var positions = {};
     var states = [];
+    var inputs = [];
     var frameMap = [];
     var flags = {};
+    var predictedRul = null;
 
     var playing = false;
     var frameIndex = 0;
     var speed = 2;
     var lastTs = 0;
     var accum = 0;
-    var rotY = 0.55;
-    var rotX = 0.35;
+    var rotY = 0.72;
+    var rotX = 0.28;
     var dragging = false;
     var lastX = 0;
     var lastY = 0;
+    var camDist = 1;
     var renderer = null;
+    var placed = [];
+    var contextPositions = [];
+    var hullPolyline = [];
+    var cachedBounds = null;
+    var lastFitKey = "";
 
     var playBtn;
     var pauseBtn;
@@ -29,6 +40,14 @@
     var frameLabel;
     var speedSlider;
     var modeLabel;
+
+    var ACTIVITY_T = 0.38;
+    var CANVAS_H = 620;
+    var CANVAS_H_COMPACT = 360;
+    var FOV_ANATOMY = 42;
+    var FOV_SCHEMATIC = 48;
+    var ANATOMY_EDGE_HIDE_CTX = 5000;
+    var ANATOMY_EDGE_CAP = 2000;
 
     function hasThree() {
         return typeof THREE !== "undefined" && THREE.WebGLRenderer && THREE.BufferGeometry;
@@ -56,8 +75,48 @@
         return 0;
     }
 
+    function nFeatures() {
+        if (inputs && inputs.length && inputs[0]) {
+            return inputs[0].length;
+        }
+        return 0;
+    }
+
     function modeName() {
         return (flags && flags.mode) || "Overview";
+    }
+
+    function isCompact() {
+        return Boolean(flags && flags.compact);
+    }
+
+    function canvasHeight() {
+        return isCompact() ? CANVAS_H_COMPACT : CANVAS_H;
+    }
+
+    function hullMode() {
+        var m = flags && flags.hull_mode;
+        return m ? String(m) : "schematic_cns";
+    }
+
+    function isAnatomy() {
+        return hullMode() === "malecns_anatomy";
+    }
+
+    function asXYZ(p) {
+        if (!p || !p.length) {
+            return [0, 0, 0];
+        }
+        return [Number(p[0]) || 0, Number(p[1]) || 0, Number(p[2]) || 0];
+    }
+
+    function reservoirActive(v, peak) {
+        var p = peak > 0 ? peak : 1;
+        return Math.abs(Number(v) || 0) >= ACTIVITY_T * p;
+    }
+
+    function contextSizeScale(nCtx) {
+        return clamp(6.5 / Math.sqrt(Math.max(nCtx, 80)), 0.045, 0.42);
     }
 
     function frameBounds() {
@@ -100,30 +159,36 @@
         return { start: start, end: end };
     }
 
-    function sampleState(t) {
-        var n = nFrames();
+    function sampleRow(rows, t, width) {
+        var n = rows && rows.length ? rows.length : 0;
         if (!n) {
             return [];
         }
         var i0 = clamp(Math.floor(t), 0, n - 1);
         var i1 = clamp(i0 + 1, 0, n - 1);
         var f = t - i0;
-        var a = states[i0] || [];
-        var b = states[i1] || a;
+        var a = rows[i0] || [];
+        var b = rows[i1] || a;
         var out = [];
-        var m = Math.max(a.length, b.length, nNodes());
+        var m = Math.max(a.length, b.length, width || 0);
         for (var i = 0; i < m; i++) {
-            var va = Number(a[i] || 0);
-            var vb = Number(b[i] || 0);
-            out.push(lerp(va, vb, f));
+            out.push(lerp(Number(a[i] || 0), Number(b[i] || 0), f));
         }
         return out;
     }
 
-    function maxAbsState() {
+    function sampleState(t) {
+        return sampleRow(states, t, nNodes());
+    }
+
+    function sampleInputs(t) {
+        return sampleRow(inputs, t, nFeatures());
+    }
+
+    function maxAbs(rows) {
         var m = 0;
-        for (var t = 0; t < states.length; t++) {
-            var row = states[t] || [];
+        for (var t = 0; t < (rows || []).length; t++) {
+            var row = rows[t] || [];
             for (var i = 0; i < row.length; i++) {
                 var v = Math.abs(Number(row[i] || 0));
                 if (v > m) {
@@ -134,17 +199,41 @@
         return m > 0 ? m : 1;
     }
 
-    function colorFromValue(v, peak) {
-        var t = clamp(Math.abs(Number(v) || 0) / peak, 0, 1);
-        // blue (inactive) → green (active), from provided state — not noise
-        return {
-            r: lerp(0.15, 0.2, t),
-            g: lerp(0.35, 0.95, t),
-            b: lerp(0.95, 0.25, t)
-        };
+    function nodeSizeScale() {
+        var n = nNodes();
+        if (isAnatomy() && placed && placed.length) {
+            var vis = 0;
+            for (var i = 0; i < placed.length; i++) {
+                if (placed[i]) {
+                    vis += 1;
+                }
+            }
+            n = Math.max(vis, 8);
+        }
+        return clamp(20 / Math.sqrt(Math.max(n, 8)), 0.22, 1.05);
     }
 
-    function nodeXYZ(i) {
+    function colorFromValue(v, peak) {
+        var t = clamp(Math.abs(Number(v) || 0) / peak, 0, 1);
+        t = t * t;
+        var r;
+        var g;
+        var b;
+        if (t < 0.5) {
+            var u = t / 0.5;
+            r = lerp(0.06, 0.95, u);
+            g = lerp(0.14, 0.72, u);
+            b = lerp(0.22, 0.38, u);
+        } else {
+            var u2 = (t - 0.5) / 0.5;
+            r = lerp(0.95, 1.0, u2);
+            g = lerp(0.72, 0.96, u2);
+            b = lerp(0.38, 0.88, u2);
+        }
+        return { r: r, g: g, b: b, t: t };
+    }
+
+    function rawXYZ(i) {
         var id = nodes[i] != null ? String(nodes[i]) : String(i);
         var p = positions[id];
         if (p && p.length >= 2) {
@@ -155,17 +244,393 @@
         return [Math.cos(angle), Math.sin(angle), 0];
     }
 
-    function extentRadius() {
-        var maxR = 1;
+    function polarToCns(x, y, i, n, maxR) {
+        var ang = Math.atan2(y, x);
+        if (!isFinite(ang)) {
+            ang = (2 * Math.PI * i) / Math.max(n, 1);
+        }
+        var r = Math.sqrt(x * x + y * y) / (maxR > 1e-8 ? maxR : 1);
+        r = clamp(r, 0, 1);
+        var u = (ang + Math.PI) / (2 * Math.PI);
+        var v = i / Math.max(n - 1, 1);
+        var ap = clamp(0.28 * v + 0.72 * ((i * 0.6180339887) % 1), 0, 1);
+        var lobeMix = u < 0.22 ? -1 : u > 0.78 ? 1 : 0;
+        if (ap < 0.62 && lobeMix !== 0) {
+            var la = u * 2 * Math.PI + i * 0.37;
+            var lr = 0.18 + 0.28 * r;
+            return [
+                lobeMix * 1.18 + Math.cos(la) * lr,
+                0.16 + Math.sin(la) * lr * 0.85,
+                Math.sin(la * 0.7 + v) * 0.28
+            ];
+        }
+        if (ap < 0.7) {
+            var th = u * 2 * Math.PI;
+            var ph = (v - 0.5) * Math.PI * 0.9;
+            return [
+                0.58 * Math.cos(th) * Math.cos(ph),
+                0.1 + 0.4 * Math.sin(ph),
+                0.36 * Math.sin(th) * Math.cos(ph)
+            ];
+        }
+        var tt = (ap - 0.7) / 0.3;
+        var rad = 0.26 * (1 - 0.55 * tt);
+        var th2 = u * 2 * Math.PI;
+        return [rad * Math.cos(th2), -0.48 - 1.42 * tt, rad * Math.sin(th2) * 0.7];
+    }
+
+    function fitNodesIntoHull() {
         var n = nNodes();
-        for (var i = 0; i < n; i++) {
-            var p = nodeXYZ(i);
-            var r = Math.sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
-            if (r > maxR) {
-                maxR = r;
+        var raw = [];
+        var i;
+        var minX = Infinity;
+        var minY = Infinity;
+        var minZ = Infinity;
+        var maxX = -Infinity;
+        var maxY = -Infinity;
+        var maxZ = -Infinity;
+        var maxR = 0.001;
+        for (i = 0; i < n; i++) {
+            var p = rawXYZ(i);
+            raw.push(p);
+            minX = Math.min(minX, p[0]);
+            minY = Math.min(minY, p[1]);
+            minZ = Math.min(minZ, p[2]);
+            maxX = Math.max(maxX, p[0]);
+            maxY = Math.max(maxY, p[1]);
+            maxZ = Math.max(maxZ, p[2]);
+            var rr = Math.sqrt(p[0] * p[0] + p[1] * p[1]);
+            if (rr > maxR) {
+                maxR = rr;
             }
         }
-        return maxR;
+        var spanZ = maxZ - minZ;
+        var spanXY = Math.max(maxX - minX, maxY - minY, 1e-6);
+        var planar = !n || spanZ <= 0.08 * spanXY;
+        placed = [];
+        for (i = 0; i < n; i++) {
+            var q = raw[i];
+            if (planar) {
+                placed.push(polarToCns(q[0], q[1], i, n, maxR));
+            } else {
+                var nx = spanXY ? (q[0] - minX) / spanXY : 0.5;
+                var ny = spanXY ? (q[1] - minY) / spanXY : 0.5;
+                var nz = spanZ > 1e-8 ? (q[2] - minZ) / spanZ : 0.5;
+                placed.push([
+                    lerp(-1.55, 1.55, clamp(nx, 0, 1)),
+                    lerp(-1.95, 0.72, clamp(ny, 0, 1)),
+                    lerp(-0.42, 0.42, clamp(nz, 0, 1))
+                ]);
+            }
+        }
+    }
+
+    function placeAnatomyNodes() {
+        var n = nNodes();
+        placed = [];
+        for (var i = 0; i < n; i++) {
+            var id = nodes[i] != null ? String(nodes[i]) : String(i);
+            var p = positions[id];
+            if (p && p.length >= 2) {
+                placed.push([Number(p[0]) || 0, Number(p[1]) || 0, Number(p[2]) || 0]);
+            } else {
+                placed.push(null);
+            }
+        }
+    }
+
+    function placeReservoirNodes() {
+        if (hullMode() === "schematic_cns") {
+            fitNodesIntoHull();
+            return;
+        }
+        placeAnatomyNodes();
+    }
+
+    function nodeXYZ(i) {
+        if (placed && i >= 0 && i < placed.length) {
+            return placed[i] || null;
+        }
+        if (isAnatomy()) {
+            return null;
+        }
+        return rawXYZ(i);
+    }
+
+    function accBounds(p, b) {
+        if (!p) {
+            return;
+        }
+        var x = Number(p[0]) || 0;
+        var y = Number(p[1]) || 0;
+        var z = Number(p[2]) || 0;
+        b.minX = Math.min(b.minX, x);
+        b.minY = Math.min(b.minY, y);
+        b.minZ = Math.min(b.minZ, z);
+        b.maxX = Math.max(b.maxX, x);
+        b.maxY = Math.max(b.maxY, y);
+        b.maxZ = Math.max(b.maxZ, z);
+        b.any = true;
+    }
+
+    function computeSceneBounds() {
+        var b = {
+            minX: Infinity,
+            minY: Infinity,
+            minZ: Infinity,
+            maxX: -Infinity,
+            maxY: -Infinity,
+            maxZ: -Infinity,
+            any: false
+        };
+        var i;
+        if (hullMode() === "schematic_cns") {
+            accBounds([-1.7, 0.82, 0.44], b);
+            accBounds([1.7, 0.82, 0.44], b);
+            accBounds([0, -2.38, 0.22], b);
+            accBounds([0, 0.74, 0.15], b);
+            var n = nNodes();
+            for (i = 0; i < n; i++) {
+                accBounds(nodeXYZ(i), b);
+            }
+        } else {
+            var nA = nNodes();
+            for (i = 0; i < nA; i++) {
+                accBounds(nodeXYZ(i), b);
+            }
+            for (i = 0; i < contextPositions.length; i++) {
+                accBounds(asXYZ(contextPositions[i]), b);
+            }
+            for (i = 0; i < hullPolyline.length; i++) {
+                accBounds(asXYZ(hullPolyline[i]), b);
+            }
+        }
+        if (!b.any) {
+            return {
+                minX: -1,
+                minY: -1,
+                minZ: -1,
+                maxX: 1,
+                maxY: 1,
+                maxZ: 1,
+                center: [0, 0, 0],
+                hx: 1,
+                hy: 1,
+                hz: 1,
+                radius: 1.6
+            };
+        }
+        var cx = (b.minX + b.maxX) * 0.5;
+        var cy = (b.minY + b.maxY) * 0.5;
+        var cz = (b.minZ + b.maxZ) * 0.5;
+        var hx = (b.maxX - b.minX) * 0.5;
+        var hy = (b.maxY - b.minY) * 0.5;
+        var hz = (b.maxZ - b.minZ) * 0.5;
+        var radius = Math.sqrt(hx * hx + hy * hy + hz * hz);
+        if (!isFinite(radius) || radius < 1e-4) {
+            radius = 0.35;
+        }
+        return {
+            minX: b.minX,
+            minY: b.minY,
+            minZ: b.minZ,
+            maxX: b.maxX,
+            maxY: b.maxY,
+            maxZ: b.maxZ,
+            center: [cx, cy, cz],
+            hx: Math.max(hx, 1e-4),
+            hy: Math.max(hy, 1e-4),
+            hz: Math.max(hz, 1e-4),
+            radius: radius
+        };
+    }
+
+    function sceneBounds() {
+        if (!cachedBounds) {
+            cachedBounds = computeSceneBounds();
+        }
+        return cachedBounds;
+    }
+
+    function sceneLookAt() {
+        if (hullMode() === "schematic_cns") {
+            return [0, -0.35, 0];
+        }
+        return sceneBounds().center;
+    }
+
+    function extentRadius() {
+        return sceneBounds().radius;
+    }
+
+    function camDistLimits() {
+        if (isAnatomy()) {
+            return { min: 0.028, max: 2.6 };
+        }
+        return { min: 0.28, max: 4.2 };
+    }
+
+    function anatomyAxes() {
+        var b = sceneBounds();
+        var axes = [
+            { u: [1, 0, 0], h: b.hx },
+            { u: [0, 1, 0], h: b.hy },
+            { u: [0, 0, 1], h: b.hz }
+        ];
+        axes.sort(function (a, c) {
+            return a.h - c.h;
+        });
+        var thin = axes[0].u;
+        var tall = axes[2].u;
+        var mean = 0;
+        var n = 0;
+        var i;
+        for (i = 0; i < contextPositions.length; i++) {
+            var p = asXYZ(contextPositions[i]);
+            mean += p[0] * tall[0] + p[1] * tall[1] + p[2] * tall[2];
+            n += 1;
+        }
+        if (n && mean < 0) {
+            tall = [-tall[0], -tall[1], -tall[2]];
+        }
+        var right = [
+            tall[1] * thin[2] - tall[2] * thin[1],
+            tall[2] * thin[0] - tall[0] * thin[2],
+            tall[0] * thin[1] - tall[1] * thin[0]
+        ];
+        var rl = Math.sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]) || 1;
+        right[0] /= rl;
+        right[1] /= rl;
+        right[2] /= rl;
+        return { thin: thin, tall: tall, right: right, hThin: axes[0].h, hMid: axes[1].h, hTall: axes[2].h };
+    }
+
+    function fittedViewDistance(aspect) {
+        var b = sceneBounds();
+        var fovDeg = isAnatomy() ? FOV_ANATOMY : FOV_SCHEMATIC;
+        var fill = isAnatomy() ? 0.84 : 0.7;
+        var fovY = (fovDeg * Math.PI) / 180;
+        var asp = Math.max(Number(aspect) || 1, 0.2);
+        var halfY = Math.tan(fovY * 0.5);
+        var halfX = halfY * asp;
+        if (isAnatomy()) {
+            var ax = anatomyAxes();
+            var distY = ax.hTall / (halfY * fill);
+            var distX = ax.hMid / (halfX * fill);
+            return Math.max(distX, distY, 0.04) + ax.hThin * 0.22;
+        }
+        var distBox = Math.max(b.hy / (halfY * fill), b.hx / (halfX * fill));
+        return Math.max(distBox, 0.04);
+    }
+
+    function cameraPose(aspect) {
+        var dist = camDist * fittedViewDistance(aspect);
+        dist = Math.max(dist, 0.02);
+        var fov = isAnatomy() ? FOV_ANATOMY : FOV_SCHEMATIC;
+        if (hullMode() === "schematic_cns") {
+            return {
+                eye: [
+                    dist * Math.cos(rotY) * Math.cos(rotX),
+                    dist * Math.sin(rotX) + 0.15,
+                    dist * Math.sin(rotY) * Math.cos(rotX)
+                ],
+                target: [0, -0.35, 0],
+                up: [0, 1, 0],
+                dist: dist,
+                fov: fov
+            };
+        }
+        var target = sceneLookAt();
+        var ax = anatomyAxes();
+        var cy = Math.cos(rotY);
+        var sy = Math.sin(rotY);
+        var cx = Math.cos(rotX);
+        var sx = Math.sin(rotX);
+        var dx = ax.thin[0] * cy * cx + ax.right[0] * sy * cx + ax.tall[0] * sx;
+        var dy = ax.thin[1] * cy * cx + ax.right[1] * sy * cx + ax.tall[1] * sx;
+        var dz = ax.thin[2] * cy * cx + ax.right[2] * sy * cx + ax.tall[2] * sx;
+        return {
+            eye: [target[0] + dist * dx, target[1] + dist * dy, target[2] + dist * dz],
+            target: target,
+            up: ax.tall,
+            dist: dist,
+            fov: fov
+        };
+    }
+
+    function selectDrawnEdges() {
+        var out = [];
+        if (!edges || !edges.length || !nodes.length) {
+            return out;
+        }
+        if (isAnatomy() && contextPositions.length >= ANATOMY_EDGE_HIDE_CTX) {
+            return out;
+        }
+        var indexOf = {};
+        var k;
+        for (k = 0; k < nodes.length; k++) {
+            indexOf[String(nodes[k])] = k;
+        }
+        var cap = isAnatomy() ? ANATOMY_EDGE_CAP : edges.length;
+        var step = edges.length > cap ? Math.ceil(edges.length / cap) : 1;
+        var e;
+        for (e = 0; e < edges.length; e += step) {
+            var src = indexOf[String(edges[e].src)];
+            var dst = indexOf[String(edges[e].dst)];
+            if (src == null || dst == null) {
+                continue;
+            }
+            if (isAnatomy() && (!nodeXYZ(src) || !nodeXYZ(dst))) {
+                continue;
+            }
+            out.push(src, dst);
+            if (out.length / 2 >= cap) {
+                break;
+            }
+        }
+        return out;
+    }
+
+    function maybeResetCameraFit() {
+        var key = hullMode() + "|" + nNodes() + "|" + contextPositions.length;
+        if (key !== lastFitKey) {
+            lastFitKey = key;
+            camDist = 1;
+            if (isAnatomy()) {
+                rotY = 0.12;
+                rotX = 0.06;
+            } else {
+                rotY = 0.72;
+                rotX = 0.28;
+            }
+        }
+        cachedBounds = null;
+    }
+
+    function predictedRulValue() {
+        if (predictedRul == null) {
+            if (flags && flags.stored_predicted_rul_s != null) {
+                return Number(flags.stored_predicted_rul_s);
+            }
+            return null;
+        }
+        if (typeof predictedRul === "number") {
+            return predictedRul;
+        }
+        if (predictedRul.length) {
+            var idx = clamp(Math.floor(frameIndex), 0, predictedRul.length - 1);
+            return Number(predictedRul[idx]);
+        }
+        return Number(predictedRul);
+    }
+
+    function currentTimestamp() {
+        if (!frameMap || !frameMap.length) {
+            return null;
+        }
+        var idx = clamp(Math.floor(frameIndex), 0, frameMap.length - 1);
+        var ts = frameMap[idx].timestamp_s;
+        return ts == null ? null : Number(ts);
     }
 
     function applyArgs(args) {
@@ -174,8 +639,15 @@
         edges = args.edges || [];
         positions = args.positions || {};
         states = args.states || [];
+        inputs = args.inputs || [];
         frameMap = args.frame_map || [];
         flags = args.flags || {};
+        predictedRul = args.predicted_rul_s != null ? args.predicted_rul_s : null;
+        contextPositions = args.context_positions || [];
+        hullPolyline = args.hull_polyline || [];
+        placeReservoirNodes();
+        maybeResetCameraFit();
+        canvas.style.height = canvasHeight() + "px";
         var bounds = frameBounds();
         if (modeName() === "Alert inspection") {
             frameIndex = bounds.start;
@@ -194,6 +666,7 @@
         if (renderer && renderer.rebuild) {
             renderer.rebuild();
         }
+        syncFrameHeight();
     }
 
     function updateFrameLabel() {
@@ -202,6 +675,68 @@
         }
         if (frameSlider && document.activeElement !== frameSlider) {
             frameSlider.value = String(Math.floor(frameIndex));
+        }
+    }
+
+    function updateHud(values) {
+        var peak = renderer && renderer.peak ? renderer.peak : 1;
+        var active = 0;
+        var i;
+        var vis = renderer && renderer.visIndex;
+        var idxs = vis && vis.length ? vis : null;
+        var nHud = idxs ? idxs.length : values.length;
+        for (i = 0; i < nHud; i++) {
+            var vi = idxs ? idxs[i] : i;
+            if (Math.abs(Number(values[vi] || 0)) >= ACTIVITY_T * peak) {
+                active += 1;
+            }
+        }
+        var pct = nHud ? Math.round((100 * active) / nHud) : 0;
+        var ts = currentTimestamp();
+        var rul = predictedRulValue();
+        var bits = ["frame " + Math.floor(frameIndex)];
+        if (ts != null && isFinite(ts)) {
+            bits.push("t=" + ts.toFixed(3) + "s");
+        }
+        if (rul != null && isFinite(rul)) {
+            bits.push("predicted RUL " + rul.toFixed(3) + "s");
+        }
+        bits.push(pct + "% nodes above activity threshold");
+        if (hudLine) {
+            hudLine.textContent = bits.join("  ·  ");
+        }
+        if (hudBanner) {
+            var parts = [];
+            if (flags && flags.is_synthetic) {
+                parts.push("Synthetic test graph — not a biological connectome");
+            }
+            if (flags && flags.phase === "training") {
+                parts.push("Live training — train-split window only");
+            }
+            if (flags && flags.downsampled) {
+                parts.push("Activity downsampled for display");
+            }
+            if (flags && flags.anatomy_missing) {
+                parts.push("Anatomical soma coordinates are missing; showing a labeled schematic.");
+            }
+            if (flags && flags.context_caption) {
+                parts.push(String(flags.context_caption));
+            } else if (flags && flags.context_downsampled) {
+                parts.push("Soma context downsampled for display");
+            }
+            hudBanner.textContent = parts.join("  ·  ");
+        }
+        if (hudHint) {
+            hudHint.textContent = isAnatomy()
+                ? "Drag to rotate · wheel to zoom into the cloud · Play runs in this view"
+                : "Drag to rotate · wheel to zoom · Play runs in this view";
+        }
+    }
+
+    function syncFrameHeight() {
+        if (window.Streamlit && window.Streamlit.setFrameHeight) {
+            var h = Math.max(document.body.scrollHeight, canvasHeight() + 88);
+            window.Streamlit.setFrameHeight(isCompact() ? Math.max(h, 460) : Math.max(h, 700));
         }
     }
 
@@ -252,15 +787,171 @@
         });
     }
 
+    function fibonacciFill(n, rx, ry, rz, ox, oy, oz, out, start) {
+        var golden = Math.PI * (3 - Math.sqrt(5));
+        for (var i = 0; i < n; i++) {
+            var y = 1 - (i / Math.max(n - 1, 1)) * 2;
+            var rad = Math.sqrt(Math.max(0, 1 - y * y));
+            var theta = golden * i;
+            var k = (start + i) * 3;
+            out[k] = ox + Math.cos(theta) * rad * rx;
+            out[k + 1] = oy + y * ry;
+            out[k + 2] = oz + Math.sin(theta) * rad * rz;
+        }
+        return start + n;
+    }
+
+    function buildHullPositions() {
+        var nLobe = 280;
+        var nBrain = 420;
+        var nVnc = 480;
+        var total = nLobe * 2 + nBrain + nVnc;
+        var out = new Float32Array(total * 3);
+        var s = 0;
+        s = fibonacciFill(nLobe, 0.52, 0.5, 0.42, -1.18, 0.16, 0, out, s);
+        s = fibonacciFill(nLobe, 0.52, 0.5, 0.42, 1.18, 0.16, 0, out, s);
+        s = fibonacciFill(nBrain, 0.72, 0.5, 0.44, 0, 0.08, 0, out, s);
+        var golden = Math.PI * (3 - Math.sqrt(5));
+        for (var i = 0; i < nVnc; i++) {
+            var t = i / Math.max(nVnc - 1, 1);
+            var y = -0.42 - 1.58 * t;
+            var rad = 0.3 * (1 - 0.58 * t);
+            var theta = golden * i;
+            var k = (s + i) * 3;
+            out[k] = Math.cos(theta) * rad;
+            out[k + 1] = y;
+            out[k + 2] = Math.sin(theta) * rad * 0.62;
+        }
+        return out;
+    }
+
+    function buildHullWire() {
+        var rings = [];
+        function ring(cx, cy, cz, rx, rz, n) {
+            var pts = [];
+            for (var i = 0; i < n; i++) {
+                var a = (2 * Math.PI * i) / n;
+                pts.push([cx + Math.cos(a) * rx, cy, cz + Math.sin(a) * rz]);
+            }
+            for (var j = 0; j < n; j++) {
+                var a0 = pts[j];
+                var a1 = pts[(j + 1) % n];
+                rings.push(a0[0], a0[1], a0[2], a1[0], a1[1], a1[2]);
+            }
+        }
+        ring(-1.18, 0.16, 0, 0.52, 0.42, 48);
+        ring(1.18, 0.16, 0, 0.52, 0.42, 48);
+        ring(0, 0.08, 0, 0.72, 0.44, 56);
+        ring(0, -0.9, 0, 0.22, 0.14, 32);
+        ring(0, -1.6, 0, 0.16, 0.1, 28);
+        rings.push(-1.18, 0.16, 0, -0.55, 0.12, 0);
+        rings.push(1.18, 0.16, 0, 0.55, 0.12, 0);
+        rings.push(0, -0.38, 0, 0, -2.02, 0);
+        return new Float32Array(rings);
+    }
+
+    function sensorXYZ(i, n) {
+        var u = n <= 1 ? 0.5 : i / (n - 1);
+        return [lerp(-0.72, 0.72, u), -2.12, 0.22];
+    }
+
+    function makeLabelSprite(text, x, y, z) {
+        var c = document.createElement("canvas");
+        c.width = 256;
+        c.height = 64;
+        var ctx = c.getContext("2d");
+        ctx.clearRect(0, 0, 256, 64);
+        ctx.font = "22px sans-serif";
+        ctx.fillStyle = "rgba(170, 196, 214, 0.72)";
+        ctx.textAlign = "center";
+        ctx.fillText(text, 128, 40);
+        var tex = new THREE.CanvasTexture(c);
+        var mat = new THREE.SpriteMaterial({
+            map: tex,
+            transparent: true,
+            depthWrite: false,
+            opacity: 0.7
+        });
+        var spr = new THREE.Sprite(mat);
+        spr.position.set(x, y, z);
+        spr.scale.set(1.15, 0.28, 1);
+        return spr;
+    }
+
+    function hullLineVerts() {
+        var pts = hullPolyline || [];
+        if (pts.length < 2) {
+            return new Float32Array(0);
+        }
+        var out = [];
+        var i;
+        for (i = 0; i < pts.length; i++) {
+            var a = asXYZ(pts[i]);
+            var b = asXYZ(pts[(i + 1) % pts.length]);
+            out.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+        }
+        return new Float32Array(out);
+    }
+
+    function pointShader(sizeMul, additive) {
+        var falloff = additive ? "7.2" : "5.2";
+        return new THREE.ShaderMaterial({
+            uniforms: { uMul: { value: sizeMul } },
+            vertexShader:
+                "attribute float aSize; attribute vec3 color; varying vec3 vCol;" +
+                "uniform float uMul;" +
+                "void main(){ vCol=color; vec4 mv=modelViewMatrix*vec4(position,1.0);" +
+                "gl_Position=projectionMatrix*mv;" +
+                "gl_PointSize=max(aSize*uMul*(36.0/max(-mv.z,0.4)), 0.75); }",
+            fragmentShader:
+                "varying vec3 vCol; void main(){ vec2 p=gl_PointCoord*2.0-1.0; float d=dot(p,p);" +
+                "if(d>1.0) discard; if(dot(vCol,vCol)<0.00015) discard; float a=exp(-d*" +
+                falloff +
+                "); gl_FragColor=vec4(vCol,a); }",
+            transparent: true,
+            blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+            depthWrite: false
+        });
+    }
+
+    function contextDustMaterial(sizeMul) {
+        return new THREE.ShaderMaterial({
+            uniforms: { uMul: { value: sizeMul } },
+            vertexShader:
+                "attribute float aSize; attribute vec3 color; varying vec3 vCol;" +
+                "uniform float uMul;" +
+                "void main(){ vCol=color; vec4 mv=modelViewMatrix*vec4(position,1.0);" +
+                "gl_Position=projectionMatrix*mv;" +
+                "gl_PointSize=max(aSize*uMul*(36.0/max(-mv.z,0.4)), 0.7); }",
+            fragmentShader:
+                "varying vec3 vCol; void main(){ vec2 p=gl_PointCoord*2.0-1.0; float d=dot(p,p);" +
+                "if(d>1.0) discard; float a=exp(-d*6.2)*0.38; gl_FragColor=vec4(vCol,a); }",
+            transparent: true,
+            blending: THREE.NormalBlending,
+            depthWrite: false
+        });
+    }
+
     function ThreeRenderer() {
         this.scene = new THREE.Scene();
-        this.scene.background = new THREE.Color(0x111111);
-        this.camera = new THREE.PerspectiveCamera(55, 1, 0.01, 100);
-        this.gl = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
-        this.points = null;
-        this.lines = null;
+        this.scene.background = new THREE.Color(0x04070c);
+        this.camera = new THREE.PerspectiveCamera(FOV_SCHEMATIC, 1, 0.002, 40);
+        this.gl = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: false });
+        this.gl.setClearColor(0x04070c, 1);
+        this.gl.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        this.core = null;
+        this.idle = null;
+        this.halo = null;
         this.colorAttr = null;
+        this.idleColorAttr = null;
+        this.sizeAttr = null;
+        this.idleSizeAttr = null;
+        this.haloSizeAttr = null;
+        this.lineColor = null;
+        this.sensorColor = null;
+        this.nSensor = 0;
         this.peak = 1;
+        this.inPeak = 1;
         this.rebuild();
         this.resize();
     }
@@ -269,103 +960,360 @@
         while (this.scene.children.length) {
             this.scene.remove(this.scene.children[0]);
         }
-        var n = nNodes();
-        var pos = new Float32Array(n * 3);
-        var col = new Float32Array(n * 3);
-        for (var i = 0; i < n; i++) {
+        placeReservoirNodes();
+        cachedBounds = null;
+        this.visIndex = [];
+        var visPos = [];
+        var nAll = nNodes();
+        var i;
+        for (i = 0; i < nAll; i++) {
             var p = nodeXYZ(i);
-            pos[i * 3] = p[0];
-            pos[i * 3 + 1] = p[1];
-            pos[i * 3 + 2] = p[2];
-        }
-        var geom = new THREE.BufferGeometry();
-        geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-        this.colorAttr = new THREE.BufferAttribute(col, 3);
-        geom.setAttribute("color", this.colorAttr);
-        var mat = new THREE.PointsMaterial({ size: 0.12, vertexColors: true, sizeAttenuation: true });
-        this.points = new THREE.Points(geom, mat);
-        this.scene.add(this.points);
-
-        if (edges && edges.length && nodes.length) {
-            var indexOf = {};
-            for (var k = 0; k < nodes.length; k++) {
-                indexOf[String(nodes[k])] = k;
+            if (!p) {
+                continue;
             }
+            this.visIndex.push(i);
+            visPos.push(p[0], p[1], p[2]);
+        }
+        var nv = this.visIndex.length;
+        var pos = nv ? new Float32Array(visPos) : new Float32Array(3);
+        var col = new Float32Array(Math.max(nv, 1) * 3);
+        var idleCol = new Float32Array(Math.max(nv, 1) * 3);
+        var sz = new Float32Array(Math.max(nv, 1));
+        var idleSz = new Float32Array(Math.max(nv, 1));
+        var idleRgb = isAnatomy() ? [0.03, 0.038, 0.048] : [0.055, 0.08, 0.11];
+        for (i = 0; i < nv; i++) {
+            idleCol[i * 3] = idleRgb[0];
+            idleCol[i * 3 + 1] = idleRgb[1];
+            idleCol[i * 3 + 2] = idleRgb[2];
+            sz[i] = 0;
+            idleSz[i] = isAnatomy() ? 0.9 : 1.25;
+        }
+        var posAttr = new THREE.BufferAttribute(pos, 3);
+        this.colorAttr = new THREE.BufferAttribute(col, 3);
+        this.idleColorAttr = new THREE.BufferAttribute(idleCol, 3);
+        this.sizeAttr = new THREE.BufferAttribute(sz, 1);
+        this.idleSizeAttr = new THREE.BufferAttribute(idleSz, 1);
+        this.haloSizeAttr = null;
+        this.halo = null;
+        var idleGeom = new THREE.BufferGeometry();
+        idleGeom.setAttribute("position", posAttr);
+        idleGeom.setAttribute("color", this.idleColorAttr);
+        idleGeom.setAttribute("aSize", this.idleSizeAttr);
+        var geom = new THREE.BufferGeometry();
+        geom.setAttribute("position", posAttr);
+        geom.setAttribute("color", this.colorAttr);
+        geom.setAttribute("aSize", this.sizeAttr);
+        this.idle = new THREE.Points(idleGeom, pointShader(1.0, false));
+        this.core = new THREE.Points(geom, pointShader(1.0, true));
+        if (!isAnatomy()) {
+            this.haloSizeAttr = new THREE.BufferAttribute(new Float32Array(Math.max(nv, 1)), 1);
+            var haloGeom = new THREE.BufferGeometry();
+            haloGeom.setAttribute("position", posAttr);
+            haloGeom.setAttribute("color", this.colorAttr);
+            haloGeom.setAttribute("aSize", this.haloSizeAttr);
+            this.halo = new THREE.Points(haloGeom, pointShader(1.4, true));
+        }
+        if (nv) {
+            this.scene.add(this.idle);
+        }
+
+        if (hullMode() === "schematic_cns") {
+            var hullPos = buildHullPositions();
+            var hg = new THREE.BufferGeometry();
+            hg.setAttribute("position", new THREE.BufferAttribute(hullPos, 3));
+            var hullMat = new THREE.PointsMaterial({
+                color: 0x3a6a88,
+                size: 0.022,
+                sizeAttenuation: true,
+                transparent: true,
+                opacity: 0.55,
+                depthWrite: false,
+                blending: THREE.NormalBlending
+            });
+            this.scene.add(new THREE.Points(hg, hullMat));
+            var wire = buildHullWire();
+            var wg = new THREE.BufferGeometry();
+            wg.setAttribute("position", new THREE.BufferAttribute(wire, 3));
+            this.scene.add(
+                new THREE.LineSegments(
+                    wg,
+                    new THREE.LineBasicMaterial({
+                        color: 0x244058,
+                        transparent: true,
+                        opacity: 0.2,
+                        blending: THREE.NormalBlending
+                    })
+                )
+            );
+            this.scene.add(makeLabelSprite("optic lobe", -1.18, 0.82, 0.2));
+            this.scene.add(makeLabelSprite("optic lobe", 1.18, 0.82, 0.2));
+            this.scene.add(makeLabelSprite("central brain", 0, 0.74, 0.15));
+            this.scene.add(makeLabelSprite("VNC", 0.55, -1.35, 0.2));
+        } else if (isAnatomy()) {
+            var nCtx = contextPositions.length;
+            if (nCtx) {
+                var cpos = new Float32Array(nCtx * 3);
+                var ccol = new Float32Array(nCtx * 3);
+                var csz = new Float32Array(nCtx);
+                var cScale = contextSizeScale(nCtx);
+                for (i = 0; i < nCtx; i++) {
+                    var cp = asXYZ(contextPositions[i]);
+                    cpos[i * 3] = cp[0];
+                    cpos[i * 3 + 1] = cp[1];
+                    cpos[i * 3 + 2] = cp[2];
+                    ccol[i * 3] = 0.36;
+                    ccol[i * 3 + 1] = 0.4;
+                    ccol[i * 3 + 2] = 0.45;
+                    csz[i] = 3.1 * cScale;
+                }
+                var cg = new THREE.BufferGeometry();
+                cg.setAttribute("position", new THREE.BufferAttribute(cpos, 3));
+                cg.setAttribute("color", new THREE.BufferAttribute(ccol, 3));
+                cg.setAttribute("aSize", new THREE.BufferAttribute(csz, 1));
+                this.scene.add(new THREE.Points(cg, contextDustMaterial(0.85)));
+            }
+            var hullVerts = hullLineVerts();
+            if (hullVerts.length) {
+                var hlg = new THREE.BufferGeometry();
+                hlg.setAttribute("position", new THREE.BufferAttribute(hullVerts, 3));
+                this.scene.add(
+                    new THREE.LineSegments(
+                        hlg,
+                        new THREE.LineBasicMaterial({
+                            color: 0x8aa4b8,
+                            transparent: true,
+                            opacity: 0.1,
+                            blending: THREE.NormalBlending,
+                            depthWrite: false
+                        })
+                    )
+                );
+            }
+        }
+
+        this.edgeIndex = [];
+        this.lineColor = null;
+        var drawn = selectDrawnEdges();
+        if (drawn.length) {
             var linePos = [];
-            for (var e = 0; e < edges.length; e++) {
-                var src = indexOf[String(edges[e].src)];
-                var dst = indexOf[String(edges[e].dst)];
-                if (src == null || dst == null) {
+            var lineCol = [];
+            for (var e = 0; e < drawn.length; e += 2) {
+                var a = nodeXYZ(drawn[e]);
+                var b = nodeXYZ(drawn[e + 1]);
+                if (!a || !b) {
                     continue;
                 }
-                var a = nodeXYZ(src);
-                var b = nodeXYZ(dst);
                 linePos.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+                lineCol.push(0.1, 0.14, 0.18, 0.1, 0.14, 0.18);
+                this.edgeIndex.push(drawn[e], drawn[e + 1]);
             }
             if (linePos.length) {
                 var lg = new THREE.BufferGeometry();
                 lg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(linePos), 3));
-                this.lines = new THREE.LineSegments(
-                    lg,
-                    new THREE.LineBasicMaterial({ color: 0x445566, transparent: true, opacity: 0.45 })
+                this.lineColor = new THREE.BufferAttribute(new Float32Array(lineCol), 3);
+                lg.setAttribute("color", this.lineColor);
+                this.scene.add(
+                    new THREE.LineSegments(
+                        lg,
+                        new THREE.LineBasicMaterial({
+                            vertexColors: true,
+                            transparent: true,
+                            opacity: isAnatomy() ? 0.12 : 0.28,
+                            blending: THREE.NormalBlending,
+                            depthWrite: false
+                        })
+                    )
                 );
-                this.scene.add(this.lines);
             }
         }
-        this.peak = maxAbsState();
+
+        if (nv) {
+            if (this.halo && !isAnatomy()) {
+                this.scene.add(this.halo);
+            }
+            this.scene.add(this.core);
+        }
+
+        var nf = nFeatures();
+        this.nSensor = 0;
+        this.sensorColor = null;
+        // Hide sensor strip when malecns_anatomy.
+        if (hullMode() === "schematic_cns" && nf) {
+            this.nSensor = nf;
+            var sp = new Float32Array(nf * 3);
+            var sc = new Float32Array(nf * 3);
+            var ss = new Float32Array(nf);
+            for (i = 0; i < nf; i++) {
+                var s = sensorXYZ(i, nf);
+                sp[i * 3] = s[0];
+                sp[i * 3 + 1] = s[1];
+                sp[i * 3 + 2] = s[2];
+                ss[i] = 8;
+            }
+            var sg = new THREE.BufferGeometry();
+            sg.setAttribute("position", new THREE.BufferAttribute(sp, 3));
+            this.sensorColor = new THREE.BufferAttribute(sc, 3);
+            sg.setAttribute("color", this.sensorColor);
+            sg.setAttribute("aSize", new THREE.BufferAttribute(ss, 1));
+            this.scene.add(new THREE.Points(sg, pointShader(1.15, false)));
+            this.scene.add(makeLabelSprite("sensor window", 0, -2.38, 0.2));
+        }
+
+        this.peak = maxAbs(states);
+        this.inPeak = maxAbs(inputs);
         this.resize();
     };
 
     ThreeRenderer.prototype.resize = function () {
         var w = canvas.clientWidth || 640;
-        var h = canvas.clientHeight || 400;
+        var h = canvas.clientHeight || canvasHeight();
         this.gl.setSize(w, h, false);
         this.camera.aspect = w / Math.max(h, 1);
         this.camera.updateProjectionMatrix();
     };
 
-    ThreeRenderer.prototype.render = function (values) {
-        var n = nNodes();
-        if (this.colorAttr) {
-            for (var i = 0; i < n; i++) {
-                var c = colorFromValue(values[i] || 0, this.peak);
-                this.colorAttr.array[i * 3] = c.r;
-                this.colorAttr.array[i * 3 + 1] = c.g;
-                this.colorAttr.array[i * 3 + 2] = c.b;
+    ThreeRenderer.prototype.render = function (values, inRow) {
+        var vis = this.visIndex || [];
+        var nv = vis.length;
+        var i;
+        var anatomy = isAnatomy();
+        if (this.colorAttr && nv) {
+            var nScale = nodeSizeScale();
+            for (i = 0; i < nv; i++) {
+                var ni = vis[i];
+                var c = colorFromValue(values[ni] || 0, this.peak);
+                var active = reservoirActive(values[ni] || 0, this.peak);
+                this.colorAttr.array[i * 3] = active ? c.r : 0;
+                this.colorAttr.array[i * 3 + 1] = active ? c.g : 0;
+                this.colorAttr.array[i * 3 + 2] = active ? c.b : 0;
+                if (this.sizeAttr) {
+                    this.sizeAttr.array[i] = active
+                        ? (anatomy ? lerp(0.9, 1.85, c.t) : lerp(1.45, 4.2, c.t)) * nScale
+                        : 0;
+                }
+                if (this.idleSizeAttr) {
+                    this.idleSizeAttr.array[i] = active ? 0 : (anatomy ? 0.82 : 1.1) * nScale;
+                }
+                if (this.idleColorAttr) {
+                    this.idleColorAttr.array[i * 3] = anatomy ? 0.03 : 0.055;
+                    this.idleColorAttr.array[i * 3 + 1] = anatomy ? 0.038 : 0.08;
+                    this.idleColorAttr.array[i * 3 + 2] = anatomy ? 0.048 : 0.11;
+                }
+                if (this.haloSizeAttr) {
+                    this.haloSizeAttr.array[i] = active
+                        ? (anatomy ? lerp(0.95, 1.85, c.t) : lerp(1.5, 4.6, c.t)) * nScale
+                        : 0;
+                }
             }
             this.colorAttr.needsUpdate = true;
+            if (this.sizeAttr) {
+                this.sizeAttr.needsUpdate = true;
+            }
+            if (this.idleSizeAttr) {
+                this.idleSizeAttr.needsUpdate = true;
+            }
+            if (this.idleColorAttr) {
+                this.idleColorAttr.needsUpdate = true;
+            }
+            if (this.haloSizeAttr) {
+                this.haloSizeAttr.needsUpdate = true;
+            }
         }
-        var radius = extentRadius() * 2.6 + 1.2;
-        this.camera.position.set(
-            radius * Math.cos(rotY) * Math.cos(rotX),
-            radius * Math.sin(rotX),
-            radius * Math.sin(rotY) * Math.cos(rotX)
-        );
-        this.camera.lookAt(0, 0, 0);
+        if (this.lineColor && this.edgeIndex && this.edgeIndex.length) {
+            var thr = ACTIVITY_T * this.peak;
+            for (i = 0; i < this.edgeIndex.length; i += 2) {
+                var sa = Math.abs(Number(values[this.edgeIndex[i]] || 0));
+                var sb = Math.abs(Number(values[this.edgeIndex[i + 1]] || 0));
+                var hot = sa >= thr && sb >= thr;
+                var r = hot ? (anatomy ? 0.42 : 0.72) : anatomy ? 0.1 : 0.14;
+                var g = hot ? (anatomy ? 0.48 : 0.7) : anatomy ? 0.14 : 0.2;
+                var b = hot ? (anatomy ? 0.52 : 0.48) : anatomy ? 0.18 : 0.28;
+                var a = i * 3;
+                this.lineColor.array[a] = r;
+                this.lineColor.array[a + 1] = g;
+                this.lineColor.array[a + 2] = b;
+                this.lineColor.array[a + 3] = r;
+                this.lineColor.array[a + 4] = g;
+                this.lineColor.array[a + 5] = b;
+            }
+            this.lineColor.needsUpdate = true;
+        }
+        if (this.sensorColor && inRow) {
+            for (i = 0; i < this.nSensor; i++) {
+                var ic = colorFromValue(inRow[i] || 0, this.inPeak);
+                this.sensorColor.array[i * 3] = ic.r;
+                this.sensorColor.array[i * 3 + 1] = ic.g;
+                this.sensorColor.array[i * 3 + 2] = ic.b;
+            }
+            this.sensorColor.needsUpdate = true;
+        }
+        var pose = cameraPose(this.camera.aspect || 1);
+        this.camera.fov = pose.fov;
+        this.camera.near = clamp(pose.dist * 0.018, 0.0008, 0.08);
+        this.camera.far = Math.max(pose.dist * 28, extentRadius() * 16, 10);
+        this.camera.updateProjectionMatrix();
+        this.camera.position.set(pose.eye[0], pose.eye[1], pose.eye[2]);
+        this.camera.up.set(pose.up[0], pose.up[1], pose.up[2]);
+        this.camera.lookAt(pose.target[0], pose.target[1], pose.target[2]);
         this.gl.render(this.scene, this.camera);
     };
 
     function WebGLRenderer() {
         this.gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
         this.program = null;
+        this.lineProgram = null;
         this.buf = null;
         this.colorBuf = null;
+        this.sizeBuf = null;
         this.lineBuf = null;
+        this.lineColorBuf = null;
+        this.hullBuf = null;
+        this.hullLineBuf = null;
+        this.contextBuf = null;
+        this.idleSizeBuf = null;
+        this.sensorBuf = null;
+        this.sensorColorBuf = null;
         this.nPoints = 0;
         this.nLineVerts = 0;
+        this.nHull = 0;
+        this.nHullLine = 0;
+        this.nContext = 0;
+        this.nSensor = 0;
         this.peak = 1;
+        this.inPeak = 1;
+        this.edgeIndex = [];
+        this.visIndex = [];
         if (!this.gl) {
             return;
         }
         var vs =
-            "attribute vec3 aPos; attribute vec3 aCol; uniform mat4 uMVP; varying vec3 vCol;" +
-            "void main(){ vCol=aCol; gl_Position=uMVP*vec4(aPos,1.0); gl_PointSize=8.0; }";
+            "attribute vec3 aPos; attribute vec3 aCol; attribute float aSize;" +
+            "uniform mat4 uMVP; uniform float uSizeMul; varying vec3 vCol;" +
+            "void main(){ vCol=aCol; gl_Position=uMVP*vec4(aPos,1.0); gl_PointSize=aSize*uSizeMul; }";
         var fs =
-            "precision mediump float; varying vec3 vCol; void main(){ gl_FragColor=vec4(vCol,1.0); }";
+            "precision mediump float; varying vec3 vCol;" +
+            "void main(){ vec2 p=gl_PointCoord*2.0-1.0; float d=dot(p,p);" +
+            "if(d>1.0) discard; if(dot(vCol,vCol)<0.00015) discard; gl_FragColor=vec4(vCol, exp(-d*5.4)); }";
         this.program = compileProgram(this.gl, vs, fs);
+        var lineVs =
+            "attribute vec3 aPos; attribute vec3 aCol;" +
+            "uniform mat4 uMVP; varying vec3 vCol;" +
+            "void main(){ vCol=aCol; gl_Position=uMVP*vec4(aPos,1.0); }";
+        var lineFs =
+            "precision mediump float; varying vec3 vCol; uniform float uAlpha;" +
+            "void main(){ gl_FragColor=vec4(vCol, uAlpha); }";
+        this.lineProgram = compileProgram(this.gl, lineVs, lineFs);
         this.buf = this.gl.createBuffer();
         this.colorBuf = this.gl.createBuffer();
+        this.sizeBuf = this.gl.createBuffer();
         this.lineBuf = this.gl.createBuffer();
+        this.lineColorBuf = this.gl.createBuffer();
+        this.hullBuf = this.gl.createBuffer();
+        this.hullLineBuf = this.gl.createBuffer();
+        this.contextBuf = this.gl.createBuffer();
+        this.idleSizeBuf = this.gl.createBuffer();
+        this.sensorBuf = this.gl.createBuffer();
+        this.sensorColorBuf = this.gl.createBuffer();
         this.rebuild();
     }
 
@@ -387,36 +1335,86 @@
         if (!this.gl) {
             return;
         }
-        var n = nNodes();
-        this.nPoints = n;
-        var pos = new Float32Array(n * 3);
-        for (var i = 0; i < n; i++) {
+        placeReservoirNodes();
+        cachedBounds = null;
+        this.visIndex = [];
+        var visPos = [];
+        var nAll = nNodes();
+        var i;
+        for (i = 0; i < nAll; i++) {
             var p = nodeXYZ(i);
-            pos[i * 3] = p[0];
-            pos[i * 3 + 1] = p[1];
-            pos[i * 3 + 2] = p[2];
-        }
-        this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.buf);
-        this.gl.bufferData(this.gl.ARRAY_BUFFER, pos, this.gl.STATIC_DRAW);
-        var indexOf = {};
-        for (var k = 0; k < nodes.length; k++) {
-            indexOf[String(nodes[k])] = k;
-        }
-        var linePos = [];
-        for (var e = 0; e < (edges || []).length; e++) {
-            var src = indexOf[String(edges[e].src)];
-            var dst = indexOf[String(edges[e].dst)];
-            if (src == null || dst == null) {
+            if (!p) {
                 continue;
             }
-            var a = nodeXYZ(src);
-            var b = nodeXYZ(dst);
+            this.visIndex.push(i);
+            visPos.push(p[0], p[1], p[2]);
+        }
+        var n = this.visIndex.length;
+        this.nPoints = n;
+        var pos = n ? new Float32Array(visPos) : new Float32Array(0);
+        this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.buf);
+        this.gl.bufferData(this.gl.ARRAY_BUFFER, pos, this.gl.STATIC_DRAW);
+        this.nHull = 0;
+        this.nContext = 0;
+        this.nHullLine = 0;
+        if (hullMode() === "schematic_cns") {
+            var hull = buildHullPositions();
+            this.nHull = hull.length / 3;
+            this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.hullBuf);
+            this.gl.bufferData(this.gl.ARRAY_BUFFER, hull, this.gl.STATIC_DRAW);
+        } else if (isAnatomy()) {
+            var nCtx = contextPositions.length;
+            if (nCtx) {
+                var cpos = new Float32Array(nCtx * 3);
+                for (i = 0; i < nCtx; i++) {
+                    var cp = asXYZ(contextPositions[i]);
+                    cpos[i * 3] = cp[0];
+                    cpos[i * 3 + 1] = cp[1];
+                    cpos[i * 3 + 2] = cp[2];
+                }
+                this.nContext = nCtx;
+                this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.contextBuf);
+                this.gl.bufferData(this.gl.ARRAY_BUFFER, cpos, this.gl.STATIC_DRAW);
+            }
+            var hullVerts = hullLineVerts();
+            if (hullVerts.length) {
+                this.nHullLine = hullVerts.length / 3;
+                this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.hullLineBuf);
+                this.gl.bufferData(this.gl.ARRAY_BUFFER, hullVerts, this.gl.STATIC_DRAW);
+            }
+        }
+        var drawn = selectDrawnEdges();
+        var linePos = [];
+        this.edgeIndex = [];
+        for (var e = 0; e < drawn.length; e += 2) {
+            var a = nodeXYZ(drawn[e]);
+            var b = nodeXYZ(drawn[e + 1]);
+            if (!a || !b) {
+                continue;
+            }
             linePos.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+            this.edgeIndex.push(drawn[e], drawn[e + 1]);
         }
         this.nLineVerts = linePos.length / 3;
         this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.lineBuf);
         this.gl.bufferData(this.gl.ARRAY_BUFFER, new Float32Array(linePos), this.gl.STATIC_DRAW);
-        this.peak = maxAbsState();
+        var nf = nFeatures();
+        this.nSensor = 0;
+        // Hide sensor strip when malecns_anatomy.
+        if (hullMode() === "schematic_cns" && nf) {
+            this.nSensor = nf;
+            var sp = new Float32Array(nf * 3);
+            for (i = 0; i < nf; i++) {
+                var s = sensorXYZ(i, nf);
+                sp[i * 3] = s[0];
+                sp[i * 3 + 1] = s[1];
+                sp[i * 3 + 2] = s[2];
+            }
+            this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.sensorBuf);
+            this.gl.bufferData(this.gl.ARRAY_BUFFER, sp, this.gl.STATIC_DRAW);
+        }
+        this.peak = maxAbs(states);
+        this.inPeak = maxAbs(inputs);
         this.resize();
     };
 
@@ -425,7 +1423,7 @@
             return;
         }
         var w = canvas.clientWidth || 640;
-        var h = canvas.clientHeight || 400;
+        var h = canvas.clientHeight || canvasHeight();
         canvas.width = w;
         canvas.height = h;
         this.gl.viewport(0, 0, w, h);
@@ -452,7 +1450,7 @@
         out[15] = 0;
     }
 
-    function lookAt(out, eye, center) {
+    function lookAt(out, eye, center, up) {
         var zx = eye[0] - center[0];
         var zy = eye[1] - center[1];
         var zz = eye[2] - center[2];
@@ -460,9 +1458,12 @@
         zx /= zl;
         zy /= zl;
         zz /= zl;
-        var ux = 0;
-        var uy = 1;
-        var uz = 0;
+        var ux = up && up.length ? Number(up[0]) || 0 : 0;
+        var uy = up && up.length ? Number(up[1]) || 0 : 1;
+        var uz = up && up.length ? Number(up[2]) || 0 : 0;
+        if (ux === 0 && uy === 0 && uz === 0) {
+            uy = 1;
+        }
         var xx = uy * zz - uz * zy;
         var xy = uz * zx - ux * zz;
         var xz = ux * zy - uy * zx;
@@ -505,57 +1506,190 @@
         return o;
     }
 
-    WebGLRenderer.prototype.render = function (values) {
+    WebGLRenderer.prototype.render = function (values, inRow) {
         var gl = this.gl;
         if (!gl || !this.program) {
             return;
         }
+        var vis = this.visIndex || [];
         var n = this.nPoints;
-        var col = new Float32Array(n * 3);
-        for (var i = 0; i < n; i++) {
-            var c = colorFromValue(values[i] || 0, this.peak);
-            col[i * 3] = c.r;
-            col[i * 3 + 1] = c.g;
-            col[i * 3 + 2] = c.b;
+        var col = new Float32Array(Math.max(n, 1) * 3);
+        var sz = new Float32Array(Math.max(n, 1));
+        var idleSz = new Float32Array(Math.max(n, 1));
+        var i;
+        var anatomy = isAnatomy();
+        var nScale = nodeSizeScale();
+        for (i = 0; i < n; i++) {
+            var ni = vis[i];
+            var c = colorFromValue(values[ni] || 0, this.peak);
+            var active = reservoirActive(values[ni] || 0, this.peak);
+            col[i * 3] = active ? c.r : 0;
+            col[i * 3 + 1] = active ? c.g : 0;
+            col[i * 3 + 2] = active ? c.b : 0;
+            sz[i] = active ? (anatomy ? lerp(3.2, 7.2, c.t) : lerp(4.4, 11, c.t)) * nScale : 0;
+            idleSz[i] = active ? 0 : (anatomy ? 2.1 : 3.4) * nScale;
         }
         gl.bindBuffer(gl.ARRAY_BUFFER, this.colorBuf);
         gl.bufferData(gl.ARRAY_BUFFER, col, gl.DYNAMIC_DRAW);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.sizeBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, sz, gl.DYNAMIC_DRAW);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.idleSizeBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, idleSz, gl.DYNAMIC_DRAW);
 
-        var radius = extentRadius() * 2.6 + 1.2;
-        var eye = [
-            radius * Math.cos(rotY) * Math.cos(rotX),
-            radius * Math.sin(rotX),
-            radius * Math.sin(rotY) * Math.cos(rotX)
-        ];
+        var pose = cameraPose(this._aspect || 1);
+        var near = clamp(pose.dist * 0.018, 0.0008, 0.08);
+        var far = Math.max(pose.dist * 28, extentRadius() * 16, 10);
         var proj = new Float32Array(16);
         var view = new Float32Array(16);
-        perspective(proj, (55 * Math.PI) / 180, this._aspect || 1, 0.01, 100);
-        lookAt(view, eye, [0, 0, 0]);
+        perspective(proj, (pose.fov * Math.PI) / 180, this._aspect || 1, near, far);
+        lookAt(view, pose.eye, pose.target, pose.up);
         var mvp = mul4(proj, view);
 
-        gl.clearColor(0.067, 0.067, 0.067, 1);
+        gl.clearColor(0.0157, 0.0275, 0.047, 1);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-        gl.enable(gl.DEPTH_TEST);
+        gl.disable(gl.DEPTH_TEST);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
         gl.useProgram(this.program);
         var uMVP = gl.getUniformLocation(this.program, "uMVP");
+        var uSize = gl.getUniformLocation(this.program, "uSizeMul");
         gl.uniformMatrix4fv(uMVP, false, mvp);
         var aPos = gl.getAttribLocation(this.program, "aPos");
         var aCol = gl.getAttribLocation(this.program, "aCol");
-        if (this.nLineVerts) {
-            gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
+        var aSize = gl.getAttribLocation(this.program, "aSize");
+        var self = this;
+        var lineProg = this.lineProgram;
+        var bindLineProg = function (alpha) {
+            if (!lineProg) {
+                return false;
+            }
+            gl.useProgram(lineProg);
+            gl.uniformMatrix4fv(gl.getUniformLocation(lineProg, "uMVP"), false, mvp);
+            gl.uniform1f(gl.getUniformLocation(lineProg, "uAlpha"), alpha);
+            return true;
+        };
+        var bindPointProg = function () {
+            gl.useProgram(self.program);
+            gl.uniformMatrix4fv(uMVP, false, mvp);
+        };
+
+        if (this.nContext) {
+            gl.uniform1f(uSize, Math.max(1.15, contextSizeScale(this.nContext) * 26));
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.contextBuf);
             gl.enableVertexAttribArray(aPos);
             gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
             gl.disableVertexAttribArray(aCol);
-            gl.vertexAttrib3f(aCol, 0.27, 0.33, 0.4);
-            gl.drawArrays(gl.LINES, 0, this.nLineVerts);
+            gl.vertexAttrib3f(aCol, 0.38, 0.43, 0.48);
+            gl.disableVertexAttribArray(aSize);
+            gl.vertexAttrib1f(aSize, 2.0);
+            gl.drawArrays(gl.POINTS, 0, this.nContext);
         }
+        if (this.nHullLine && bindLineProg(0.18)) {
+            var laPos = gl.getAttribLocation(lineProg, "aPos");
+            var laCol = gl.getAttribLocation(lineProg, "aCol");
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.hullLineBuf);
+            gl.enableVertexAttribArray(laPos);
+            gl.vertexAttribPointer(laPos, 3, gl.FLOAT, false, 0, 0);
+            gl.disableVertexAttribArray(laCol);
+            gl.vertexAttrib3f(laCol, 0.28, 0.33, 0.38);
+            gl.drawArrays(gl.LINES, 0, this.nHullLine);
+            bindPointProg();
+        }
+        if (this.nHull) {
+            gl.uniform1f(uSize, 1.0);
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.hullBuf);
+            gl.enableVertexAttribArray(aPos);
+            gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+            gl.disableVertexAttribArray(aCol);
+            gl.vertexAttrib3f(aCol, 0.12, 0.22, 0.3);
+            gl.disableVertexAttribArray(aSize);
+            gl.vertexAttrib1f(aSize, 3.0);
+            gl.drawArrays(gl.POINTS, 0, this.nHull);
+        }
+        if (this.nLineVerts) {
+            var lc = new Float32Array(this.nLineVerts * 3);
+            var thr = ACTIVITY_T * this.peak;
+            for (i = 0; i < this.edgeIndex.length; i += 2) {
+                var sa = Math.abs(Number(values[this.edgeIndex[i]] || 0));
+                var sb = Math.abs(Number(values[this.edgeIndex[i + 1]] || 0));
+                var hot = sa >= thr && sb >= thr;
+                var r = hot ? (anatomy ? 0.42 : 0.72) : anatomy ? 0.1 : 0.16;
+                var g = hot ? (anatomy ? 0.48 : 0.7) : anatomy ? 0.14 : 0.22;
+                var b = hot ? (anatomy ? 0.52 : 0.48) : anatomy ? 0.18 : 0.3;
+                var a = i * 3;
+                lc[a] = r;
+                lc[a + 1] = g;
+                lc[a + 2] = b;
+                lc[a + 3] = r;
+                lc[a + 4] = g;
+                lc[a + 5] = b;
+            }
+            if (bindLineProg(anatomy ? 0.12 : 0.28)) {
+                var eaPos = gl.getAttribLocation(lineProg, "aPos");
+                var eaCol = gl.getAttribLocation(lineProg, "aCol");
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
+                gl.enableVertexAttribArray(eaPos);
+                gl.vertexAttribPointer(eaPos, 3, gl.FLOAT, false, 0, 0);
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.lineColorBuf);
+                gl.bufferData(gl.ARRAY_BUFFER, lc, gl.DYNAMIC_DRAW);
+                gl.enableVertexAttribArray(eaCol);
+                gl.vertexAttribPointer(eaCol, 3, gl.FLOAT, false, 0, 0);
+                gl.drawArrays(gl.LINES, 0, this.nLineVerts);
+                bindPointProg();
+            }
+        }
+        gl.uniform1f(uSize, 1.0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.buf);
+        gl.enableVertexAttribArray(aPos);
+        gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+        gl.disableVertexAttribArray(aCol);
+        gl.vertexAttrib3f(aCol, anatomy ? 0.035 : 0.06, anatomy ? 0.045 : 0.09, anatomy ? 0.055 : 0.12);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.idleSizeBuf);
+        gl.enableVertexAttribArray(aSize);
+        gl.vertexAttribPointer(aSize, 1, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.POINTS, 0, n);
+
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+        gl.uniform1f(uSize, anatomy ? 1.25 : 1.55);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.buf);
         gl.enableVertexAttribArray(aPos);
         gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.colorBuf);
         gl.enableVertexAttribArray(aCol);
         gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.sizeBuf);
+        gl.enableVertexAttribArray(aSize);
+        gl.vertexAttribPointer(aSize, 1, gl.FLOAT, false, 0, 0);
         gl.drawArrays(gl.POINTS, 0, n);
+        if (!anatomy) {
+            gl.uniform1f(uSize, 1.0);
+            gl.drawArrays(gl.POINTS, 0, n);
+        }
+        if (this.nSensor && inRow) {
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+            var sc = new Float32Array(this.nSensor * 3);
+            var ssz = new Float32Array(this.nSensor);
+            for (i = 0; i < this.nSensor; i++) {
+                var ic = colorFromValue(inRow[i] || 0, this.inPeak);
+                sc[i * 3] = ic.r;
+                sc[i * 3 + 1] = ic.g;
+                sc[i * 3 + 2] = ic.b;
+                ssz[i] = 10;
+            }
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.sensorBuf);
+            gl.enableVertexAttribArray(aPos);
+            gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.sensorColorBuf);
+            gl.bufferData(gl.ARRAY_BUFFER, sc, gl.DYNAMIC_DRAW);
+            gl.enableVertexAttribArray(aCol);
+            gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, 0, 0);
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.sizeBuf);
+            gl.bufferData(gl.ARRAY_BUFFER, ssz, gl.DYNAMIC_DRAW);
+            gl.enableVertexAttribArray(aSize);
+            gl.vertexAttribPointer(aSize, 1, gl.FLOAT, false, 0, 0);
+            gl.uniform1f(uSize, 1.2);
+            gl.drawArrays(gl.POINTS, 0, this.nSensor);
+        }
     };
 
     function initRenderer() {
@@ -592,10 +1726,15 @@
         } else {
             lastTs = 0;
         }
-        var values = sampleState(frameIndex);
-        if (renderer && renderer.render) {
-            renderer.render(values);
+        if (!dragging && hullMode() === "schematic_cns") {
+            rotY += 0.00032;
         }
+        var values = sampleState(frameIndex);
+        var inRow = sampleInputs(frameIndex);
+        if (renderer && renderer.render) {
+            renderer.render(values, inRow);
+        }
+        updateHud(values);
     }
 
     canvas.addEventListener("mousedown", function (ev) {
@@ -611,17 +1750,25 @@
             return;
         }
         rotY += (ev.clientX - lastX) * 0.01;
-        rotX = clamp(rotX + (ev.clientY - lastY) * 0.01, -1.2, 1.2);
+        rotX = clamp(rotX + (ev.clientY - lastY) * 0.01, -1.15, 1.15);
         lastX = ev.clientX;
         lastY = ev.clientY;
     });
+    canvas.addEventListener(
+        "wheel",
+        function (ev) {
+            ev.preventDefault();
+            var limits = camDistLimits();
+            var next = camDist * (ev.deltaY > 0 ? 1.1 : 0.9);
+            camDist = clamp(next, limits.min, limits.max);
+        },
+        { passive: false }
+    );
     window.addEventListener("resize", function () {
         if (renderer && renderer.resize) {
             renderer.resize();
         }
-        if (window.Streamlit && window.Streamlit.setFrameHeight) {
-            window.Streamlit.setFrameHeight(document.body.scrollHeight);
-        }
+        syncFrameHeight();
     });
 
     buildControls();
@@ -631,13 +1778,9 @@
     if (window.Streamlit) {
         window.Streamlit.onRender(function (event) {
             applyArgs(event.args || {});
-            if (window.Streamlit.setFrameHeight) {
-                window.Streamlit.setFrameHeight(document.body.scrollHeight);
-            }
+            syncFrameHeight();
         });
         window.Streamlit.setComponentReady();
-        if (window.Streamlit.setFrameHeight) {
-            window.Streamlit.setFrameHeight(document.body.scrollHeight);
-        }
+        syncFrameHeight();
     }
 })();

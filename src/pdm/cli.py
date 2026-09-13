@@ -31,6 +31,7 @@ def doctor() -> dict:
     import torch
     import yaml
 
+    from pdm.connectome.anatomy import find_soma_table_path
     from pdm.connectome.sources import default_malemcns_path
     from pdm.models import PDMNet
 
@@ -43,6 +44,7 @@ def doctor() -> dict:
     loss.backward()
     fwd_ok = bool(torch.isfinite(y).all().item())
     grad_ok = all(p.grad is not None for p in net.parameters() if p.requires_grad)
+    soma_path = find_soma_table_path()
 
     writable = {}
     for name, path in {"raw": data_raw(), "processed": data_processed(), "runs": runs_root()}.items():
@@ -73,6 +75,8 @@ def doctor() -> dict:
         "pytest": pytest.__version__,
         "networkx": networkx.__version__,
         "malemcns_present": default_malemcns_path().is_file(),
+        "soma_table_present": soma_path is not None,
+        "soma_table_path": str(soma_path) if soma_path is not None else None,
         "device": info.name,
         "device_fallback": info.fallback_reason,
         "forward_backward_ok": fwd_ok and grad_ok,

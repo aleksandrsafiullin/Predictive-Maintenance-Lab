@@ -72,6 +72,14 @@ def run_job(job: dict) -> None:
     pid_path().write_text(str(os.getpid()), encoding="utf-8")
     log_lines: list[str] = []
 
+    if kind != "train":
+        try:
+            from pdm.visualization.live import clear_live_activity
+
+            clear_live_activity()
+        except Exception:  # noqa: BLE001
+            pass
+
     def log(msg: str) -> None:
         log_lines.append(msg)
         print(msg, flush=True)

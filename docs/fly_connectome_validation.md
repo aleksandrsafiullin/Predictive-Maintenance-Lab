@@ -47,7 +47,7 @@ Clamp vs raise:
 | `test_no_cdn_in_frontend` | `tests/test_neural_explorer.py` | No `https://` script/module src; no unpkg / jsDelivr / cdnjs / googleapis, including the component bridge |
 | `test_screen_switch_by_label` | `tests/test_neural_explorer.py` | AppTest selects Screen by **label**, not radio index |
 | `test_worker_busy_shows_error_not_inline` | `tests/test_neural_explorer.py` | Build trace while worker busy → error caption, no inline inference |
-| `test_gru_run_does_not_show_fake_biological_activity` | `tests/test_neural_explorer.py` | GRU run shows “Neural Activity Explorer requires a reservoir run” |
+| `test_gru_run_does_not_show_fake_biological_activity` | `tests/test_neural_explorer.py` | GRU run shows “Neural Activity Explorer requires a reservoir run.” |
 | `test_explorer_caption_present` | `tests/test_neural_explorer.py` | Required computational-activity caption + synthetic disclaimer |
 | `test_synthetic_banner_present` | `tests/test_neural_explorer.py` | Synthetic banner when `is_synthetic=True` |
 | `test_explorer_screen_present_in_app` | `tests/test_neural_explorer.py` | Explicit 4-way Screen radio |
@@ -64,6 +64,6 @@ Existing GRU/LSTM leakage, Weibull censoring, and AppTest suites in `tests/test_
 
 - Full MaleCNS download from GCS
 - 30-epoch reservoir accuracy on XJTU-SY / HSE
-- Browser visual verification of the WebGL explorer (AppTest is the merge gate)
+- Browser visual verification of the WebGL explorer. **AppTest does not certify WebGL look**; pytest greps + payload flags are the merge gate
 
 The synthetic fixture is **not a biological connectome**. Do not treat smoke metrics or explorer frames as model quality.

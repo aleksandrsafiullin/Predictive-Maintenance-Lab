@@ -144,7 +144,13 @@ LSTM: same flags with `--arch lstm`.
 
 ### Fly connectome reservoir (experimental)
 
-Synthetic graph (demo / CI):
+Synthetic graph (demo / CI). Synthetic test graph — not a biological connectome. `--smoke` is not a quality benchmark.
+
+```bash
+.venv/bin/python -m pdm train --dataset bearings --arch fly_connectome_reservoir --smoke --n-nodes 8
+```
+
+Equivalent with explicit graph mode:
 
 ```bash
 .venv/bin/python -m pdm train --dataset bearings --arch fly_connectome_reservoir \
@@ -258,6 +264,7 @@ scripts/          setup.sh / run.sh (and Windows .ps1)
 - [docs/fly_connectome.md](docs/fly_connectome.md) — MaleCNS import, graph orientation, sampling  
 - [docs/fly_connectome_demo.md](docs/fly_connectome_demo.md) — short connectome demo commands  
 - [docs/neural_activity_explorer.md](docs/neural_activity_explorer.md) — Explorer meaning and limits  
+- [docs/malecns_visualization.md](docs/malecns_visualization.md) — optional soma viz (CC-BY; not a required setup step)  
 - [docs/fly_connectome_validation.md](docs/fly_connectome_validation.md) — what was verified  
 
 ---

@@ -1539,13 +1539,15 @@ def test_stop_flag_sets_cancelled_not_completed(monkeypatch, tmp_path):
     assert status not in {"completed", "stopped"}
 
 
-def test_app_explorer_comparison_by_label_no_exception():
+def test_app_explorer_comparison_by_label_no_exception(tmp_path, monkeypatch):
     """Explorer + comparison widgets must not raise; screens stay selectable by label."""
     from streamlit.testing.v1 import AppTest
 
     from pdm.paths import project_root
-    from pdm.visualization.explorer import EXPLORER_DISCLAIMER
+    from pdm.visualization.explorer import EXPLORER_DISCLAIMER, clear_soma_table_cache
 
+    monkeypatch.setattr("pdm.connectome.anatomy.default_soma_dir", lambda: tmp_path)
+    clear_soma_table_cache()
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception

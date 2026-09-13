@@ -119,7 +119,11 @@ Written to `runs/<dataset>/<run_id>/connectome/provenance.json`:
 | `graph_hash` | Canonical SHA-256 of nodes/edges |
 | `is_synthetic` | `true` for the fixture; never auto-promote |
 
-Also stored: `connectome/graph.json`, `connectome/layout.json` (anatomical xyz when present, otherwise topological spring layout).
+Also stored: `connectome/graph.json`, `connectome/layout.json` from `layout_positions()` spring (2D or 3D — **schematic, not FlyEM anatomy**), `connectome/weights.npz`.
+
+## Soma xyz (viz only)
+
+Optional MaleCNS **body-annotations** xyz is joined in the Neural Activity Explorer at display time. It does not change ESN `n_nodes` (still 500–2000 for `real_connectome`) and is **not** written over run `connectome/provenance.json`. `layout.json` spring remains schematic. Allowlist, CC-BY, and reference URLs: [malecns_visualization.md](malecns_visualization.md).
 
 ## Cancel status
 
@@ -129,4 +133,5 @@ Worker jobs that see `stop.flag` / `should_stop()` write status **`cancelled`**.
 
 - Demo commands: [fly_connectome_demo.md](fly_connectome_demo.md)
 - Explorer: [neural_activity_explorer.md](neural_activity_explorer.md)
+- Soma viz (optional, not a setup step): [malecns_visualization.md](malecns_visualization.md)
 - Test map: [fly_connectome_validation.md](fly_connectome_validation.md)

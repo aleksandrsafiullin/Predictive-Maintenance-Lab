@@ -61,6 +61,7 @@ class UnitWindowDataset(Dataset):
         self.feature_names = feature_names
         self.time_scale_s = time_scale_s
         self.arrays: dict[str, np.ndarray] = {}
+        self.timestamps: dict[str, np.ndarray] = {}
         self.index: list[tuple[str, int, int, float, float, int]] = []
         rng = np.random.RandomState(seed)
         by_unit = defaultdict(list)
@@ -70,6 +71,10 @@ class UnitWindowDataset(Dataset):
         }
         for uid, g in feat_sorted.items():
             self.arrays[str(uid)] = g[feature_names].to_numpy(dtype=np.float32)
+            if "timestamp_s" in g.columns:
+                self.timestamps[str(uid)] = g["timestamp_s"].to_numpy(dtype=np.float64)
+            else:
+                self.timestamps[str(uid)] = np.arange(len(g), dtype=np.float64)
         for _, w in windows.iterrows():
             uid = str(w["unit_id"])
             duration = float(w.get("duration_s", w.get("target_rul_s", np.nan)))
@@ -87,7 +92,8 @@ class UnitWindowDataset(Dataset):
 
     def __getitem__(self, i: int):
         uid, start, end, target, duration, event = self.index[i]
-        x = self.arrays[uid][start : end + 1]
+        x = np.ascontiguousarray(self.arrays[uid][start : end + 1])
+        ts = self.timestamps[uid][start : end + 1]
         return {
             "x": torch.from_numpy(x),
             "target": torch.tensor(target, dtype=torch.float32),
@@ -95,6 +101,7 @@ class UnitWindowDataset(Dataset):
             "event": torch.tensor(event, dtype=torch.float32),
             "unit_id": uid,
             "window_index": int(i),
+            "timestamps_s": ts.copy(),
         }
 
 
@@ -460,6 +467,43 @@ def _apply_saved_model_to_mcfg(mcfg: dict[str, Any], saved_cfg: dict[str, Any]) 
         mcfg["history_length"] = int(saved_model["history_length"])
 
 
+def _try_live_activity_snapshot(
+    model,
+    probe_x,
+    *,
+    architecture: str,
+    dataset_id: str,
+    run_id: str,
+    epoch: int | None,
+    unit_id: str | None,
+    should_stop: StopFn | None,
+    log: LogFn | None = None,
+    window_timestamps_s: np.ndarray | None = None,
+) -> bool:
+    """Write worker live_activity artifacts. Never put arrays in status.json."""
+    from pdm.visualization.live import write_training_live_snapshot
+
+    try:
+        return bool(
+            write_training_live_snapshot(
+                model,
+                probe_x,
+                architecture=architecture,
+                dataset_id=dataset_id,
+                run_id=run_id,
+                epoch=epoch,
+                unit_id=unit_id,
+                node_order=list(getattr(model, "node_order", []) or []),
+                window_timestamps_s=window_timestamps_s,
+                should_stop=should_stop,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log(f"live activity snapshot skipped: {exc}")
+        return False
+
+
 def run_training(
     dataset_id: str,
     *,
@@ -706,6 +750,16 @@ def run_training(
         num_workers=0,
         collate_fn=_collate,
     )
+    live_probe_x = None
+    live_probe_uid = None
+    live_probe_ts = None
+    if len(train_ds):
+        probe_item = train_ds[0]
+        live_probe_x = probe_item["x"].detach().clone()
+        live_probe_uid = str(probe_item["unit_id"])
+        ts = probe_item.get("timestamps_s")
+        if ts is not None:
+            live_probe_ts = np.asarray(ts, dtype=np.float64).copy()
     sel_spec = selection_metric_spec(dataset_id)
 
     readout_kind = str((mcfg.get("reservoir") or {}).get("readout") or "").strip().lower()
@@ -768,6 +822,11 @@ def run_training(
         atomic_write_json(rdir / "data_manifest.json", json.loads(manifest_src.read_text()))
     if is_reservoir(mcfg["architecture"]):
         _write_connectome_artifacts(rdir, model)
+    from pdm.visualization.live import clear_live_activity, write_live_activity
+
+    clear_live_activity()
+    if not is_reservoir(mcfg["architecture"]):
+        write_live_activity(architecture=str(mcfg["architecture"]), status="not_reservoir")
     log_path = rdir / "train.log"
     hist_path = rdir / "training_history.csv"
     hist_cols = _history_columns(hist_path)
@@ -831,6 +890,19 @@ def run_training(
                 emit=emit,
                 log=_log,
             )
+            if last_status != "cancelled":
+                _try_live_activity_snapshot(
+                    model,
+                    live_probe_x,
+                    architecture=str(mcfg["architecture"]),
+                    dataset_id=dataset_id,
+                    run_id=run_id,
+                    epoch=best_epoch,
+                    unit_id=live_probe_uid,
+                    should_stop=should_stop,
+                    log=_log,
+                    window_timestamps_s=live_probe_ts,
+                )
         else:
             for epoch in range(start_epoch, int(mcfg["max_epochs"]) + 1):
                 if should_stop and should_stop():
@@ -922,6 +994,20 @@ def run_training(
                 )
                 _log(msg)
                 append_line(log_path, msg)
+                live_ok = False
+                if is_reservoir(mcfg["architecture"]):
+                    live_ok = _try_live_activity_snapshot(
+                        model,
+                        live_probe_x,
+                        architecture=str(mcfg["architecture"]),
+                        dataset_id=dataset_id,
+                        run_id=run_id,
+                        epoch=epoch,
+                        unit_id=live_probe_uid,
+                        should_stop=should_stop,
+                        log=_log,
+                        window_timestamps_s=live_probe_ts,
+                    )
                 emit(
                     "training",
                     epoch=epoch,
@@ -936,6 +1022,7 @@ def run_training(
                     n_gradient_draws=n_gradient_draws,
                     n_unique_sampled_windows=n_unique_sampled_windows,
                     message=msg,
+                    **({"live_activity": True} if live_ok else {}),
                 )
                 atomic_write_json(
                     rdir / "validation_metrics.json",

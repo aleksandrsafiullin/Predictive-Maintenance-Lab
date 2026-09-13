@@ -81,18 +81,27 @@ from pdm.visualization.explorer import (
     EXPLORER_DISCLAIMER,
     EXPLORER_MODES,
     INLINE_TRACE_MAX_NODES,
+    LIVE_CONTEXT_CAP,
     RESERVOIR_REQUIRED_MESSAGE,
     WORKER_BUSY_MESSAGE,
     alert_jump_target,
-    build_explorer_payload,
+    build_ui_explorer_payload,
     collect_alert_rows,
+    explorer_anatomy_captions,
+    explorer_overlay_clock,
     fallback_positions,
+    is_active_train_live,
     load_scene_from_run,
+    selected_trace_predicted_rul,
     slice_trace_to_alert,
+    soma_join_allowed,
     stored_alert_prediction,
+    subset_scene,
     synthetic_banner_required,
 )
 from pdm.visualization.export import load_trace
+from pdm.visualization.live import load_live_activity
+from pdm.visualization.overlay import OVERLAY_HISTORY_CAPTION, build_work_overlay_figure
 from pdm.visualization.trace import run_trace_job
 from pdm.worker import read_status, request_stop, worker_alive
 
@@ -560,6 +569,7 @@ def screen_train(dataset_id: str) -> None:
         )
         st.caption(_windows_used_caption(ws))
         st.caption(ws.get("message") or "")
+        _render_train_live_activity(dataset_id, ws)
         _auto_refresh()
     if ws.get("status") == "failed":
         st.error(ws.get("error"))
@@ -677,6 +687,202 @@ def screen_train(dataset_id: str) -> None:
             st.json(vm)
 
 
+def _explorer_mode_label(mode: str) -> str:
+    return {
+        "Overview": "Overview — full window",
+        "Equipment replay": "Equipment replay — follow Test & Replay time",
+        "Inside prediction window": "Inside prediction window — what the model saw",
+        "Alert inspection": "Alert inspection — at a stored warning",
+    }.get(mode, mode)
+
+
+def _reservoir_live_activity(ws: dict | None = None) -> dict | None:
+    live = load_live_activity()
+    if not live:
+        return None
+    if str(live.get("status") or "") == "not_reservoir":
+        return None
+    arch = str(live.get("architecture") or (ws or {}).get("architecture") or "")
+    if not is_reservoir(arch):
+        return None
+    if live.get("states") is None:
+        return None
+    return live
+
+
+def _active_train_live(ws: dict | None = None) -> dict | None:
+    rec = ws if ws is not None else {}
+    live = _reservoir_live_activity(rec)
+    if not is_active_train_live(
+        worker_alive=worker_alive(),
+        worker_kind=rec.get("kind"),
+        live=live,
+    ):
+        return None
+    return live
+
+
+def _run_n_model(rec: dict | None) -> int | None:
+    """ESN width from the run row. Never ``len(display nodes)`` after a live cap."""
+    rec = rec or {}
+    raw = rec.get("n_nodes")
+    if raw is None:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _emit_explorer_anatomy_captions(
+    payload: dict,
+    *,
+    is_synthetic: bool,
+    schema_error: str | None,
+) -> None:
+    for line in explorer_anatomy_captions(
+        payload, is_synthetic=is_synthetic, schema_error=schema_error
+    ):
+        st.caption(line)
+
+
+def _render_train_live_activity(
+    dataset_id: str,  # UI dataset unused; live scene uses live dataset_id + run_id
+    ws: dict,
+    *,
+    component_key: str = "train_live_activity",
+) -> None:
+    """Compact reservoir viewer. GRU/LSTM and leftover files skip the widget."""
+    live = _active_train_live(ws)
+    if live is None:
+        return
+    st.caption("Live training — train-split window only")
+    probe = str(live.get("unit_id") or "").strip()
+    if probe:
+        st.caption(f"Probe unit `{probe}` (train-split window). Not a living fly recording.")
+    else:
+        st.caption("Training activity from a train-split window. Not a living fly recording.")
+    run_id = str(live.get("run_id") or "")
+    ds = str(live.get("dataset_id") or "")
+    scene: dict = {"nodes": [], "edges": [], "positions": {}}
+    order = [str(n) for n in (live.get("node_order") or [])]
+    rdir = None
+    if run_id and ds:
+        try:
+            rdir = run_dir(ds, run_id)
+            scene = load_scene_from_run(rdir, node_order=order or None)
+        except Exception:  # noqa: BLE001
+            scene = {"nodes": order, "edges": [], "positions": fallback_positions(order)}
+    if order:
+        scene = subset_scene(scene, order)
+    if not scene.get("nodes"):
+        scene["nodes"] = order
+    if not scene.get("positions") and scene.get("nodes"):
+        scene["positions"] = fallback_positions(scene["nodes"])
+    is_synthetic = synthetic_banner_required(scene, scene)
+    join_soma = soma_join_allowed(scene, scene)
+    payload, schema_error = build_ui_explorer_payload(
+        nodes=scene.get("nodes") or order,
+        edges=scene.get("edges") or [],
+        positions=scene.get("positions") or {},
+        states=live.get("states"),
+        inputs=live.get("inputs"),
+        predicted_rul_s=live.get("predicted_rul_s"),
+        frame_map=live.get("frame_map") or [],
+        flags={
+            "mode": "Overview",
+            "phase": "training",
+            "compact": True,
+            "is_synthetic": bool(scene.get("is_synthetic")) or is_synthetic,
+            "graph_mode": str(scene.get("graph_mode") or ""),
+            "architecture": str(live.get("architecture") or ""),
+            "downsampled": bool(live.get("downsampled")),
+            "stored_predicted_rul_s": live.get("predicted_rul_s"),
+        },
+        run_dir=rdir,
+        n_model=None,
+        join_soma=join_soma,
+        context_cap=LIVE_CONTEXT_CAP,
+    )
+    _emit_explorer_anatomy_captions(payload, is_synthetic=is_synthetic, schema_error=schema_error)
+    neural_activity_explorer(**payload, key=component_key)
+
+
+def _render_explorer_intro() -> None:
+    st.markdown(
+        "This tool watches a **connectome reservoir** read a bearing or filter history window "
+        "and estimate **remaining useful life**. Glowing dots are **computational units** whose "
+        "values come from the same inference as the forecast — not a living fly recording."
+    )
+    st.markdown(
+        "1. **Sensor window** — recent measurements fed into the reservoir  \n"
+        "2. **Reservoir activity** — computational units lighting up  \n"
+        "3. **Remaining-life estimate** — predicted time until failure / 600 Pa"
+    )
+
+
+def _explorer_now_s(
+    mode: str,
+    trace: dict | None,
+    replay_step: int,
+    alert_ts: float | None,
+    view: dict | None,
+) -> float | None:
+    return explorer_overlay_clock(
+        trace,
+        mode=mode,
+        replay_step=replay_step,
+        alert_ts=alert_ts,
+        view=view,
+    )
+
+
+def _explorer_status_label(trace: dict | None, alert_rows: list[dict], now_s: float | None) -> str:
+    rec = trace or {}
+    status = str(rec.get("status") or rec.get("valid_history_reason") or "")
+    if "Collecting history" in status:
+        return "Collecting history"
+    if now_s is not None:
+        for row in alert_rows or []:
+            ts = row.get("timestamp_s")
+            kind = str(row.get("type") or row.get("alert_status") or "").lower()
+            if _finite_number(ts) and float(ts) <= float(now_s) and "warn" in kind:
+                return "warning"
+    if rec.get("predicted_rul_s") is not None:
+        return "estimating"
+    return "Collecting history"
+
+
+def _payload_from_scene_trace(
+    *,
+    scene: dict,
+    trace: dict | None,
+    flags: dict,
+    predicted_rul_s=None,
+    run_dir=None,
+    n_model: int | None = None,
+    join_soma: bool = True,
+    context_cap: int | None = None,
+) -> tuple[dict, str | None]:
+    nodes = list(scene.get("nodes") or [])
+    states = (trace or {}).get("states")
+    return build_ui_explorer_payload(
+        nodes=nodes,
+        edges=scene.get("edges") or [],
+        positions=scene.get("positions") or {},
+        states=states,
+        inputs=(trace or {}).get("inputs"),
+        predicted_rul_s=predicted_rul_s if predicted_rul_s is not None else (trace or {}).get("predicted_rul_s"),
+        frame_map=(trace or {}).get("frame_map") or [],
+        flags=flags,
+        run_dir=run_dir,
+        n_model=n_model,
+        join_soma=join_soma,
+        context_cap=context_cap,
+    )
+
+
 def _render_architecture_comparison(dataset_id: str) -> None:
     """One canonical comparison table. Synthetic rows never share the real section."""
     st.markdown("**Architecture comparison**")
@@ -711,6 +917,7 @@ def _render_architecture_comparison(dataset_id: str) -> None:
 def screen_explorer(dataset_id: str) -> None:
     st.header(f"Neural Activity Explorer — {LABELS[dataset_id]}")
     st.caption(EXPLORER_DISCLAIMER)
+    _render_explorer_intro()
 
     table = [r for r in list_runs(dataset_id) if r.get("has_best") or r.get("has_last")]
     reservoir_rows = [r for r in table if is_reservoir(str(r.get("architecture") or ""))]
@@ -752,8 +959,14 @@ def screen_explorer(dataset_id: str) -> None:
     if not reservoir:
         st.info(RESERVOIR_REQUIRED_MESSAGE)
 
-    mode = st.radio("Mode", list(EXPLORER_MODES), horizontal=True)
+    mode = st.radio(
+        "Mode",
+        list(EXPLORER_MODES),
+        horizontal=True,
+        format_func=_explorer_mode_label,
+    )
 
+    bundle = None
     unit_ids: list[str] = []
     if processed_ready(dataset_id):
         bundle = load_processed(dataset_id)
@@ -824,60 +1037,175 @@ def screen_explorer(dataset_id: str) -> None:
             st.rerun()
 
     ws = read_status()
+    live = _active_train_live(ws)
     if worker_alive() and ws.get("kind") == "trace":
         st.info("Building trace…")
         if st.button("Stop", key="explorer_stop"):
             request_stop()
             st.rerun()
         _auto_refresh()
+    elif live is not None:
+        _auto_refresh()
+    if live is not None:
+        _render_train_live_activity(dataset_id, ws, component_key="explorer_train_live")
 
-    _render_architecture_comparison(dataset_id)
-
-    if not uid:
-        return
-    tdir = run_traces_dir(dataset_id, str(run_id), str(uid))
-    if not (tdir / "meta.json").exists():
-        if mode == "Alert inspection":
-            st.caption("Select an alert to view its trace")
-        st.caption("No trace yet. Click Build trace.")
-        return
-    try:
-        trace = load_trace(tdir)
-    except Exception as exc:  # noqa: BLE001
-        st.error(str(exc))
-        return
-    if str(trace.get("status") or "").startswith("traces require"):
+    trace = None
+    has_trace = False
+    if uid:
+        tdir = run_traces_dir(dataset_id, str(run_id), str(uid))
+        if (tdir / "meta.json").exists():
+            try:
+                trace = load_trace(tdir)
+                has_trace = True
+            except Exception as exc:  # noqa: BLE001
+                st.error(str(exc))
+                trace = None
+        else:
+            if mode == "Alert inspection":
+                st.caption("Select an alert to view its trace")
+            st.caption("No trace yet. Click Build trace.")
+    if has_trace and str((trace or {}).get("status") or "").startswith("traces require"):
         st.info(RESERVOIR_REQUIRED_MESSAGE)
-        return
-
-    if mode == "Alert inspection" and alert_episode is not None:
+        has_trace = False
+        trace = None
+    if has_trace and mode == "Alert inspection" and alert_episode is not None:
         trace = slice_trace_to_alert(trace, alert_episode, timestamp_s=alert_ts)
-    elif mode == "Alert inspection" and alert_episode is None:
+    elif mode == "Alert inspection" and alert_episode is None and has_trace:
         st.caption("Select an alert to view its trace")
 
-    node_order = [str(n) for n in (trace.get("node_order") or scene.get("nodes") or [])]
-    scene = load_scene_from_run(rdir, node_order=node_order)
-    if not scene["nodes"]:
-        scene["nodes"] = node_order
-        scene["positions"] = fallback_positions(node_order)
+    display_scene = scene
+    node_order = [str(n) for n in ((trace or {}).get("node_order") or display_scene.get("nodes") or [])]
+    if node_order:
+        display_scene = load_scene_from_run(rdir, node_order=node_order)
+    if not display_scene.get("nodes"):
+        display_scene["nodes"] = node_order
+        display_scene["positions"] = fallback_positions(node_order)
 
-    payload = build_explorer_payload(
-        nodes=scene["nodes"],
-        edges=scene["edges"],
-        positions=scene["positions"],
-        states=trace.get("states"),
-        frame_map=trace.get("frame_map") or [],
-        flags={
-            "mode": mode,
-            "replay_step": int(st.session_state.get("replay_step", 0) or 0),
-            "alert_timestamp_s": alert_ts,
-            "is_synthetic": is_synthetic,
-            "graph_mode": graph_mode,
-            "architecture": arch,
-            "stored_predicted_rul_s": trace.get("predicted_rul_s"),
-        },
+    replay_step = int(st.session_state.get("replay_step", 0) or 0)
+    pred_rul = selected_trace_predicted_rul(trace if has_trace else None)
+    now_s = explorer_overlay_clock(
+        trace if has_trace else None,
+        mode=mode,
+        replay_step=replay_step,
+        alert_ts=alert_ts,
+        view=view,
+        live=live,
+        train_live=live is not None,
     )
-    neural_activity_explorer(**payload, key="neural_activity_explorer")
+    flags = {
+        "mode": mode,
+        "replay_step": replay_step,
+        "alert_timestamp_s": alert_ts,
+        "is_synthetic": is_synthetic or bool(display_scene.get("is_synthetic")),
+        "graph_mode": graph_mode or str(display_scene.get("graph_mode") or ""),
+        "architecture": arch,
+        "stored_predicted_rul_s": pred_rul,
+        "phase": "replay" if has_trace else "overview",
+        "now_timestamp_s": now_s,
+        "predicted_event_timestamp_s": (
+            float(now_s) + float(pred_rul) if _finite_number(now_s) and _finite_number(pred_rul) else None
+        ),
+        "history_length": int((trace or {}).get("n_history") or 0)
+        or int(((trace or {}).get("meta") or {}).get("history_length") or 0),
+        "downsampled": False,
+    }
+
+    if reservoir:
+        payload, schema_error = _payload_from_scene_trace(
+            scene=display_scene,
+            trace=trace if has_trace else None,
+            flags=flags,
+            predicted_rul_s=pred_rul,
+            run_dir=rdir,
+            n_model=_run_n_model(rec),
+            join_soma=soma_join_allowed(rec, display_scene),
+        )
+        _emit_explorer_anatomy_captions(
+            payload, is_synthetic=is_synthetic, schema_error=schema_error
+        )
+        neural_activity_explorer(**payload, key="neural_activity_explorer")
+
+    unit_feat = pd.DataFrame()
+    unit_meta = {}
+    if bundle is not None and uid:
+        feats = bundle.get("features")
+        if isinstance(feats, pd.DataFrame) and "unit_id" in feats.columns:
+            unit_feat = feats[feats["unit_id"].astype(str) == str(uid)].copy()
+        units_df = bundle.get("units")
+        if isinstance(units_df, pd.DataFrame) and "unit_id" in units_df.columns:
+            hit = units_df[units_df["unit_id"].astype(str) == str(uid)]
+            if not hit.empty:
+                unit_meta = hit.iloc[0].to_dict()
+
+    show_gt = st.checkbox("Show ground truth", value=False, key="explorer_show_gt")
+    hist_len = int(flags.get("history_length") or 0)
+    if hist_len <= 0 and has_trace:
+        hist_len = len((trace or {}).get("frame_map") or [])
+    overlay_now = now_s
+    if overlay_now is None and not unit_feat.empty and "timestamp_s" in unit_feat.columns:
+        overlay_now = float(pd.to_numeric(unit_feat["timestamp_s"], errors="coerce").max())
+    stored_pred = pred_rul if has_trace else None
+    event_t = unit_meta.get("event_time_s") if unit_meta else None
+    event_obs = bool(int(unit_meta.get("event_observed") or 0)) if unit_meta else False
+    pressure = None
+    if dataset_id == "filters":
+        try:
+            pressure = float(
+                load_run_pressure_limit_pa(rdir, load_dataset_config(dataset_id).get("pressure_limit_pa"))
+            )
+        except Exception:  # noqa: BLE001
+            pressure = 600.0
+    if not unit_feat.empty:
+        fig = build_work_overlay_figure(
+            dataset_id=dataset_id,
+            unit_features=unit_feat,
+            now_timestamp_s=overlay_now,
+            predicted_rul_s=stored_pred if has_trace else None,
+            history_length=hist_len or None,
+            show_gt=bool(show_gt),
+            event_time_s=float(event_t) if _finite_number(event_t) else None,
+            event_observed=event_obs,
+            pressure_limit_pa=pressure,
+        )
+        st.plotly_chart(fig, width="stretch")
+        st.caption(OVERLAY_HISTORY_CAPTION)
+
+    c1, c2, c3, c4 = st.columns(4)
+    filter_scale = dataset_id == "filters"
+    age_s = overlay_now if _finite_number(overlay_now) else None
+    disp_pred = stored_pred if has_trace else None
+    event_pred = None
+    if _finite_number(overlay_now) and _finite_number(disp_pred):
+        event_pred = float(overlay_now) + float(disp_pred)
+    if filter_scale:
+        c1.metric("Operating age (s, internal)", "—" if age_s is None else f"{float(age_s):.1f}")
+        c2.metric(
+            "Predicted RUL (s, internal)",
+            "—" if not _finite_number(disp_pred) else f"{float(disp_pred):.1f}",
+        )
+        c3.metric(
+            "Predicted event (s, internal)",
+            "—" if event_pred is None else f"{event_pred:.1f}",
+        )
+    else:
+        c1.metric("Operating age (min)", "—" if age_s is None else f"{float(age_s) / 60.0:.1f}")
+        c2.metric(
+            "Predicted RUL (min)",
+            "—" if not _finite_number(disp_pred) else f"{float(disp_pred) / 60.0:.1f}",
+        )
+        c3.metric(
+            "Predicted event (min)",
+            "—" if event_pred is None else f"{event_pred / 60.0:.1f}",
+        )
+    alert_rows: list[dict] = []
+    try:
+        alert_rows = collect_alert_rows(rdir, uid) if uid else []
+    except Exception:  # noqa: BLE001
+        alert_rows = []
+    c4.metric("Current status", _explorer_status_label(trace if has_trace else None, alert_rows, overlay_now))
+
+    with st.expander("Run table", expanded=False):
+        _render_architecture_comparison(dataset_id)
 
 
 def _replay_pressure_limit_pa(rdir, cfg: dict) -> float:
