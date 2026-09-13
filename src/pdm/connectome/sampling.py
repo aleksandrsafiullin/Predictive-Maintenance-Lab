@@ -157,8 +157,12 @@ def prepare_run_graph(
     ``RandomReservoir`` performs the degree-preserving rewiring.
     ``synthetic_fixture`` clamps; ``real_connectome`` validates range.
     ``source_path`` is the local MaleCNS feather used only for ``real_connectome``.
+
+    For ``real_connectome``: samples directly from the feather DataFrame (BFS on
+    sorted arrays). Never builds a full NetworkX graph of the ~152M-edge MaleCNS
+    connectome.
     """
-    from pdm.connectome.sources import load_malemcns, load_synthetic_fixture
+    from pdm.connectome.sources import load_malemcns_subgraph, load_synthetic_fixture
 
     arch = str(architecture or "").strip().lower()
     mode = str(graph_mode or GRAPH_MODE_SYNTHETIC).strip().lower()
@@ -169,16 +173,24 @@ def prepare_run_graph(
         parent_mode = GRAPH_MODE_SYNTHETIC
 
     if parent_mode == GRAPH_MODE_REAL:
-        src = load_malemcns(source_path)
+        if not (REAL_CONNECTOME_N_MIN <= int(n_nodes) <= REAL_CONNECTOME_N_MAX):
+            raise ValueError(
+                f"real_connectome n_nodes must be in "
+                f"[{REAL_CONNECTOME_N_MIN}, {REAL_CONNECTOME_N_MAX}], got {n_nodes}"
+            )
+        # BFS subgraph from feather — never builds full NetworkX graph
+        src = load_malemcns_subgraph(source_path, int(n_nodes), int(seed))
         if src.is_synthetic:
             parent_mode = GRAPH_MODE_SYNTHETIC
+        subgraph = src.graph
+        resolved = subgraph.number_of_nodes()
     else:
         src = load_synthetic_fixture()
         parent_mode = GRAPH_MODE_SYNTHETIC
+        resolved = resolve_n_nodes(parent_mode, int(n_nodes), src.graph.number_of_nodes())
+        node_list = sample_connected_subgraph(src.graph, resolved, int(seed))
+        subgraph = induced_subgraph(src.graph, node_list)
 
-    resolved = resolve_n_nodes(parent_mode, int(n_nodes), src.graph.number_of_nodes())
-    node_list = sample_connected_subgraph(src.graph, resolved, int(seed))
-    subgraph = induced_subgraph(src.graph, node_list)
     provenance = dict(src.provenance)
     provenance["n_nodes"] = int(subgraph.number_of_nodes())
     provenance["n_edges"] = int(subgraph.number_of_edges())

@@ -24,17 +24,30 @@ Place the feather file at `data/raw/connectome/connectome-weights-male-cns-v1.0-
 
 The loader does not download GCS objects. Missing files fall back to the synthetic fixture with `source=unavailable` and `graph_mode=synthetic_fixture` — never silently labeled `real_connectome`.
 
-Expected FlyEM-style columns: `pre`, `post`, and `synapse_count` (or `weight`). Unknown columns are not invented.
+Expected FlyEM-style columns: `body_pre`/`pre`, `body_post`/`post`, and `weight` (or `synapse_count`). Unknown columns are not invented.
 
 ## Local path import
 
 ```bash
-.venv/bin/python -m pdm train --dataset bearings --arch fly_connectome_reservoir --graph-mode real_connectome --source-path /path/to/file.feather
+.venv/bin/python -m pdm train --dataset bearings --arch fly_connectome_reservoir --graph-mode real_connectome --n-nodes 1000 --source-path /path/to/file.feather
 ```
 
 `--source-path` may be a `.feather` file or a directory that contains the preferred filename. Default search path when `--source-path` is omitted: `data/raw/connectome/connectome-weights-male-cns-v1.0-minconf-0.5.feather`.
 
-`real_connectome` `n_nodes` must be in **500–2000** and must not exceed the loaded graph size. Out of range raises.
+`real_connectome` `n_nodes` must be in **500–2000**. Out of range raises. Sampling never materialises the full ~152 M-edge NetworkX graph (see below).
+
+## Memory and subsampling
+
+The MaleCNS feather (~1 GB, ~152 M edges) is too large to load as a NetworkX graph. For `real_connectome`, the loader:
+
+1. Reads the feather into a pandas DataFrame (columnar; does **not** materialise Python dicts per edge).
+2. Builds two sorted numpy arrays (by source, by destination) for O(log n) neighbour lookups.
+3. Runs a seeded BFS from a deterministically chosen start node, expanding the frontier using searchsorted. Stops at `n_nodes` (500–2000).
+4. Filters the DataFrame to the sampled node set and builds a NetworkX DiGraph **only** for the sampled subgraph.
+
+Provenance records `full_graph_materialized: false`, `sampling_method: seeded_bfs`, and the `seed` used.
+
+The file is already pre-filtered at minimum confidence 0.5 by FlyEM (`minconf-0.5` in the filename). An optional `weight_threshold` parameter retains only edges with weight ≥ threshold; do not set this without a documented biological reason.
 
 ## CI / synthetic fixture
 
