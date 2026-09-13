@@ -13,6 +13,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
+from pdm.architectures import RESERVOIR_COMPAT_KEYS, is_reservoir
 from pdm.config import load_dataset_config, model_defaults
 from pdm.data.prepare import dataset_fingerprint_for_run, load_processed
 from pdm.device import resolve_device
@@ -26,7 +27,7 @@ from pdm.io_util import (
     sha256_file,
 )
 from pdm.losses import smooth_l1, weibull_nll
-from pdm.models import PDMNet
+from pdm.models import build_model
 from pdm.paths import dataset_runs, project_root
 from pdm.preprocessing import (
     Preprocessor,
@@ -337,6 +338,7 @@ def compatibility_dict(
     dataset_id: str,
     head: str,
     fingerprint: dict[str, Any] | None = None,
+    reservoir_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {
         "dataset_id": dataset_id,
@@ -355,6 +357,19 @@ def compatibility_dict(
     for k in ("dataset_version", "features_hash", "units_hash"):
         if fp.get(k) is not None:
             out[k] = fp[k]
+    if is_reservoir(cfg_model.get("architecture", "")):
+        meta = reservoir_meta or {}
+        out["n_nodes"] = meta["n_nodes"]
+        out["graph_mode"] = meta["graph_mode"]
+        out["graph_hash"] = meta["graph_hash"]
+        out["state_mode"] = meta.get("state_mode", "window_reset")
+        out["leak"] = meta["leak"]
+        out["spectral_radius"] = meta["spectral_radius"]
+        out["input_scale"] = meta["input_scale"]
+        out["seed"] = meta["seed"]
+        out["readout"] = meta["readout"]
+        if meta.get("parent_graph_hash") is not None:
+            out["parent_graph_hash"] = meta["parent_graph_hash"]
     return out
 
 
@@ -376,6 +391,16 @@ def checkpoints_compatible(saved: dict, current: dict) -> bool:
             return False
     for k in ("dataset_version", "features_hash", "units_hash"):
         if k in saved and k in current and saved.get(k) != current.get(k):
+            return False
+    if is_reservoir(saved.get("architecture", "")) and is_reservoir(current.get("architecture", "")):
+        for k in RESERVOIR_COMPAT_KEYS:
+            if k in saved and k in current and saved[k] != current[k]:
+                return False
+        if (
+            "parent_graph_hash" in saved
+            and "parent_graph_hash" in current
+            and saved["parent_graph_hash"] != current["parent_graph_hash"]
+        ):
             return False
     return resolve_split_hash(saved) == resolve_split_hash(current)
 
@@ -449,14 +474,34 @@ def run_training(
     status_cb: Callable[[dict[str, Any]], None] | None = None,
     max_windows_per_unit: int | None = None,
     seed: int | None = None,
+    n_nodes: int | None = None,
+    graph_mode: str | None = None,
+    readout: str | None = None,
+    source_path: str | None = None,
 ) -> dict[str, Any]:
     def _log(msg: str) -> None:
         if log:
             log(msg)
 
     cfg = load_dataset_config(dataset_id)
+    yaml_readout = ((cfg.get("model") or {}).get("reservoir") or {}).get("readout")
+    _assert_filters_ridge_forbidden(
+        dataset_id, readout if readout is not None else yaml_readout
+    )
     mcfg = model_defaults(cfg)
     mcfg["architecture"] = architecture.lower()
+    reservoir = dict(mcfg.get("reservoir") or {})
+    if n_nodes is not None:
+        reservoir["n_nodes"] = int(n_nodes)
+    if graph_mode is not None:
+        reservoir["graph_mode"] = str(graph_mode)
+    if readout is not None:
+        reservoir["readout"] = str(readout).strip().lower()
+    if source_path is not None:
+        reservoir["source_path"] = str(source_path)
+    if reservoir:
+        mcfg["reservoir"] = reservoir
+    _assert_filters_ridge_forbidden(dataset_id, (mcfg.get("reservoir") or {}).get("readout"))
     if history_length is not None:
         mcfg["history_length"] = int(history_length)
     if seed is not None:
@@ -552,6 +597,31 @@ def run_training(
     if device_info.fallback_reason:
         _log(device_info.fallback_reason)
 
+    reservoir_meta: dict[str, Any] | None = None
+    if is_reservoir(mcfg["architecture"]):
+        model, reservoir_meta = _build_reservoir_model(
+            mcfg,
+            input_size=len(prep.feature_names),
+            head=head,
+            time_scale_s=prep.time_scale_s,
+        )
+        mcfg.setdefault("reservoir", {})
+        mcfg["reservoir"]["n_nodes"] = reservoir_meta["n_nodes"]
+        mcfg["reservoir"]["graph_mode"] = reservoir_meta["graph_mode"]
+        if reservoir_meta.get("parent_graph_hash") is not None:
+            mcfg["reservoir"]["parent_graph_hash"] = reservoir_meta["parent_graph_hash"]
+    else:
+        model = build_model(
+            architecture=mcfg["architecture"],
+            input_size=len(prep.feature_names),
+            hidden_size=int(mcfg["hidden_size"]),
+            num_layers=int(mcfg["recurrent_layers"]),
+            head=head,
+            dropout=float(mcfg["dropout"]),
+            time_scale_s=prep.time_scale_s,
+        )
+    model = model.to(device)
+
     if resume_run_id:
         run_id = resume_run_id
         rdir = dataset_runs(dataset_id) / run_id
@@ -566,6 +636,7 @@ def run_training(
             dataset_id,
             head,
             fingerprint=dataset_fingerprint_for_run(processed, split),
+            reservoir_meta=reservoir_meta,
         )
         if not checkpoints_compatible(blob.get("compat") or {}, current):
             raise RuntimeError(
@@ -637,23 +708,26 @@ def run_training(
     )
     sel_spec = selection_metric_spec(dataset_id)
 
-    model = PDMNet(
-        input_size=len(prep.feature_names),
-        hidden_size=int(mcfg["hidden_size"]),
-        num_layers=int(mcfg["recurrent_layers"]),
-        architecture=mcfg["architecture"],
-        head=head,
-        dropout=float(mcfg["dropout"]),
-        time_scale_s=prep.time_scale_s,
-    ).to(device)
-    opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(mcfg["learning_rate"]),
-        weight_decay=float(mcfg["weight_decay"]),
+    readout_kind = str((mcfg.get("reservoir") or {}).get("readout") or "").strip().lower()
+    ridge_path = (
+        is_reservoir(mcfg["architecture"])
+        and dataset_id == "bearings"
+        and readout_kind == "ridge"
     )
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    opt: torch.optim.Optimizer | None
+    if ridge_path:
+        opt = None
+    else:
+        opt = torch.optim.AdamW(
+            trainable if trainable else model.parameters(),
+            lr=float(mcfg["learning_rate"]),
+            weight_decay=float(mcfg["weight_decay"]),
+        )
     if blob is not None:
         model.load_state_dict(blob["model_state_dict"])
-        opt.load_state_dict(blob["optimizer_state_dict"])
+        if opt is not None and blob.get("optimizer_state_dict"):
+            opt.load_state_dict(blob["optimizer_state_dict"])
 
     env = _environment(device_info)
     run_cfg: dict[str, Any] = {
@@ -692,6 +766,8 @@ def run_training(
     manifest_src = project_root() / "data" / "manifest.json"
     if manifest_src.exists():
         atomic_write_json(rdir / "data_manifest.json", json.loads(manifest_src.read_text()))
+    if is_reservoir(mcfg["architecture"]):
+        _write_connectome_artifacts(rdir, model)
     log_path = rdir / "train.log"
     hist_path = rdir / "training_history.csv"
     hist_cols = _history_columns(hist_path)
@@ -727,38 +803,85 @@ def run_training(
     bad = 0
     last_status = "training"
     try:
-        for epoch in range(start_epoch, int(mcfg["max_epochs"]) + 1):
-            if should_stop and should_stop():
-                last_status = "stopped"
-                _log(f"Stop requested at epoch {epoch}")
-                break
-            sampler.set_epoch(epoch)
-            sampled_idx: list[int] = []
-            tr_loss = _run_epoch(
-                model,
-                opt,
-                train_loader,
-                dataset_id,
-                device,
-                mcfg,
-                train=True,
-                sampled_indices=sampled_idx,
+        if ridge_path:
+            last_status, best_epoch, best_metric = _run_bearings_ridge(
+                model=model,
+                train_diag_loader=train_diag_loader,
+                val_loader=val_loader,
+                mcfg=mcfg,
+                prep=prep,
+                split=split,
+                dataset_id=dataset_id,
+                head=head,
+                smoke=smoke,
+                device=device,
+                rdir=rdir,
+                run_fp=run_fp,
+                reservoir_meta=reservoir_meta,
+                sel_spec=sel_spec,
+                n_train_windows=n_train_windows,
+                n_val_windows=n_val_windows,
+                max_windows_per_unit=max_windows_per_unit,
+                train_wpu=train_wpu,
+                val_wpu=val_wpu,
+                hist_path=hist_path,
+                hist_cols=hist_cols,
+                log_path=log_path,
+                should_stop=should_stop,
+                emit=emit,
+                log=_log,
             )
-            samp_diag = UnitBalancedSampler.draw_stats(len(train_ds), sampled_idx)
-            n_eligible_windows = int(samp_diag["n_eligible_windows"])
-            n_gradient_draws = int(samp_diag["n_gradient_draws"])
-            n_unique_sampled_windows = int(samp_diag["n_unique_sampled_windows"])
-            train_stats = _eval_unit_weighted(model, train_diag_loader, dataset_id, device)
-            val_stats = _eval_unit_weighted(model, val_loader, dataset_id, device)
-            val_metric = val_stats["selection_metric"]
-            train_metric = train_stats["selection_metric"]
-            improved = val_metric < best_metric - 1e-8
-            if improved:
-                best_metric = val_metric
-                best_epoch = epoch
-                bad = 0
+        else:
+            for epoch in range(start_epoch, int(mcfg["max_epochs"]) + 1):
+                if should_stop and should_stop():
+                    last_status = "cancelled"
+                    _log(f"Stop requested at epoch {epoch}")
+                    break
+                sampler.set_epoch(epoch)
+                sampled_idx: list[int] = []
+                tr_loss = _run_epoch(
+                    model,
+                    opt,
+                    train_loader,
+                    dataset_id,
+                    device,
+                    mcfg,
+                    train=True,
+                    sampled_indices=sampled_idx,
+                )
+                samp_diag = UnitBalancedSampler.draw_stats(len(train_ds), sampled_idx)
+                n_eligible_windows = int(samp_diag["n_eligible_windows"])
+                n_gradient_draws = int(samp_diag["n_gradient_draws"])
+                n_unique_sampled_windows = int(samp_diag["n_unique_sampled_windows"])
+                train_stats = _eval_unit_weighted(model, train_diag_loader, dataset_id, device)
+                val_stats = _eval_unit_weighted(model, val_loader, dataset_id, device)
+                val_metric = val_stats["selection_metric"]
+                train_metric = train_stats["selection_metric"]
+                improved = val_metric < best_metric - 1e-8
+                if improved:
+                    best_metric = val_metric
+                    best_epoch = epoch
+                    bad = 0
+                    _save_ckpt(
+                        rdir / "best.pt",
+                        model,
+                        opt,
+                        epoch,
+                        best_epoch,
+                        best_metric,
+                        mcfg,
+                        prep,
+                        split,
+                        dataset_id,
+                        head,
+                        smoke,
+                        fingerprint=run_fp,
+                        reservoir_meta=reservoir_meta,
+                    )
+                else:
+                    bad += 1
                 _save_ckpt(
-                    rdir / "best.pt",
+                    rdir / "last.pt",
                     model,
                     opt,
                     epoch,
@@ -771,88 +894,72 @@ def run_training(
                     head,
                     smoke,
                     fingerprint=run_fp,
+                    reservoir_meta=reservoir_meta,
                 )
-            else:
-                bad += 1
-            _save_ckpt(
-                rdir / "last.pt",
-                model,
-                opt,
-                epoch,
-                best_epoch,
-                best_metric,
-                mcfg,
-                prep,
-                split,
-                dataset_id,
-                head,
-                smoke,
-                fingerprint=run_fp,
-            )
-            _sync_run_checkpoint_hash(rdir)
-            hist_row = {
-                "epoch": epoch,
-                "train_loss": f"{tr_loss:.6f}",
-                "val_loss": f"{val_stats['val_loss']:.6f}",
-                "train_metric": f"{train_metric:.6f}",
-                "val_metric": f"{val_metric:.6f}",
-                "val_mae_events": val_stats.get("val_mae_events"),
-                "n_val_event_units": val_stats.get("n_val_event_units"),
-                "n_eligible_windows": n_eligible_windows,
-                "n_gradient_draws": n_gradient_draws,
-                "n_unique_sampled_windows": n_unique_sampled_windows,
-            }
-            append_line(
-                hist_path,
-                ",".join("" if hist_row.get(c) is None else str(hist_row.get(c, "")) for c in hist_cols),
-            )
-            msg = (
-                f"epoch {epoch}/{mcfg['max_epochs']} train_loss={tr_loss:.4f} "
-                f"val_loss={val_stats['val_loss']:.4f} train_metric={train_metric:.4f} "
-                f"val_metric={val_metric:.4f} ({sel_spec['label']}) best_epoch={best_epoch} "
-                f"sampled_unique={n_unique_sampled_windows}/{n_eligible_windows} "
-                f"draws={n_gradient_draws}"
-            )
-            _log(msg)
-            append_line(log_path, msg)
-            emit(
-                "training",
-                epoch=epoch,
-                max_epochs=int(mcfg["max_epochs"]),
-                train_loss=tr_loss,
-                val_loss=val_stats["val_loss"],
-                train_metric=train_metric,
-                val_metric=val_metric,
-                best_epoch=best_epoch,
-                best_metric=best_metric,
-                n_eligible_windows=n_eligible_windows,
-                n_gradient_draws=n_gradient_draws,
-                n_unique_sampled_windows=n_unique_sampled_windows,
-                message=msg,
-            )
-            atomic_write_json(
-                rdir / "validation_metrics.json",
-                {
-                    "best_epoch": best_epoch,
-                    "best_metric": best_metric,
-                    "selection_metric_name": sel_spec["name"],
-                    "selection_metric_unit": sel_spec["unit"],
-                    "selection_metric_label": sel_spec["label"],
-                    "last": val_stats,
-                    "last_train": train_stats,
-                    "n_train_windows": n_train_windows,
-                    "n_val_windows": n_val_windows,
-                    "max_windows_per_unit": max_windows_per_unit,
-                    "train_windows_per_unit": train_wpu,
-                    "val_windows_per_unit": val_wpu,
-                    "smoke": smoke,
-                    "mode": training_mode_label(smoke),
-                },
-            )
-            if bad >= patience:
-                _log(f"Early stopping at epoch {epoch}, best_epoch={best_epoch}")
-                break
-        if last_status != "stopped":
+                _sync_run_checkpoint_hash(rdir)
+                hist_row = {
+                    "epoch": epoch,
+                    "train_loss": f"{tr_loss:.6f}",
+                    "val_loss": f"{val_stats['val_loss']:.6f}",
+                    "train_metric": f"{train_metric:.6f}",
+                    "val_metric": f"{val_metric:.6f}",
+                    "val_mae_events": val_stats.get("val_mae_events"),
+                    "n_val_event_units": val_stats.get("n_val_event_units"),
+                    "n_eligible_windows": n_eligible_windows,
+                    "n_gradient_draws": n_gradient_draws,
+                    "n_unique_sampled_windows": n_unique_sampled_windows,
+                }
+                append_line(
+                    hist_path,
+                    ",".join("" if hist_row.get(c) is None else str(hist_row.get(c, "")) for c in hist_cols),
+                )
+                msg = (
+                    f"epoch {epoch}/{mcfg['max_epochs']} train_loss={tr_loss:.4f} "
+                    f"val_loss={val_stats['val_loss']:.4f} train_metric={train_metric:.4f} "
+                    f"val_metric={val_metric:.4f} ({sel_spec['label']}) best_epoch={best_epoch} "
+                    f"sampled_unique={n_unique_sampled_windows}/{n_eligible_windows} "
+                    f"draws={n_gradient_draws}"
+                )
+                _log(msg)
+                append_line(log_path, msg)
+                emit(
+                    "training",
+                    epoch=epoch,
+                    max_epochs=int(mcfg["max_epochs"]),
+                    train_loss=tr_loss,
+                    val_loss=val_stats["val_loss"],
+                    train_metric=train_metric,
+                    val_metric=val_metric,
+                    best_epoch=best_epoch,
+                    best_metric=best_metric,
+                    n_eligible_windows=n_eligible_windows,
+                    n_gradient_draws=n_gradient_draws,
+                    n_unique_sampled_windows=n_unique_sampled_windows,
+                    message=msg,
+                )
+                atomic_write_json(
+                    rdir / "validation_metrics.json",
+                    {
+                        "best_epoch": best_epoch,
+                        "best_metric": best_metric,
+                        "selection_metric_name": sel_spec["name"],
+                        "selection_metric_unit": sel_spec["unit"],
+                        "selection_metric_label": sel_spec["label"],
+                        "last": val_stats,
+                        "last_train": train_stats,
+                        "n_train_windows": n_train_windows,
+                        "n_val_windows": n_val_windows,
+                        "max_windows_per_unit": max_windows_per_unit,
+                        "train_windows_per_unit": train_wpu,
+                        "val_windows_per_unit": val_wpu,
+                        "smoke": smoke,
+                        "mode": training_mode_label(smoke),
+                    },
+                )
+                if bad >= patience:
+                    _log(f"Early stopping at epoch {epoch}, best_epoch={best_epoch}")
+                    break
+        if last_status != "cancelled":
             last_status = "completed"
     except Exception as exc:  # noqa: BLE001
         last_status = "failed"
@@ -891,7 +998,9 @@ def _run_epoch(
             loss = nll.mean()
         if train:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(mcfg["grad_clip"]))
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            if trainable:
+                torch.nn.utils.clip_grad_norm_(trainable, float(mcfg["grad_clip"]))
             opt.step()
         losses.append(float(loss.detach().cpu()))
     return float(np.mean(losses)) if losses else float("nan")
@@ -971,28 +1080,51 @@ def _save_ckpt(
     head,
     smoke,
     fingerprint=None,
+    reservoir_meta=None,
 ):
+    meta = {
+        "epoch": epoch,
+        "best_epoch": best_epoch,
+        "best_metric": best_metric,
+        "smoke": smoke,
+        "time_scale_s": prep.time_scale_s,
+        "head": head,
+        "architecture": mcfg["architecture"],
+        "history_length": int(mcfg["history_length"]),
+        "hidden_size": int(mcfg["hidden_size"]),
+        "recurrent_layers": int(mcfg["recurrent_layers"]),
+        "dropout": float(mcfg["dropout"]),
+        "input_size": len(prep.feature_names),
+        "feature_names": list(prep.feature_names),
+        "dataset_id": dataset_id,
+    }
+    if is_reservoir(mcfg["architecture"]):
+        rmeta = reservoir_meta or _reservoir_meta_from_model(model, mcfg)
+        meta.update(
+            {
+                "n_nodes": rmeta["n_nodes"],
+                "graph_mode": rmeta["graph_mode"],
+                "graph_hash": rmeta["graph_hash"],
+                "state_mode": rmeta["state_mode"],
+                "leak": rmeta["leak"],
+                "spectral_radius": rmeta["spectral_radius"],
+                "input_scale": rmeta["input_scale"],
+                "seed": rmeta["seed"],
+                "readout": rmeta["readout"],
+            }
+        )
+        if rmeta.get("parent_graph_hash") is not None:
+            meta["parent_graph_hash"] = rmeta["parent_graph_hash"]
+    else:
+        rmeta = None
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": opt.state_dict(),
-            "compat": compatibility_dict(mcfg, prep, split, dataset_id, head, fingerprint=fingerprint),
-            "meta": {
-                "epoch": epoch,
-                "best_epoch": best_epoch,
-                "best_metric": best_metric,
-                "smoke": smoke,
-                "time_scale_s": prep.time_scale_s,
-                "head": head,
-                "architecture": mcfg["architecture"],
-                "history_length": int(mcfg["history_length"]),
-                "hidden_size": int(mcfg["hidden_size"]),
-                "recurrent_layers": int(mcfg["recurrent_layers"]),
-                "dropout": float(mcfg["dropout"]),
-                "input_size": len(prep.feature_names),
-                "feature_names": list(prep.feature_names),
-                "dataset_id": dataset_id,
-            },
+            "optimizer_state_dict": opt.state_dict() if opt is not None else {},
+            "compat": compatibility_dict(
+                mcfg, prep, split, dataset_id, head, fingerprint=fingerprint, reservoir_meta=rmeta
+            ),
+            "meta": meta,
         },
         path,
     )
@@ -1004,7 +1136,7 @@ def load_trained_model(
     which: str = "best",
     *,
     verify_checkpoint_hash: bool = True,
-) -> tuple[PDMNet, Preprocessor, dict]:
+) -> tuple[torch.nn.Module, Preprocessor, dict]:
     ckpt_file = run_path / f"{which}.pt"
     if not ckpt_file.exists():
         ckpt_file = run_path / "last.pt"
@@ -1014,11 +1146,15 @@ def load_trained_model(
         run_path, ckpt_file, blob, verify_checkpoint_hash=verify_checkpoint_hash
     )
     prep = Preprocessor.from_dict(json.loads((run_path / "preprocessing.json").read_text()))
-    model = PDMNet(
+    if is_reservoir(meta["architecture"]):
+        model = _load_reservoir_from_artifacts(Path(run_path), blob, meta, device)
+        model.eval()
+        return model, prep, meta
+    model = build_model(
+        architecture=meta["architecture"],
         input_size=int(meta["input_size"]),
         hidden_size=int(meta["hidden_size"]),
         num_layers=int(meta["recurrent_layers"]),
-        architecture=meta["architecture"],
         head=meta["head"],
         dropout=float(meta.get("dropout", 0.1)),
         time_scale_s=float(meta["time_scale_s"]),
@@ -1027,6 +1163,338 @@ def load_trained_model(
     model.to(device)
     model.eval()
     return model, prep, meta
+
+
+def _assert_filters_ridge_forbidden(dataset_id: str, readout: object) -> None:
+    if str(dataset_id).strip().lower() == "filters" and str(readout or "").strip().lower() == "ridge":
+        raise ValueError(
+            "Ridge readout is not supported for filters (censored data). Use readout='gradient'."
+        )
+
+
+def _reservoir_meta_from_model(model, mcfg: dict) -> dict[str, Any]:
+    res = dict(mcfg.get("reservoir") or {})
+    graph_hash = getattr(model, "graph_hash", None)
+    if graph_hash is None and getattr(model, "graph", None) is not None:
+        from pdm.connectome.provenance import hash_graph
+
+        graph_hash = hash_graph(model.graph)
+    meta = {
+        "n_nodes": int(getattr(model, "n_nodes")),
+        "graph_mode": str(getattr(model, "graph_mode", res.get("graph_mode", "synthetic_fixture"))),
+        "graph_hash": graph_hash,
+        "state_mode": str(getattr(model, "state_mode", res.get("state_mode", "window_reset"))),
+        "leak": float(getattr(model, "leak", res.get("leak", 0.2))),
+        "spectral_radius": float(getattr(model, "spectral_radius", res.get("spectral_radius", 0.9))),
+        "input_scale": float(getattr(model, "input_scale", res.get("input_scale", 0.1))),
+        "seed": int(getattr(model, "seed", res.get("seed", mcfg.get("seed", 42)))),
+        "readout": str(res.get("readout") or "ridge"),
+    }
+    parent = getattr(model, "parent_graph_hash", None)
+    if parent is not None:
+        meta["parent_graph_hash"] = parent
+    return meta
+
+
+def _build_reservoir_model(mcfg: dict, *, input_size: int, head: str, time_scale_s: float):
+    from pdm.connectome.sampling import prepare_run_graph
+
+    res = dict(mcfg.get("reservoir") or {})
+    seed = int(res.get("seed", mcfg.get("seed", 42)))
+    requested = int(res.get("n_nodes", 1000))
+    graph_mode = str(res.get("graph_mode") or "synthetic_fixture")
+    graph, parent_prov, resolved_n = prepare_run_graph(
+        architecture=mcfg["architecture"],
+        graph_mode=graph_mode,
+        n_nodes=requested,
+        seed=seed,
+        source_path=res.get("source_path"),
+    )
+    model = build_model(
+        architecture=mcfg["architecture"],
+        input_size=input_size,
+        head=head,
+        time_scale_s=time_scale_s,
+        graph=graph,
+        n_nodes=resolved_n,
+        leak=float(res.get("leak", 0.2)),
+        spectral_radius=float(res.get("spectral_radius", 0.9)),
+        input_scale=float(res.get("input_scale", 0.1)),
+        seed=seed,
+        state_mode=str(res.get("state_mode") or "window_reset"),
+        provenance=parent_prov,
+        parent_provenance=parent_prov,
+    )
+    return model, _reservoir_meta_from_model(model, mcfg)
+
+
+def _write_connectome_artifacts(rdir: Path, model) -> None:
+    from pdm.connectome.graph import graph_to_payload
+    from pdm.connectome.layout import layout_positions
+    from pdm.connectome.provenance import write_graph_artifact
+    from pdm.connectome.weights import save_reservoir_weights
+
+    cdir = Path(rdir) / "connectome"
+    cdir.mkdir(parents=True, exist_ok=True)
+    graph = getattr(model, "graph", None)
+    provenance = dict(getattr(model, "provenance", {}) or {})
+    if graph is not None:
+        payload = graph_to_payload(graph, node_order=list(getattr(model, "node_order", []) or []))
+        write_graph_artifact(cdir, payload, provenance)
+        try:
+            positions = layout_positions(graph, seed=int(getattr(model, "seed", 42)))
+            atomic_write_json(
+                cdir / "layout.json",
+                {"positions": positions, "node_order": list(getattr(model, "node_order", []))},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        atomic_write_json(cdir / "provenance.json", provenance)
+    save_reservoir_weights(
+        cdir / "weights.npz",
+        model.W_in.detach().cpu().numpy(),
+        model.W_res.detach().cpu().numpy(),
+        model.b_res.detach().cpu().numpy(),
+    )
+
+
+def _saved_node_order(run_path: Path, graph_payload: dict | None) -> list[str] | None:
+    """W_res row labels stored with the run. Never NetworkX insertion order alone."""
+    from pdm.io_util import read_json
+
+    payload = graph_payload or {}
+    order = payload.get("node_order")
+    if order:
+        return [str(n) for n in order]
+    layout_path = Path(run_path) / "connectome" / "layout.json"
+    if layout_path.exists():
+        rec = read_json(layout_path)
+        order = rec.get("node_order")
+        if order:
+            return [str(n) for n in order]
+    return None
+
+
+def _load_reservoir_from_artifacts(run_path: Path, blob: dict, meta: dict, device):
+    from pdm.connectome.graph import graph_from_payload
+    from pdm.connectome.weights import load_reservoir_weights
+    from pdm.io_util import read_json
+
+    weights_path = Path(run_path) / "connectome" / "weights.npz"
+    if not weights_path.exists():
+        raise FileNotFoundError(f"Missing {weights_path}; will not rebuild from seed")
+    arrays = load_reservoir_weights(weights_path)
+    n_w = int(arrays["W_res"].shape[0])
+    meta_n = meta.get("n_nodes")
+    if meta_n is not None and int(meta_n) != n_w:
+        raise ValueError(
+            f"n_nodes mismatch: checkpoint has {int(meta_n)}, weights.npz has {n_w}"
+        )
+    graph = None
+    graph_payload: dict = {}
+    graph_path = Path(run_path) / "connectome" / "graph.json"
+    if graph_path.exists():
+        graph_payload = read_json(graph_path)
+        graph = graph_from_payload(graph_payload)
+        n_graph = int(graph.number_of_nodes())
+        if n_graph != n_w:
+            raise ValueError(
+                f"n_nodes mismatch: graph.json has {n_graph}, weights.npz has {n_w}"
+            )
+    provenance = {}
+    prov_path = Path(run_path) / "connectome" / "provenance.json"
+    if prov_path.exists():
+        provenance = read_json(prov_path)
+    node_order = _saved_node_order(run_path, graph_payload)
+    model = build_model(
+        architecture=meta["architecture"],
+        input_size=int(arrays["W_in"].shape[1]),
+        head=meta["head"],
+        time_scale_s=float(meta["time_scale_s"]),
+        graph=graph,
+        n_nodes=n_w,
+        leak=float(meta.get("leak", 0.2)),
+        spectral_radius=float(meta.get("spectral_radius", 0.9)),
+        input_scale=float(meta.get("input_scale", 0.1)),
+        seed=int(meta.get("seed", 42)),
+        state_mode=str(meta.get("state_mode", "window_reset")),
+        provenance=provenance,
+        node_order=node_order,
+        frozen_weights=(arrays["W_in"], arrays["W_res"], arrays["b_res"]),
+    )
+    readout_sd = {
+        k: v for k, v in blob["model_state_dict"].items() if str(k).startswith("readout.")
+    }
+    missing = model.load_state_dict(readout_sd, strict=False)
+    del missing
+    model.to(device)
+    return model
+
+
+def _run_bearings_ridge(
+    *,
+    model,
+    train_diag_loader,
+    val_loader,
+    mcfg,
+    prep,
+    split,
+    dataset_id,
+    head,
+    smoke,
+    device,
+    rdir,
+    run_fp,
+    reservoir_meta,
+    sel_spec,
+    n_train_windows,
+    n_val_windows,
+    max_windows_per_unit,
+    train_wpu,
+    val_wpu,
+    hist_path,
+    hist_cols,
+    log_path,
+    should_stop,
+    emit,
+    log,
+) -> tuple[str, int, float]:
+    """Closed-form ridge on TRAIN windows only. Never calls ``loss.backward()``."""
+    from pdm.models.readout import fit_ridge, freeze_readout, ridge_design_matrix
+
+    last_status = "training"
+    if should_stop and should_stop():
+        log("Stop requested before ridge solve")
+        return "cancelled", 0, float("inf")
+
+    zs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    model.eval()
+    # y = target_rul_s / time_scale_s — normalized RUL, same space as Smooth L1.
+    # Contribution identity (03) uses pre-activation raw, not this display/loss space.
+    with torch.no_grad():
+        for batch in train_diag_loader:
+            x = batch["x"].to(device)
+            states = model.forward_states(x)
+            x_t = states[:, -1, :].detach().cpu().numpy()
+            u_t = x[:, -1, :].detach().cpu().numpy()
+            zs.append(ridge_design_matrix(x_t, u_t))
+            target_s = batch["target"].detach().cpu().numpy().reshape(-1)
+            ys.append(target_s / max(float(model.time_scale_s), 1e-8))
+    if not zs:
+        raise RuntimeError("No training windows for ridge readout")
+    z = np.concatenate(zs, axis=0)
+    y = np.concatenate(ys, axis=0)
+    ridge_alpha = float((mcfg.get("reservoir") or {}).get("ridge_alpha", 0.001))
+    w, residual_mean_sq = fit_ridge(z, y, alpha=ridge_alpha)
+    model.readout.load_ridge_vector(w)
+    freeze_readout(model.readout)
+
+    if should_stop and should_stop():
+        log("Stop requested after ridge solve")
+        last_status = "cancelled"
+
+    train_stats = _eval_unit_weighted(model, train_diag_loader, dataset_id, device)
+    val_stats = _eval_unit_weighted(model, val_loader, dataset_id, device)
+    val_metric = float(val_stats["selection_metric"])
+    train_metric = float(train_stats["selection_metric"])
+    best_epoch = 1
+    best_metric = val_metric
+    _save_ckpt(
+        rdir / "best.pt",
+        model,
+        None,
+        1,
+        best_epoch,
+        best_metric,
+        mcfg,
+        prep,
+        split,
+        dataset_id,
+        head,
+        smoke,
+        fingerprint=run_fp,
+        reservoir_meta=reservoir_meta,
+    )
+    _save_ckpt(
+        rdir / "last.pt",
+        model,
+        None,
+        1,
+        best_epoch,
+        best_metric,
+        mcfg,
+        prep,
+        split,
+        dataset_id,
+        head,
+        smoke,
+        fingerprint=run_fp,
+        reservoir_meta=reservoir_meta,
+    )
+    _sync_run_checkpoint_hash(rdir)
+    hist_row = {
+        "epoch": 1,
+        "train_loss": f"{residual_mean_sq:.6f}",
+        "val_loss": f"{val_stats['val_loss']:.6f}",
+        "train_metric": f"{train_metric:.6f}",
+        "val_metric": f"{val_metric:.6f}",
+        "val_mae_events": val_stats.get("val_mae_events"),
+        "n_val_event_units": val_stats.get("n_val_event_units"),
+        "n_eligible_windows": n_train_windows,
+        "n_gradient_draws": 0,
+        "n_unique_sampled_windows": n_train_windows,
+    }
+    append_line(
+        hist_path,
+        ",".join("" if hist_row.get(c) is None else str(hist_row.get(c, "")) for c in hist_cols),
+    )
+    msg = (
+        f"ridge residual_mean_sq={residual_mean_sq:.4f} "
+        f"val_loss={val_stats['val_loss']:.4f} train_metric={train_metric:.4f} "
+        f"val_metric={val_metric:.4f} ({sel_spec['label']})"
+    )
+    log(msg)
+    append_line(log_path, msg)
+    emit(
+        "training" if last_status != "cancelled" else "cancelled",
+        epoch=1,
+        max_epochs=int(mcfg["max_epochs"]),
+        train_loss=residual_mean_sq,
+        val_loss=val_stats["val_loss"],
+        train_metric=train_metric,
+        val_metric=val_metric,
+        best_epoch=best_epoch,
+        best_metric=best_metric,
+        n_eligible_windows=n_train_windows,
+        n_gradient_draws=0,
+        n_unique_sampled_windows=n_train_windows,
+        message=msg,
+    )
+    atomic_write_json(
+        rdir / "validation_metrics.json",
+        {
+            "best_epoch": best_epoch,
+            "best_metric": best_metric,
+            "selection_metric_name": sel_spec["name"],
+            "selection_metric_unit": sel_spec["unit"],
+            "selection_metric_label": sel_spec["label"],
+            "last": val_stats,
+            "last_train": train_stats,
+            "n_train_windows": n_train_windows,
+            "n_val_windows": n_val_windows,
+            "max_windows_per_unit": max_windows_per_unit,
+            "train_windows_per_unit": train_wpu,
+            "val_windows_per_unit": val_wpu,
+            "smoke": smoke,
+            "mode": training_mode_label(smoke),
+            "ridge_residual_mean_sq": residual_mean_sq,
+        },
+    )
+    if last_status != "cancelled":
+        last_status = "completed"
+    return last_status, best_epoch, best_metric
 
 
 def _verify_loaded_checkpoint(

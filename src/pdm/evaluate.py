@@ -1084,6 +1084,62 @@ def generate_split_predictions(
     return pd.concat(pred_frames, ignore_index=True)
 
 
+def _write_reservoir_traces(
+    *,
+    dataset_id: str,
+    run_id: str,
+    unit_ids: list[str],
+    features: pd.DataFrame,
+    model: Any,
+    prep: Any,
+    history_length: int,
+) -> None:
+    """Persist per-unit traces next to the run. Does not touch predictions.csv."""
+    from pdm.paths import run_traces_dir
+    from pdm.visualization.export import save_trace
+    from pdm.visualization.trace import is_reservoir_module, predict_with_trace
+
+    if not is_reservoir_module(model):
+        return
+    hist_len = int(history_length)
+    for uid in unit_ids:
+        meas = features[features["unit_id"].astype(str) == str(uid)].copy()
+        if meas.empty:
+            continue
+        meas.attrs["raw_features"] = True
+        trace = predict_with_trace(
+            meas,
+            str(uid),
+            model,
+            prep,
+            history_length=hist_len,
+        )
+        if trace["status"] != "predicted":
+            continue
+        save_trace(
+            run_traces_dir(dataset_id, run_id, str(uid)),
+            unit_id=str(uid),
+            run_id=str(run_id),
+            dataset_id=str(dataset_id),
+            architecture=str(getattr(model, "architecture", "")),
+            graph_hash=getattr(model, "graph_hash", None),
+            n_nodes=int(getattr(model, "n_nodes", 0) or 0),
+            history_length=hist_len,
+            graph_mode=str(getattr(model, "graph_mode", "")),
+            is_synthetic=bool(getattr(model, "is_synthetic", True)),
+            states=trace["states"],
+            inputs=trace["inputs"],
+            contributions=trace["contributions"],
+            frame_map=trace["frame_map"],
+            node_order=trace["node_order"],
+            predicted_rul_s=trace["predicted_rul_s"],
+            raw_prediction=trace["raw_prediction"],
+            status=trace["status"],
+            time_scale_s=float(getattr(model, "time_scale_s", 1.0)),
+            head=str(getattr(model, "head_type", "")),
+        )
+
+
 def evaluate_run(
     dataset_id: str,
     run_id: str,
@@ -1097,6 +1153,7 @@ def evaluate_run(
     max_useful_horizon_s: float | None = None,
     device: str = "cpu",
     force: bool = False,
+    with_trace: bool = False,
 ) -> dict[str, Any]:
     from pdm.config import load_dataset_config
     from pdm.device import resolve_device
@@ -1187,6 +1244,16 @@ def evaluate_run(
     if not preds.empty:
         preds = attach_actual_rul(preds, units, dataset_id)
     pred_export = prediction_export_frame(preds)
+    if with_trace:
+        _write_reservoir_traces(
+            dataset_id=dataset_id,
+            run_id=run_id,
+            unit_ids=unit_ids,
+            features=features,
+            model=model,
+            prep=prep,
+            history_length=int(meta["history_length"]),
+        )
 
     expected_ckpt = run_fp.get("checkpoint_hash")
     ckpt_sha = checkpoint_hash(rdir / "best.pt")

@@ -1,0 +1,16 @@
+Vendored frontend libraries for Neural Activity Explorer.
+Runtime loads only these local files. No CDN script or module src.
+
+three.min.js
+  Package: three
+  Version: 0.160.1
+  License: MIT
+  Copyright 2010-2023 three.js authors
+  File: build/three.min.js (UMD). Animation uses reservoir state arrays.
+
+streamlit-component-lib.js
+  Streamlit custom-component iframe bridge, API version 1
+  License: Apache-2.0
+  Copyright Streamlit Inc. (2018-2022) / Snowflake Inc. (2022)
+  Local browser shim of setComponentReady / onRender / setFrameHeight /
+  setComponentValue. The npm package is ESM/React-only and is not used here.

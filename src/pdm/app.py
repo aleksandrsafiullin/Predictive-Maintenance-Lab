@@ -17,8 +17,10 @@ from pdm.alerts import (
     load_alert_policy,
     save_alert_policy,
 )
+from pdm.architectures import is_reservoir
 from pdm.cli import spawn_worker
 from pdm.config import load_dataset_config, model_defaults
+from pdm.connectome.provenance import SYNTHETIC_DISCLAIMER
 from pdm.data.filters import filter_time_scale_meta
 from pdm.data.prepare import load_processed, processed_ready
 from pdm.device import resolve_device
@@ -45,7 +47,7 @@ from pdm.experiments import (
     resolve_evaluation_artifacts,
     run_dir,
 )
-from pdm.paths import dataset_raw
+from pdm.paths import dataset_raw, run_traces_dir
 from pdm.replay import (
     END_OF_OBSERVED_DATA,
     active_warning_episode_time_s,
@@ -66,6 +68,32 @@ from pdm.train import (
     selection_metric_spec,
     training_mode_label,
 )
+from pdm.visualization.comparison import (
+    BIOLOGICAL_SECTION,
+    SMOKE_NOTE,
+    SYNTHETIC_SECTION,
+    build_comparison_table,
+    comparison_sections,
+)
+from pdm.visualization.component import neural_activity_explorer
+from pdm.visualization.demo import get_demo_instructions, load_demo_scenario
+from pdm.visualization.explorer import (
+    EXPLORER_DISCLAIMER,
+    EXPLORER_MODES,
+    INLINE_TRACE_MAX_NODES,
+    RESERVOIR_REQUIRED_MESSAGE,
+    WORKER_BUSY_MESSAGE,
+    alert_jump_target,
+    build_explorer_payload,
+    collect_alert_rows,
+    fallback_positions,
+    load_scene_from_run,
+    slice_trace_to_alert,
+    stored_alert_prediction,
+    synthetic_banner_required,
+)
+from pdm.visualization.export import load_trace
+from pdm.visualization.trace import run_trace_job
 from pdm.worker import read_status, request_stop, worker_alive
 
 st.set_page_config(page_title="Predictive Maintenance Lab", layout="wide")
@@ -78,6 +106,7 @@ REPLAY_MODE_RESEARCH = "Research"
 REPLAY_MODES = (REPLAY_MODE_VALIDATION, REPLAY_MODE_TEST, REPLAY_MODE_RESEARCH)
 REPLAY_PLAY_INTERVAL_S = 0.4
 _REPLAY_VIEW_KEY = "_replay_view"
+_EXPLORER_DEMO_KEY = "_explorer_demo_run"
 _REPLAY_SESSION_KEYS = (
     "replay_cache",
     "replay_alert_episodes",
@@ -115,6 +144,8 @@ def _status_chip() -> dict:
     alive = worker_alive()
     st.sidebar.write("Worker:", "running" if alive else "idle")
     st.sidebar.json({k: st_.get(k) for k in ("status", "dataset_id", "run_id", "epoch", "message", "error") if k in st_ or st_.get(k)})
+    if st_.get("status") in {"cancelled", "stopped"}:
+        st.sidebar.caption(f"Job interrupted ({st_.get('status')})")
     return st_
 
 
@@ -123,14 +154,22 @@ def main() -> None:
     st.info("Historical replay — not a live equipment connection")
     dataset_id = _dataset()
     _device_box()
-    page = st.sidebar.radio("Screen", ["Data", "Train", "Test & Replay"], index=0)
+    page = st.sidebar.radio(
+        "Screen",
+        options=["Data", "Train", "Test & Replay", "Neural Activity Explorer"],
+        index=0,
+    )
     _status_chip()
     if page == "Data":
         screen_data(dataset_id)
     elif page == "Train":
         screen_train(dataset_id)
-    else:
+    elif page == "Test & Replay":
         screen_replay(dataset_id)
+    elif page == "Neural Activity Explorer":
+        screen_explorer(dataset_id)
+    else:
+        st.error(f"Unknown screen: {page}")
 
 
 def _filters_time_warning(report: dict | None = None) -> str:
@@ -456,7 +495,11 @@ def screen_train(dataset_id: str) -> None:
     if int(st.session_state.get(cap_key) or 0) != next_cap:
         st.session_state[cap_key] = next_cap
     st.session_state[prev_key] = smoke
-    arch = st.selectbox("Architecture", ["gru", "lstm"], index=0)
+    arch = st.selectbox(
+        "Architecture",
+        ["gru", "lstm", "fly_connectome_reservoir", "random_reservoir"],
+        index=0,
+    )
     epochs = st.number_input("Epochs", min_value=1, max_value=200, value=int(mcfg["max_epochs"]))
     hist = st.number_input(
         "History length (measurements)", min_value=2, max_value=128, value=int(mcfg["history_length"])
@@ -520,6 +563,8 @@ def screen_train(dataset_id: str) -> None:
         _auto_refresh()
     if ws.get("status") == "failed":
         st.error(ws.get("error"))
+    if ws.get("status") in {"cancelled", "stopped"}:
+        st.info(f"Job interrupted ({ws.get('status')})")
     st.subheader("Experiments")
     table = list_runs(dataset_id)
     if not table:
@@ -630,6 +675,209 @@ def screen_train(dataset_id: str) -> None:
     if vm:
         with st.expander("validation_metrics.json (debug)"):
             st.json(vm)
+
+
+def _render_architecture_comparison(dataset_id: str) -> None:
+    """One canonical comparison table. Synthetic rows never share the real section."""
+    st.markdown("**Architecture comparison**")
+    try:
+        table = build_comparison_table(dataset_id)
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"Comparison table unavailable ({exc}).")
+        return
+    real, synth = comparison_sections(table)
+    if real.empty and synth.empty:
+        st.caption("No finished runs to compare on this dataset.")
+        return
+    if not real.empty:
+        st.markdown(f"**{BIOLOGICAL_SECTION}**")
+        st.caption(
+            "Same dataset split / evaluation mask. Synthetic fixture graphs are excluded. "
+            "Never mix bearings and filters checkpoints."
+        )
+        if bool(real["smoke"].any()) if "smoke" in real.columns else False:
+            st.caption(SMOKE_NOTE)
+        st.dataframe(real, width="stretch", hide_index=True)
+    st.markdown(f"**{SYNTHETIC_SECTION}**")
+    if synth.empty:
+        st.caption("No synthetic-fixture runs on this dataset.")
+    else:
+        st.caption("These rows are not a biological connectome and are not averaged with real runs.")
+        if bool(synth["smoke"].any()) if "smoke" in synth.columns else False:
+            st.caption(SMOKE_NOTE)
+        st.dataframe(synth, width="stretch", hide_index=True)
+
+
+def screen_explorer(dataset_id: str) -> None:
+    st.header(f"Neural Activity Explorer — {LABELS[dataset_id]}")
+    st.caption(EXPLORER_DISCLAIMER)
+
+    table = [r for r in list_runs(dataset_id) if r.get("has_best") or r.get("has_last")]
+    reservoir_rows = [r for r in table if is_reservoir(str(r.get("architecture") or ""))]
+    selector_rows = reservoir_rows if reservoir_rows else table
+    if not selector_rows:
+        st.warning("No saved model. Train a reservoir run first.")
+        _render_architecture_comparison(dataset_id)
+        return
+
+    if st.button("Load demo scenario"):
+        demo = load_demo_scenario(dataset_id)
+        if demo is None:
+            st.info(get_demo_instructions())
+            st.caption(SYNTHETIC_DISCLAIMER)
+        else:
+            st.session_state[_EXPLORER_DEMO_KEY] = str(demo.get("run_id") or "")
+            st.warning(SYNTHETIC_DISCLAIMER)
+            st.caption("Demo uses a synthetic test graph — not a biological connectome.")
+            st.rerun()
+
+    view = st.session_state.get(_REPLAY_VIEW_KEY) or {}
+    run_ids = [str(r["run_id"]) for r in selector_rows]
+    preferred_run = str(
+        st.session_state.get(_EXPLORER_DEMO_KEY) or view.get("run_id") or ""
+    )
+    run_index = run_ids.index(preferred_run) if preferred_run in run_ids else 0
+    run_id = st.selectbox("Run", run_ids, index=run_index)
+    rec = next((r for r in selector_rows if str(r.get("run_id")) == str(run_id)), {})
+    rdir = run_dir(dataset_id, run_id)
+    scene = load_scene_from_run(rdir)
+    is_synthetic = synthetic_banner_required(rec, scene)
+    graph_mode = str(rec.get("graph_mode") or scene.get("graph_mode") or "")
+    if is_synthetic:
+        st.warning(SYNTHETIC_DISCLAIMER)
+        st.caption(SYNTHETIC_DISCLAIMER)
+
+    arch = str(rec.get("architecture") or "")
+    reservoir = is_reservoir(arch)
+    if not reservoir:
+        st.info(RESERVOIR_REQUIRED_MESSAGE)
+
+    mode = st.radio("Mode", list(EXPLORER_MODES), horizontal=True)
+
+    unit_ids: list[str] = []
+    if processed_ready(dataset_id):
+        bundle = load_processed(dataset_id)
+        units = bundle["units"]
+        unit_ids = [str(u) for u in units["unit_id"].tolist()]
+    preferred_unit = str(view.get("unit_id") or st.session_state.get("replay_unit") or "")
+    uid = None
+    if unit_ids:
+        uidx = unit_ids.index(preferred_unit) if preferred_unit in unit_ids else 0
+        uid = st.selectbox("Unit", unit_ids, index=uidx)
+    else:
+        st.warning("Prepare data first.")
+
+    alert_ts = None
+    alert_episode = None
+    if mode == "Alert inspection":
+        rows = collect_alert_rows(rdir, None)
+        if not rows:
+            st.caption("Select an alert to view its trace")
+            st.caption(
+                "No alert episodes for this run. Alert inspection reads existing alerts.csv when present."
+            )
+        else:
+            labels = [
+                (
+                    f"{item.get('unit_id')} @ {item.get('timestamp_s')} "
+                    f"({item.get('type') or item.get('alert_status') or 'alert'})"
+                )
+                for item in rows
+            ]
+            pick = st.selectbox("Alert episode", labels)
+            alert_episode = rows[labels.index(pick)]
+            jump = alert_jump_target(alert_episode) or {}
+            alert_ts = jump.get("timestamp_s")
+            jump_unit = jump.get("unit_id")
+            if jump_unit:
+                uid = str(jump_unit)
+            st.caption(
+                "Predicted RUL is the stored evaluation prediction, not a rescore from future rows."
+            )
+            stored = stored_alert_prediction(alert_episode)
+            if stored is not None:
+                st.metric("Stored predicted RUL (s)", f"{stored:.4g}")
+
+    n_nodes = int(rec.get("n_nodes") or len(scene.get("nodes") or []) or 0)
+    if st.button("Build trace"):
+        if worker_alive():
+            st.error(WORKER_BUSY_MESSAGE)
+        elif not reservoir:
+            st.info(RESERVOIR_REQUIRED_MESSAGE)
+        elif not uid:
+            st.error("Select a unit first.")
+        elif 0 < n_nodes <= INLINE_TRACE_MAX_NODES:
+            try:
+                run_trace_job(dataset_id, str(run_id), str(uid), lazy=False, device="cpu")
+            except Exception as exc:  # noqa: BLE001
+                st.error(str(exc))
+        else:
+            spawn_worker(
+                {
+                    "kind": "trace",
+                    "dataset_id": dataset_id,
+                    "run_id": str(run_id),
+                    "unit_id": str(uid),
+                    "lazy": False,
+                }
+            )
+            st.rerun()
+
+    ws = read_status()
+    if worker_alive() and ws.get("kind") == "trace":
+        st.info("Building trace…")
+        if st.button("Stop", key="explorer_stop"):
+            request_stop()
+            st.rerun()
+        _auto_refresh()
+
+    _render_architecture_comparison(dataset_id)
+
+    if not uid:
+        return
+    tdir = run_traces_dir(dataset_id, str(run_id), str(uid))
+    if not (tdir / "meta.json").exists():
+        if mode == "Alert inspection":
+            st.caption("Select an alert to view its trace")
+        st.caption("No trace yet. Click Build trace.")
+        return
+    try:
+        trace = load_trace(tdir)
+    except Exception as exc:  # noqa: BLE001
+        st.error(str(exc))
+        return
+    if str(trace.get("status") or "").startswith("traces require"):
+        st.info(RESERVOIR_REQUIRED_MESSAGE)
+        return
+
+    if mode == "Alert inspection" and alert_episode is not None:
+        trace = slice_trace_to_alert(trace, alert_episode, timestamp_s=alert_ts)
+    elif mode == "Alert inspection" and alert_episode is None:
+        st.caption("Select an alert to view its trace")
+
+    node_order = [str(n) for n in (trace.get("node_order") or scene.get("nodes") or [])]
+    scene = load_scene_from_run(rdir, node_order=node_order)
+    if not scene["nodes"]:
+        scene["nodes"] = node_order
+        scene["positions"] = fallback_positions(node_order)
+
+    payload = build_explorer_payload(
+        nodes=scene["nodes"],
+        edges=scene["edges"],
+        positions=scene["positions"],
+        states=trace.get("states"),
+        frame_map=trace.get("frame_map") or [],
+        flags={
+            "mode": mode,
+            "replay_step": int(st.session_state.get("replay_step", 0) or 0),
+            "alert_timestamp_s": alert_ts,
+            "is_synthetic": is_synthetic,
+            "graph_mode": graph_mode,
+            "architecture": arch,
+            "stored_predicted_rul_s": trace.get("predicted_rul_s"),
+        },
+    )
+    neural_activity_explorer(**payload, key="neural_activity_explorer")
 
 
 def _replay_pressure_limit_pa(rdir, cfg: dict) -> float:

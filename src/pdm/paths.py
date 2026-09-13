@@ -55,3 +55,12 @@ def processed_manifest_path(dataset_id: str) -> Path:
 
 def dataset_runs(dataset_id: str) -> Path:
     return runs_root() / dataset_id
+
+
+def run_connectome_dir(dataset_id: str, run_id: str) -> Path:
+    return dataset_runs(dataset_id) / run_id / "connectome"
+
+
+def run_traces_dir(dataset_id: str, run_id: str, unit_id: str | None = None) -> Path:
+    base = dataset_runs(dataset_id) / run_id / "traces"
+    return base / unit_id if unit_id else base

@@ -6,8 +6,26 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from pdm.connectome.provenance import GRAPH_MODE_SYNTHETIC
 from pdm.io_util import read_json
 from pdm.paths import dataset_runs, runs_root
+from pdm.splits import resolve_split_hash, split_hash
+
+_RUN_IDENTITY_KEYS = (
+    "architecture",
+    "graph_mode",
+    "is_synthetic",
+    "parent_graph_hash",
+    "graph_hash",
+    "n_nodes",
+    "split_hash",
+    "leak",
+    "spectral_radius",
+    "state_mode",
+    "history_length",
+    "head",
+    "smoke",
+)
 
 EVALUATIONS_DIRNAME = "evaluations"
 LEGACY_PREDICTIONS_NAME = "predictions.csv"
@@ -43,9 +61,70 @@ def list_runs(dataset_id: str | None = None) -> list[dict[str, Any]]:
             row.setdefault("run_id", run_dir.name)
             row["n_evaluations"] = _count_evaluations(run_dir)
             row["has_legacy_predictions"] = (run_dir / LEGACY_PREDICTIONS_NAME).exists()
+            _enrich_run_identity(row, run_dir)
             rows.append(row)
     rows.sort(key=lambda r: r.get("updated_at") or r.get("run_id") or "", reverse=True)
     return rows
+
+
+def _optional_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        loaded = read_json(path)
+    except Exception:
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _copy_if_missing(row: dict[str, Any], key: str, value: Any) -> None:
+    if value is None:
+        return
+    current = row.get(key)
+    if current is None or current == "":
+        row[key] = value
+
+
+def _enrich_run_identity(row: dict[str, Any], run_path: Path) -> dict[str, Any]:
+    """Fill architecture / graph identity from snapshot + provenance when status omits them."""
+    snap = _optional_json(run_path / "experiment_snapshot.json") or {}
+    model = snap.get("model") if isinstance(snap.get("model"), dict) else {}
+    reservoir = model.get("reservoir") if isinstance(model.get("reservoir"), dict) else {}
+    _copy_if_missing(row, "architecture", model.get("architecture"))
+    _copy_if_missing(row, "head", model.get("head") or snap.get("head"))
+    _copy_if_missing(row, "history_length", model.get("history_length"))
+    _copy_if_missing(row, "smoke", snap.get("smoke") if "smoke" in snap else None)
+    for key in (
+        "graph_mode",
+        "n_nodes",
+        "graph_hash",
+        "parent_graph_hash",
+        "leak",
+        "spectral_radius",
+        "state_mode",
+    ):
+        _copy_if_missing(row, key, reservoir.get(key))
+
+    prov = _optional_json(run_path / "connectome" / "provenance.json") or {}
+    for key in ("graph_mode", "graph_hash", "parent_graph_hash", "n_nodes", "is_synthetic"):
+        _copy_if_missing(row, key, prov.get(key))
+
+    fp = _optional_json(run_path / "dataset_fingerprint.json") or {}
+    split_id = resolve_split_hash(fp) or resolve_split_hash(row) or resolve_split_hash(snap)
+    if split_id is None:
+        split_doc = _optional_json(run_path / "split.json")
+        if split_doc is not None:
+            split_id = resolve_split_hash(split_doc) or split_hash(split_doc)
+    _copy_if_missing(row, "split_hash", split_id)
+
+    mode = str(row.get("graph_mode") or "").strip().lower()
+    if row.get("is_synthetic") is None and mode == GRAPH_MODE_SYNTHETIC:
+        row["is_synthetic"] = True
+    elif row.get("is_synthetic") is not None:
+        row["is_synthetic"] = bool(row.get("is_synthetic"))
+    for key in _RUN_IDENTITY_KEYS:
+        row.setdefault(key, row.get(key))
+    return row
 
 
 def run_dir(dataset_id: str, run_id: str) -> Path:
