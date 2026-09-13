@@ -38,8 +38,9 @@ SYNTHETIC_FIXTURE_NAME = "synthetic_connectome.json"
 FIXTURE_PACKAGE = "pdm.connectome.fixtures"
 
 # Documented FlyEM-style names. Do not invent columns for a missing file.
-SRC_COLUMNS = ("pre",)
-DST_COLUMNS = ("post",)
+# v1.0 feather uses body_pre/body_post; older exports use pre/post.
+SRC_COLUMNS = ("pre", "body_pre")
+DST_COLUMNS = ("post", "body_post")
 WEIGHT_COLUMNS = ("synapse_count", "weight")
 
 
@@ -99,7 +100,8 @@ def _map_malemcns_columns(frame: pd.DataFrame) -> tuple[str, str, str]:
     if src is None or dst is None or weight is None:
         raise ValueError(
             "MaleCNS table columns do not match documented FlyEM names "
-            f"(pre, post, synapse_count/weight). Columns found: {cols}"
+            "(pre/body_pre, post/body_post, synapse_count/weight). "
+            f"Columns found: {cols}"
         )
     return src, dst, weight
 
