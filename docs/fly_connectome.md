@@ -24,7 +24,7 @@ Place the feather file at `data/raw/connectome/connectome-weights-male-cns-v1.0-
 
 The loader does not download GCS objects. Missing files fall back to the synthetic fixture with `source=unavailable` and `graph_mode=synthetic_fixture` — never silently labeled `real_connectome`.
 
-Expected FlyEM-style columns: `body_pre`/`pre`, `body_post`/`post`, and `weight` (or `synapse_count`). Unknown columns are not invented.
+Expected FlyEM-style columns: `pre` or `body_pre` (source neuron), `post` or `body_post` (target neuron), and `synapse_count` (or `weight`). The v1.0 feather uses `body_pre`/`body_post`; older exports use `pre`/`post`. Both are accepted. Unknown columns are not invented.
 
 ## Local path import
 

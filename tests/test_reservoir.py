@@ -243,6 +243,50 @@ def test_bfs_subgraph_weight_threshold(tmp_path):
     assert result2.provenance["weight_threshold"] is None
 
 
+def test_map_malemcns_columns_body_pre_body_post(tmp_path):
+    """v1.0 feather uses body_pre/body_post/weight — must map without error."""
+    from pdm.connectome.sources import _map_malemcns_columns
+
+    df = pd.DataFrame(
+        {"body_pre": [1, 2], "body_post": [2, 3], "weight": [5.0, 3.0]}
+    )
+    src, dst, w = _map_malemcns_columns(df)
+    assert src == "body_pre"
+    assert dst == "body_post"
+    assert w == "weight"
+
+
+def test_map_malemcns_columns_pre_post_synapse_count():
+    """Older-style pre/post/synapse_count still works."""
+    from pdm.connectome.sources import _map_malemcns_columns
+
+    df = pd.DataFrame(
+        {"pre": [1], "post": [2], "synapse_count": [7]}
+    )
+    src, dst, w = _map_malemcns_columns(df)
+    assert src == "pre"
+    assert dst == "post"
+    assert w == "synapse_count"
+
+
+def test_load_malemcns_body_pre_body_post_feather(tmp_path):
+    """Load path handles a feather file with body_pre/body_post/weight columns."""
+    feather_path = tmp_path / "connectome-weights-male-cns-v1.0-minconf-0.5.feather"
+    df = pd.DataFrame(
+        {
+            "body_pre": ["10", "20", "30"],
+            "body_post": ["20", "30", "10"],
+            "weight": [2.0, 4.0, 1.0],
+        }
+    )
+    df.to_feather(feather_path)
+    cg = load_malemcns(feather_path)
+    assert cg.is_synthetic is False
+    assert cg.provenance.get("source") == "local"
+    assert cg.graph.number_of_nodes() == 3
+    assert cg.graph.number_of_edges() == 3
+
+
 def test_yaml_reservoir_defaults_parse():
     cfg = load_dataset_config("bearings")
     mcfg = model_defaults(cfg)
