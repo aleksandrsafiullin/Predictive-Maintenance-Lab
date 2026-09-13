@@ -184,6 +184,11 @@ def prepare_run_graph(
             parent_mode = GRAPH_MODE_SYNTHETIC
         subgraph = src.graph
         resolved = subgraph.number_of_nodes()
+        if not src.is_synthetic and subgraph.number_of_nodes() < int(n_nodes):
+            raise ValueError(
+                f"real_connectome n_nodes={n_nodes} exceeds available graph size "
+                f"{subgraph.number_of_nodes()}"
+            )
     else:
         src = load_synthetic_fixture()
         parent_mode = GRAPH_MODE_SYNTHETIC

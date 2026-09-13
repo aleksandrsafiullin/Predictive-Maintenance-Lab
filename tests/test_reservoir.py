@@ -120,9 +120,13 @@ def test_missing_malemens_fallback_does_not_raise(tmp_path):
         seed=1,
         source_path=missing,
     )
+    assert prov.get("source") == "unavailable"
+    assert prov.get("is_synthetic") is True
     assert prov.get("graph_mode") == "synthetic_fixture"
-    assert resolved >= 1
-    assert graph.number_of_nodes() >= 1  # clamped to fixture size
+    # resolved should be the fixture size (clamped to whatever the synthetic fixture has)
+    assert 1 <= resolved <= 64  # fixture has ~64 nodes
+    assert graph.number_of_nodes() >= 1
+    assert graph.number_of_nodes() <= 64
 
 
 def _make_tiny_feather(tmp_path: Path, n_nodes: int = 30, n_edges: int = 200, seed: int = 0) -> Path:
@@ -182,11 +186,11 @@ def test_load_malemcns_subgraph_missing_fallback(tmp_path):
 
 def test_prepare_run_graph_real_uses_subgraph_bfs(tmp_path):
     """prepare_run_graph with real_connectome uses subgraph BFS (not full NetworkX)."""
-    p = _make_tiny_feather(tmp_path, n_nodes=50, n_edges=500)
+    p = _make_tiny_feather(tmp_path, n_nodes=600, n_edges=3000)
     graph, prov, resolved = prepare_run_graph(
         architecture="fly_connectome_reservoir",
         graph_mode="real_connectome",
-        n_nodes=500,  # valid real_connectome range; tiny file has fewer nodes
+        n_nodes=500,
         seed=5,
         source_path=p,
     )
@@ -196,6 +200,20 @@ def test_prepare_run_graph_real_uses_subgraph_bfs(tmp_path):
     assert prov["full_graph_materialized"] is False
     assert prov["seed"] == 5
     assert resolved == graph.number_of_nodes()
+
+
+def test_prepare_run_graph_real_raises_if_too_few_nodes(tmp_path):
+    """real_connectome raises if feather has fewer nodes than requested."""
+    # Tiny feather with only 5 nodes
+    p = _make_tiny_feather(tmp_path, n_nodes=5, n_edges=20, seed=9)
+    with pytest.raises(ValueError, match="exceeds available"):
+        prepare_run_graph(
+            architecture="fly_connectome_reservoir",
+            graph_mode="real_connectome",
+            n_nodes=500,
+            seed=1,
+            source_path=p,
+        )
 
 
 def test_bfs_subgraph_from_df_determinism(tmp_path):
@@ -217,6 +235,12 @@ def test_bfs_subgraph_weight_threshold(tmp_path):
     result = load_malemcns_subgraph(p, n_nodes=10, seed=0, weight_threshold=5)
     assert result.provenance["weight_threshold"] == 5
     assert "weight_threshold=5" in result.provenance["weight_threshold_note"]
+    # All edges in the subgraph must have weight >= 5
+    for _, _, data in result.graph.edges(data=True):
+        assert data.get("weight", data.get("synapse_count", 0)) >= 5
+    # Default (no threshold): None
+    result2 = load_malemcns_subgraph(p, n_nodes=10, seed=0)
+    assert result2.provenance["weight_threshold"] is None
 
 
 def test_yaml_reservoir_defaults_parse():

@@ -311,6 +311,12 @@ def load_malemcns(path: str | Path | None = None) -> ConnectomeGraph:
 
     Missing files do not invent rows. Provenance ``source=unavailable`` and
     ``graph_mode=synthetic_fixture`` — never silently labeled ``real_connectome``.
+
+    .. warning::
+        This function materialises the full edge list as Python dicts and builds a
+        NetworkX graph of ALL rows (up to 152 M edges). Use ``load_malemcns_subgraph``
+        for the real_connectome training path. ``load_malemcns`` is kept for fallback
+        / synthetic fixture tests only.
     """
     loc = Path(path).expanduser() if path is not None else default_malemcns_path()
     if loc.is_dir():
