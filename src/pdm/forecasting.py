@@ -119,10 +119,17 @@ def trajectory_design(model, prep, features, units, ids, warmup=20):
     endpoints = units.set_index("unit_id")["event_time_s"]
     blocks, rows = [], []
     for uid, group in encoded.groupby("unit_id", sort=True):
+        if hasattr(model, "pooled_trajectory"):
+            from pdm.worker import stop_path
+
+            if stop_path().exists():
+                raise InterruptedError("Full CNS training cancelled")
+            print(f"Full CNS trajectory: {uid}, {len(group)} measurements", flush=True)
         group = group.sort_values("timestamp_s")
         u = group[prep.feature_names].to_numpy(np.float32)
         gaps = group.get("gap_before", pd.Series(False, index=group.index)).fillna(False).to_numpy(bool)
-        states = continuous_states(model, u, gaps)
+        states = (model.pooled_trajectory(u, gaps) if hasattr(model, "pooled_trajectory")
+                  else continuous_states(model, u, gaps))
         age = np.arange(len(group))
         start = 0
         eligible = np.zeros(len(group), bool)

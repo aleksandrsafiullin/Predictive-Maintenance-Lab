@@ -52,7 +52,7 @@ def forward_states(
     for t in range(n_steps):
         u_t = inputs[:, t, :]
         # F.linear(x, W_res) = x @ W_res.T = (W_res @ x.T).T — column j is the source.
-        preact = F.linear(x, W_res, None) + F.linear(u_t, W_in, b_res)
+        preact = recurrent_drive(x, W_res) + F.linear(u_t, W_in, b_res)
         x = keep * x + leak * torch.tanh(preact)
         frames.append(x)
     states = torch.stack(frames, dim=1)
@@ -177,5 +177,27 @@ class LeakyESN(nn.Module):
 
 def _as_float_tensor(value: torch.Tensor | object) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
-        return value.detach().to(dtype=torch.float32).contiguous()
+        result = value.detach().to(dtype=torch.float32)
+        return result.contiguous() if result.layout == torch.strided else result
     return torch.tensor(value, dtype=torch.float32)
+
+
+def recurrent_drive(states: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """The same j→i operator for dense legacy runs and the full sparse CNS."""
+    if weights.layout != torch.strided:
+        if (weights.layout == torch.sparse_csr and weights.device.type == "cpu"
+                and states.device.type == "cpu" and not states.requires_grad and not weights.requires_grad):
+            # PyTorch's generic macOS CSR kernel is substantially slower than
+            # SciPy's native CSR matvec. This preserves float32 j→i semantics.
+            from scipy.sparse import csr_matrix
+
+            version = (weights._version, weights.values()._version)
+            cached = getattr(weights, "_pdm_csr_cache", None)
+            if cached is None or cached[0] != version:
+                matrix = csr_matrix((weights.values().numpy(), weights.col_indices().numpy(),
+                                     weights.crow_indices().numpy()), shape=tuple(weights.shape))
+                cached = (version, matrix)
+                weights._pdm_csr_cache = cached
+            return torch.from_numpy(cached[1] @ states.detach().numpy().T).T
+        return torch.sparse.mm(weights, states.T.contiguous()).T
+    return F.linear(states, weights)

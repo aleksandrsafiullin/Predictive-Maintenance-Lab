@@ -98,6 +98,22 @@ def run_job(job: dict) -> None:
 
             prepare_dataset(job["dataset_id"], progress=progress)
             write_status({"status": "ready", "dataset_id": job["dataset_id"], "kind": kind})
+        elif kind == "train_full_cns":
+            from pdm.connectome.morphology import morphology_directory, prepare_morphology
+            from pdm.train_full_cns import main as train_full_cns
+
+            if job["dataset_id"] != "bearings":
+                raise ValueError("Full CNS forecasting currently supports bearings")
+            write_status({"status": "training", "kind": kind, "dataset_id": "bearings",
+                          "message": "Preparing complete MaleCNS and fitting a new forecast readout"})
+            if not (morphology_directory() / "manifest.json").is_file():
+                prepare_morphology()
+            try:
+                train_full_cns([])
+            except InterruptedError:
+                write_status({"status": "cancelled", "kind": kind, "dataset_id": "bearings"})
+            else:
+                write_status({"status": "completed", "kind": kind, "dataset_id": "bearings"})
         elif kind == "train":
             from pdm.train import run_training
 

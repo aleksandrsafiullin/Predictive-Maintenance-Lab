@@ -1,6 +1,6 @@
 # Neural Activity Explorer
 
-The operational screen contains one scenario: select the prepared model and bearing, then Start, Pause, Next measurement or Reset. There is no Modes selector or trace-building prerequisite. The newest ready anatomy-complete continuous model is selected by default, with a held-out bearing. Archived models remain separate files.
+The operational screen contains one scenario: select the prepared model and bearing, then Start, Pause, Next measurement or Reset. There is no Modes selector or trace-building prerequisite. The newest ready complete-classified-CNS model is selected by default, with a held-out bearing. Old 1,000-neuron training results were removed; other model families remain separate experiments.
 
 > Computational activity in a connectome-based reservoir. This is not a biophysical simulation or recorded activity of a living fly brain.
 
@@ -8,11 +8,15 @@ Synthetic fixtures retain the banner **Synthetic test graph — not a biological
 
 ## The computing brain
 
-The real model has 1,000 MaleCNS neurons and actual synapse-derived recurrent connections. Every computing body ID must have a curated anatomical soma coordinate. The operational screen blocks incomplete anatomy instead of silently drawing only a subset or moving missing cells to invented positions. The older September 13 checkpoint has only 116 matches and is therefore unsuitable for this screen.
+The primary model is now the complete **166,700 classified MaleCNS v1.0 neurons** (`superclass.notna()`), with **25,582,938 directed neuron pairs** representing **124,177,617 synapses**. Every source connection between these bodies is retained, including weight-one and self connections. Unclassified segments are excluded by the documented population rule. There is no BFS, node cap or synapse-strength threshold. The previous four trained 1,000-neuron real-connectome runs were deleted at the user's request; the new readout is trained from scratch.
 
-A deterministic 40,000-cell gray soma cloud supplies the recognizable anatomical reference. It never receives reservoir activity. Cyan/amber computing nodes show signed actual states, including small and zero states. All computing nodes are represented. The legend and counter distinguish them from background anatomy. Fit brain restores the complete anatomical framing. Edges are hidden by default; an internal diagnostic option can draw up to 350 real connections.
+The recurrent operator is stored as CSR, in `W_res[target, source]` orientation. SciPy performs the CPU sparse products; the shared leaky tanh equation preserves chronological state. There is no dense 166,700-square allocation. Synapse counts undergo `log1p` and one global spectral scaling. These dynamics do **not** model neurotransmitter signs, membrane voltages or biological spikes. Sensor inputs and the trained forecast are engineering additions.
 
-Soma positions come from the exact allowlisted body-annotations feather. Spring coordinates are schematic, never anatomical. The payload preserves model body-ID order; state width and anatomical coverage must match it. `n_viz` is a legacy context-count field, not the number of computing neurons. See [MaleCNS data and provenance](malecns_visualization.md).
+All neurons compute, including the **26,062** without a curated point location. **139,662** cells have a soma location and **976** additional cells have a to-soma point: **140,638** plotted locations in total. Missing cells are not placed at invented coordinates. Their states still participate in recurrence and the forecast. The browser shows this coverage explicitly.
+
+The morphology layer contains **123 actual reconstructed neuron arbors**, selected deterministically across annotated classes from Janelia's public SWC files. It preserves branch points, endpoints and original source vertices while simplifying unbranched chains. This is a declared morphology display subset, independent of the full computing population. Brain / Whole CNS buttons control camera framing. Activity / Cell classes controls coloring. The optional connection sample draws at most 12,000 real directed pairs as straight schematic links, explicitly separate from anatomical arbors. It never changes the recurrent graph.
+
+The state-history panel shows actual continuous values for 120 deterministic neuron IDs and up to 120 observed measurements. These are not generated spikes; pausing adds no history. Coordinates, morphology and states share body-ID order and one anatomical transform. Source URLs, hashes, counts and license are recorded with artifacts. See [full model implementation and limitations](full_cns.md).
 
 ## Continuous history and failure interval
 

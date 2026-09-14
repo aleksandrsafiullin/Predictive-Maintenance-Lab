@@ -29,7 +29,7 @@ def operational_screen(monkeypatch, tmp_path, tiny_bearing_tables):
         rdir = tmp_path / name
         (rdir / "connectome").mkdir(parents=True)
         (rdir / "connectome" / "provenance.json").write_text(json.dumps({
-            "sampling_method": "seeded_bfs_soma_xyz" if ready else "seeded_bfs",
+            "sampling_method": "all_classified_neurons" if ready else "seeded_bfs_soma_xyz",
         }))
         if ready:
             (rdir / "interval_profile.json").write_text(json.dumps({"version": 1, "ready": True}))

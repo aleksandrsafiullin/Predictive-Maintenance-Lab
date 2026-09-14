@@ -2,6 +2,8 @@
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="data:,">
     <script src="./vendor/streamlit-component-lib.js"></script>
     <script src="./vendor/three.min.js"></script>
     <style>
@@ -30,6 +32,7 @@
             border: 1px solid #26344788;
         }
         #canvas {
+            touch-action: none;
             width: 100%;
             height: 620px;
             display: block;
@@ -77,6 +80,14 @@
             background: linear-gradient(90deg, #61d8ee, #28394a 50%, #f2be68);
         }
         #reset-view { position: absolute; right: 20px; bottom: 104px; font-size: 10px; }
+        #anatomy-views { position: absolute; left: 20px; bottom: 104px; display: none; gap: 6px; }
+        #anatomy-views button { font-size: 10px; padding: 7px 9px; }
+        #stage:fullscreen { border-radius: 0; width: 100vw; height: 100vh; }
+        #stage:fullscreen #canvas { height: 100vh !important; }
+        #activity-history-panel { display: none; padding: 16px; background: #081019; border-top: 1px solid #263447; }
+        #activity-history-panel h4 { font-size: 11px; font-weight: 500; margin: 0 0 12px; color: #b5c6d3; }
+        #activity-history { height: 130px; display: block; }
+        #history-caption { font-size: 10px; color: #879eae; margin-top: 10px; }
         #controls {
             padding: 8px 12px 10px;
             display: flex;
@@ -113,8 +124,10 @@
             <div id="hud-hint">Drag to rotate · wheel to zoom · Play runs in this view</div>
         </div>
         <button id="reset-view" type="button">Fit brain</button>
+        <div id="anatomy-views"><button id="view-brain">Brain</button><button id="view-cns">Whole CNS</button><button id="view-fullscreen">Expand</button></div>
         <div id="hud-legend"></div>
     </div>
+    <div id="activity-history-panel"><h4>NEURAL STATE HISTORY</h4><canvas id="activity-history" aria-label="Actual state history of 120 selected neurons"></canvas><div id="history-caption"></div></div>
     <div id="controls"></div>
     <script src="./main.js"></script>
 </body>

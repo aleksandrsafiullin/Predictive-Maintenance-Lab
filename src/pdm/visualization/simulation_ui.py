@@ -1,6 +1,7 @@
 """One server clock drives inference, neural activity and equipment charts."""
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,10 @@ def _simulation_model(path: str, checkpoint_stamp: int):
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def _simulation_scene(path, checkpoint_stamp, soma_stamp, context=True):
+    if (Path(path) / "connectome/recurrent.npz").is_file():
+        from pdm.visualization.full_scene import full_cns_scene
+
+        return full_cns_scene(path)
     scene = load_scene_from_run(Path(path))
     return build_ui_explorer_payload(
         nodes=scene["nodes"], edges=scene["edges"], positions=scene["positions"],
@@ -148,9 +153,9 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
             node_ids = list(map(str, model.node_order))
             anatomy = payload.get("flags") or {}
             if (anatomy.get("hull_mode") != "malecns_anatomy"
-                or int(anatomy.get("n_with_soma") or 0) != len(node_ids)
+                or (not anatomy.get("full_cns") and int(anatomy.get("n_with_soma") or 0) != len(node_ids))
                 or set(payload["nodes"]) != set(node_ids)
-                or any(n not in payload["positions"] for n in node_ids)):
+                or (not anatomy.get("full_cns") and any(n not in payload["positions"] for n in node_ids))):
                 session["playing"] = False
                 if scheduled:
                     st.rerun()
@@ -212,6 +217,9 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
         predicted_rul_s=pred,
         frame_map=[{"timestamp_s": now, "frame_index": index}] if has_activity else [],
     )
+    if payload["flags"].get("full_cns") and has_activity:
+        payload["states_b64"] = base64.b64encode(np.asarray(values[-1], dtype="<f4").tobytes()).decode()
+        payload["states"] = []
     payload["flags"].update(
         mode="Equipment replay", phase="simulation", synchronized=True,
         signal_label=activity, now_timestamp_s=now, history_length=hist_len,
@@ -239,14 +247,34 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
         st.caption(f"Legacy point forecast: {pred/scale:.2f} {unit_label} remaining; no calibrated interval is available.")
     left, right = st.columns([1, 1.35], gap="medium")
     with left, st.container(key="lab_brain_panel"):
-        render_panel_header("01", "The computing brain", "MaleCNS anatomy", f"{visible:,} / {model.n_nodes:,} neurons")
+        full_cns = bool(payload["flags"].get("full_cns"))
+        render_panel_header("01", "MaleCNS · whole connectome" if full_cns else "The computing brain",
+                            "MaleCNS v1.0", f"{model.n_nodes:,} computing neurons")
+        if full_cns:
+            st.caption(f"{model.provenance['n_edges']:,} directed connections · {model.provenance['n_synapses']:,} synapses")
+            color, arbors = st.columns([1.3, 1])
+            with color:
+                payload["flags"]["color_mode"] = st.radio("Color", ["Activity", "Cell classes"],
+                                                          horizontal=True, key=key + ":color", label_visibility="collapsed")
+            with arbors:
+                payload["flags"]["show_morphology"] = st.checkbox("Neuron arbors", value=True, key=key + ":arbors")
+                payload["flags"]["show_connections"] = st.checkbox("Connection sample", value=False, key=key + ":edges")
+            history = trace.get("activity_history")
+            if history is not None:
+                payload["activity_history"] = history.tolist()
+                payload["activity_history_timestamps_s"] = trace["activity_history_timestamps_s"].tolist()
+                payload["activity_history_ids"] = [model.node_order[i] for i in trace["activity_history_ids"]]
         payload["flags"]["compact"] = True
         neural_activity_explorer(**payload, key=key + ":brain")
-        st.markdown(
-            '<div class="lab-panel-foot"><strong>Every computing neuron is visible.</strong> '
-            'Color and intensity show the current state; the dim anatomy provides spatial context.</div>',
-            unsafe_allow_html=True,
-        )
+        if full_cns:
+            morph = payload.get("morphology", {})
+            st.caption(f"{visible:,} curated soma/to-soma positions · {model.n_nodes - visible:,} neurons compute without a curated point. "
+                       f"Arbors: {morph.get('n_neurons', 0)} reconstructed neurons. "
+                       "Connection sample: up to 12,000 real pairs, drawn as straight links; not axon paths.")
+            st.caption("MaleCNS data: FlyEM / HHMI Janelia, Cambridge / MRC LMB, Google Research · CC-BY 4.0. "
+                       "Computational states, not biological recordings or spikes.")
+        else:
+            st.markdown('<div class="lab-panel-foot">Color and intensity show the current state.</div>', unsafe_allow_html=True)
     with right, st.container(key="lab_forecast_panel"):
         render_panel_header("02", "Failure forecast", "Evidence → failure window", "SYNCHRONIZED")
         fig = build_work_overlay_figure(
@@ -274,8 +302,14 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
     if not has_activity:
         return
     with st.expander("Inspect a computing neuron", expanded=False):
-        node = st.selectbox("Reservoir body ID", list(model.node_order), key=key + ":neuron", on_change=_pause, args=(key,))
-        i = list(model.node_order).index(node)
+        if hasattr(model, "pool_index"):
+            node = st.text_input("MaleCNS body ID", value=model.node_order[0], key=key + ":neuron", on_change=_pause, args=(key,)).strip()
+            if node not in model.node_order:
+                st.info("Enter a classified MaleCNS body ID from this model.")
+                return
+        else:
+            node = st.selectbox("Reservoir body ID", list(model.node_order), key=key + ":neuron", on_change=_pause, args=(key,))
+        i = model.node_order.index(node)
         proc = trace["processing"]
         inp, recurrent, bias, prev = (
             float(proc["input_drive"][-1, i]), float(proc["recurrent_drive"][-1, i]),

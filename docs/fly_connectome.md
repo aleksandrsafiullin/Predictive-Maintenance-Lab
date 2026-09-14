@@ -1,5 +1,7 @@
 # Fly connectome reservoir
 
+The primary Neural Activity Explorer now uses the [complete classified MaleCNS](full_cns.md), with 166,700 computing neurons and a sparse recurrent operator. The 500–2000-neuron path below is retained for legacy comparison experiments and synthetic tests; it is not the operational model or the Train screen's fly-model workflow.
+
 Leaky Echo State Network whose recurrent matrix comes from a fly CNS subgraph (or a matched random rewiring). GRU/LSTM remain the default architectures. This page documents import, graph orientation, CI fallback, and provenance.
 
 ## Preferred source (MaleCNS)

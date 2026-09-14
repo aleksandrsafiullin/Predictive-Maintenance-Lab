@@ -37,6 +37,13 @@
     var cachedBounds = null;
     var lastFitKey = "";
     var lastGeometryMode = "";
+    var morphology = {};
+    var morphologyXYZ = null;
+    var morphologyOwners = null;
+    var focusBrain = false;
+    var activityHistory = [];
+    var activityHistoryTimestamps = [];
+    var classPalette = {};
 
     var playBtn;
     var pauseBtn;
@@ -94,6 +101,7 @@
     }
 
     function canvasHeight() {
+        if (document.fullscreenElement) return window.innerHeight;
         if (flags.synchronized) {
             return 570;
         }
@@ -209,6 +217,7 @@
     }
 
     function nodeSizeScale() {
+        if (flags.full_cns) return 0.07;
         var n = nNodes();
         if (isAnatomy() && placed && placed.length) {
             var vis = 0;
@@ -252,6 +261,56 @@
             b = lerp(0.38, 0.88, u2);
         }
         return { r: r, g: g, b: b, t: t };
+    }
+
+    function cellColor(index, value, peak) {
+        if (flags.color_mode === "Cell classes") {
+            var cls = (flags.class_ids || [])[index] || 0;
+            if (!classPalette[cls]) {
+                var color = new THREE.Color().setHSL(cls * 0.61803398875 % 1, 0.65, 0.62);
+                classPalette[cls] = {r: color.r, g: color.g, b: color.b, t: 0.5};
+            }
+            return classPalette[cls];
+        }
+        return colorFromValue(value, peak);
+    }
+
+    function decodeBuffer(encoded, Type) {
+        var raw = atob(encoded || "");
+        var bytes = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+        return new Type(bytes.buffer);
+    }
+
+    function drawActivityHistory() {
+        var panel = document.getElementById("activity-history-panel");
+        if (!panel) return;
+        panel.style.display = flags.full_cns ? "block" : "none";
+        if (!flags.full_cns) return;
+        var historyCanvas = document.getElementById("activity-history");
+        var width = Math.max(panel.clientWidth - 32, 100);
+        var height = 130;
+        historyCanvas.width = width * 2;
+        historyCanvas.height = height * 2;
+        historyCanvas.style.width = width + "px";
+        var ctx = historyCanvas.getContext("2d");
+        ctx.scale(2, 2);
+        ctx.fillStyle = "#081019"; ctx.fillRect(0, 0, width, height);
+        var n = activityHistory.length;
+        var rows = n ? activityHistory[0].length : 0;
+        for (var t = 0; t < n; t++) {
+            for (var j = 0; j < rows; j++) {
+                var v = Number(activityHistory[t][j]) || 0;
+                var c = colorFromValue(v, 1);
+                ctx.fillStyle = "rgb(" + Math.round(c.r*255) + "," + Math.round(c.g*255) + "," + Math.round(c.b*255) + ")";
+                ctx.fillRect(t * width / 120, j * height / rows, Math.ceil(width / 120), Math.ceil(height / rows));
+            }
+        }
+        var start = n ? activityHistoryTimestamps[0] / 60 : 0;
+        var end = n ? activityHistoryTimestamps[n - 1] / 60 : 0;
+        document.getElementById("history-caption").textContent = "120 selected neurons · actual states · " + start.toFixed(0) + "–" + end.toFixed(0) + " min · time →";
+        historyCanvas.dataset.frames = String(n);
+        historyCanvas.dataset.neurons = String(rows);
     }
 
     function rawXYZ(i) {
@@ -414,6 +473,9 @@
             for (i = 0; i < n; i++) {
                 accBounds(nodeXYZ(i), b);
             }
+        } else if (flags.full_cns && focusBrain && flags.brain_bounds) {
+            accBounds(flags.brain_bounds[0], b);
+            accBounds(flags.brain_bounds[1], b);
         } else {
             var nA = nNodes();
             for (i = 0; i < nA; i++) {
@@ -493,6 +555,9 @@
 
     function anatomyAxes() {
         var b = sceneBounds();
+        if (flags.full_cns) {
+            return {thin: [0, -1, 0], tall: [0, 0, -1], right: [1, 0, 0], hThin: b.hy, hMid: b.hx, hTall: b.hz};
+        }
         var axes = [
             { u: [1, 0, 0], h: b.hx },
             { u: [0, 1, 0], h: b.hy },
@@ -529,7 +594,8 @@
     function fittedViewDistance(aspect) {
         var b = sceneBounds();
         var fovDeg = isAnatomy() ? FOV_ANATOMY : FOV_SCHEMATIC;
-        var fill = isAnatomy() ? 0.84 : 0.7;
+        // Leave room for the clock above and anatomy controls / legend below.
+        var fill = flags.full_cns ? 0.64 : (isAnatomy() ? 0.84 : 0.7);
         var fovY = (fovDeg * Math.PI) / 180;
         var asp = Math.max(Number(aspect) || 1, 0.2);
         var halfY = Math.tan(fovY * 0.5);
@@ -563,6 +629,11 @@
         }
         var target = sceneLookAt();
         var ax = anatomyAxes();
+        if (flags.full_cns) {
+            target = target.map(function (value, axis) {
+                return value - ax.tall[axis] * ax.hTall * 0.15;
+            });
+        }
         var cy = Math.cos(rotY);
         var sy = Math.sin(rotY);
         var cx = Math.cos(rotX);
@@ -592,7 +663,7 @@
         for (k = 0; k < nodes.length; k++) {
             indexOf[String(nodes[k])] = k;
         }
-        var cap = isAnatomy() ? ANATOMY_EDGE_CAP : edges.length;
+        var cap = isAnatomy() ? (flags.full_cns ? Number(flags.edge_cap || 12000) : ANATOMY_EDGE_CAP) : edges.length;
         var step = edges.length > cap ? Math.ceil(edges.length / cap) : 1;
         var e;
         for (e = 0; e < edges.length; e += step) {
@@ -664,15 +735,26 @@
         var nextInputs = args.inputs || [];
         var geometryMode = String(nextFlags.hull_mode || "schematic_cns") + "|" +
             Boolean(nextFlags.show_connections) + "|" + Boolean(nextFlags.show_anatomy_envelope) + "|" +
-            (nextInputs[0] ? nextInputs[0].length : 0);
+            (nextInputs[0] ? nextInputs[0].length : 0) + "|" + Boolean(nextFlags.show_morphology) + "|" +
+            ((args.morphology || {}).version || "");
         var rebuild = geometryMode !== lastGeometryMode || !sameSceneGeometry(args);
         nodes = args.nodes || [];
         edges = args.edges || [];
         positions = args.positions || {};
-        states = args.states || [];
+        states = args.states_b64 ? [decodeBuffer(args.states_b64, Float32Array)] : args.states || [];
         inputs = args.inputs || [];
         frameMap = args.frame_map || [];
         flags = args.flags || {};
+        if ((args.morphology || {}).version !== morphology.version) {
+            morphology = args.morphology || {};
+            morphologyXYZ = morphology.positions_b64 ? decodeBuffer(morphology.positions_b64, Float32Array) : null;
+            morphologyOwners = morphology.owners_b64 ? decodeBuffer(morphology.owners_b64, Int32Array) : null;
+        }
+        activityHistory = args.activity_history || [];
+        activityHistoryTimestamps = args.activity_history_timestamps_s || [];
+        drawActivityHistory();
+        var viewButtons = document.getElementById("anatomy-views");
+        if (viewButtons) viewButtons.style.display = flags.full_cns ? "flex" : "none";
         if (flags.synchronized) {
             playing = false;
             frameIndex = 0;
@@ -787,7 +869,7 @@
         if (!flags.synchronized && rul != null && isFinite(rul)) {
             bits.push("predicted RUL " + rul.toFixed(3) + "s");
         }
-        bits.push(nHud + " / " + nNodes() + " neurons");
+        bits.push(flags.full_cns ? nNodes().toLocaleString() + " computing · " + nHud.toLocaleString() + " positioned" : nHud + " / " + nNodes() + " neurons");
         if (hudLine) {
             hudLine.textContent = bits.join("  ·  ");
         }
@@ -824,6 +906,12 @@
             hudLegend.textContent = String(flags.signal_label || "State") + " · cyan: negative · amber: positive · brightness: magnitude" +
                 " · scale ±" + Number(peak).toPrecision(3) +
                 (contextPositions.length ? "\nDim gray: anatomical reference only" : "");
+            if (flags.full_cns) {
+                hudLegend.textContent = flags.color_mode === "Cell classes"
+                    ? "Color: annotated cell class · central brain, optic lobes and nerve cord"
+                    : "State · cyan: negative · amber: positive · scale ±1";
+                if (flags.show_morphology && morphology.n_neurons) hudLegend.textContent += "\n" + morphology.n_neurons + " reconstructed neuron arbors · official MaleCNS SWC";
+            }
         }
         // Read-only observability for browser verification of the actual draw set.
         canvas.dataset.drawnNeurons = String(vis ? vis.length : 0);
@@ -831,12 +919,16 @@
         canvas.dataset.contextCells = String(contextPositions.length);
         canvas.dataset.timestampS = ts == null ? "" : String(ts);
         canvas.dataset.geometryBuilds = String(renderer && renderer.rebuildCount || 0);
+        canvas.dataset.recurrentEdges = String(flags.n_edges || edges.length);
+        canvas.dataset.synapses = String(flags.n_synapses || 0);
+        canvas.dataset.drawnConnections = String(renderer && renderer.edgeIndex ? renderer.edgeIndex.length / 2 : 0);
+        canvas.dataset.morphologyNeurons = String(flags.show_morphology ? morphology.n_neurons || 0 : 0);
     }
 
     function syncFrameHeight() {
         if (window.Streamlit && window.Streamlit.setFrameHeight) {
             if (flags.synchronized) {
-                window.Streamlit.setFrameHeight(canvasHeight());
+                window.Streamlit.setFrameHeight(canvasHeight() + (flags.full_cns ? 211 : 0));
                 return;
             }
             var h = Math.max(document.body.scrollHeight, canvasHeight() + 88);
@@ -1007,7 +1099,7 @@
                 "uniform float uMul;" +
                 "void main(){ vCol=color; vec4 mv=modelViewMatrix*vec4(position,1.0);" +
                 "gl_Position=projectionMatrix*mv;" +
-                "gl_PointSize=clamp(aSize*uMul*(36.0/max(-mv.z,0.4)), 2.2, 13.0); }",
+                "gl_PointSize=clamp(aSize*uMul*(36.0/max(-mv.z,0.4)), " + (flags.full_cns ? "0.8, 4.0" : "2.2, 13.0") + "); }",
             fragmentShader:
                 "varying vec3 vCol; void main(){ vec2 p=gl_PointCoord*2.0-1.0; float d=dot(p,p);" +
                 "if(d>1.0) discard; if(dot(vCol,vCol)<0.00015) discard; float a=exp(-d*" +
@@ -1208,6 +1300,17 @@
         }
 
         this.edgeIndex = [];
+        this.arborColor = null;
+        if (flags.show_morphology && morphologyXYZ && morphologyOwners) {
+            var arbor = new THREE.BufferGeometry();
+            arbor.setAttribute("position", new THREE.BufferAttribute(morphologyXYZ, 3));
+            this.arborColor = new THREE.BufferAttribute(new Float32Array(morphologyXYZ.length), 3);
+            arbor.setAttribute("color", this.arborColor);
+            this.scene.add(new THREE.LineSegments(arbor, new THREE.LineBasicMaterial({
+                vertexColors: true, transparent: true, opacity: 0.60, depthWrite: false,
+                blending: THREE.NormalBlending
+            })));
+        }
         this.lineColor = null;
         var drawn = selectDrawnEdges();
         if (drawn.length) {
@@ -1297,7 +1400,7 @@
             var nScale = nodeSizeScale();
             for (i = 0; i < nv; i++) {
                 var ni = vis[i];
-                var c = colorFromValue(values[ni] || 0, this.peak);
+                var c = cellColor(ni, values[ni] || 0, this.peak);
                 var active = anatomy || reservoirActive(values[ni] || 0, this.peak);
                 this.colorAttr.array[i * 3] = active ? c.r : 0;
                 this.colorAttr.array[i * 3 + 1] = active ? c.g : 0;
@@ -1353,6 +1456,17 @@
                 this.lineColor.array[a + 5] = b;
             }
             this.lineColor.needsUpdate = true;
+        }
+        if (this.arborColor && morphologyOwners) {
+            for (i = 0; i < morphologyOwners.length; i++) {
+                var owner = morphologyOwners[i];
+                var ac = cellColor(owner, values[owner] || 0, this.peak);
+                var at = i * 6;
+                this.arborColor.array[at] = this.arborColor.array[at + 3] = ac.r;
+                this.arborColor.array[at + 1] = this.arborColor.array[at + 4] = ac.g;
+                this.arborColor.array[at + 2] = this.arborColor.array[at + 5] = ac.b;
+            }
+            this.arborColor.needsUpdate = true;
         }
         if (this.sensorColor && inRow) {
             for (i = 0; i < this.nSensor; i++) {
@@ -1869,6 +1983,35 @@
         lastX = ev.clientX;
         lastY = ev.clientY;
     });
+    document.getElementById("view-brain").addEventListener("click", function () {
+        focusBrain = true; cachedBounds = null; camDist = 1; rotY = 0.08; rotX = 0.04; needsRender = true;
+    });
+    document.getElementById("view-cns").addEventListener("click", function () {
+        focusBrain = false; cachedBounds = null; camDist = 1; rotY = 0.08; rotX = 0.04; needsRender = true;
+    });
+    document.getElementById("view-fullscreen").addEventListener("click", function () {
+        var stage = document.getElementById("stage");
+        if (document.fullscreenElement) document.exitFullscreen();
+        else if (stage.requestFullscreen) stage.requestFullscreen();
+    });
+    document.addEventListener("fullscreenchange", function () {
+        if (renderer) renderer.resize();
+        needsRender = true;
+    });
+    canvas.addEventListener("touchstart", function (ev) {
+        if (ev.touches.length === 1) {
+            dragging = true; lastX = ev.touches[0].clientX; lastY = ev.touches[0].clientY;
+        }
+    }, {passive: true});
+    canvas.addEventListener("touchmove", function (ev) {
+        if (ev.touches.length === 1 && dragging) {
+            ev.preventDefault();
+            rotY += (ev.touches[0].clientX - lastX) * 0.006;
+            rotX = clamp(rotX + (ev.touches[0].clientY - lastY) * 0.006, -1.3, 1.3);
+            lastX = ev.touches[0].clientX; lastY = ev.touches[0].clientY; needsRender = true;
+        }
+    }, {passive: false});
+    canvas.addEventListener("touchend", function () { dragging = false; }, {passive: true});
     document.getElementById("reset-view").addEventListener("click", function () {
         needsRender = true;
         camDist = 1;
@@ -1901,6 +2044,7 @@
     );
     window.addEventListener("resize", function () {
         needsRender = true;
+        drawActivityHistory();
         if (renderer && renderer.resize) {
             renderer.resize();
         }

@@ -1835,10 +1835,10 @@ def test_explorer_docs_single_flow_anatomy_history_and_validation():
     assert "A heavy job is already running. Please wait." in text
     assert "one scenario" in text
     assert "no Modes selector or trace-building prerequisite" in text
-    assert "Every computing body ID" in text
-    assert "blocks incomplete anatomy" in text
-    assert "Spring coordinates are schematic, never anatomical" in text
-    assert "state width and anatomical coverage must match" in text
+    assert "166,700 classified MaleCNS" in text
+    assert "All neurons compute" in text
+    assert "Missing cells are not placed at invented coordinates" in text
+    assert "Coordinates, morphology and states share body-ID order" in text
     assert "persistent chronological state" in text
     assert "interval_profile.json" in text
     assert "dataset fingerprint" in text

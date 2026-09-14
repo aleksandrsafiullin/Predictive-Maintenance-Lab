@@ -157,7 +157,16 @@ Equivalent with explicit graph mode:
   --graph-mode synthetic_fixture --n-nodes 8 --smoke
 ```
 
-Real MaleCNS subgraph (after step 2 optional download; `n_nodes` in 500–2000):
+Primary Neural Activity Explorer: train the complete classified MaleCNS from scratch
+(166,700 neurons; 25,582,938 directed pairs; no sampling):
+
+```bash
+.venv/bin/python scripts/train_brain_forecast.py
+```
+
+See [Full CNS data, morphology, training and limitations](docs/full_cns.md).
+
+Legacy subgraph experiments for comparisons (`n_nodes` in 500–2000; not the primary Explorer):
 
 ```bash
 .venv/bin/python -m pdm train --dataset bearings --arch fly_connectome_reservoir \

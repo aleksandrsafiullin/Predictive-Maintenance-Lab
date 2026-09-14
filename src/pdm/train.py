@@ -1229,7 +1229,10 @@ def _save_ckpt(
         rmeta = None
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": {
+                k: v for k, v in model.state_dict().items()
+                if not hasattr(model, "write_artifacts") or k.startswith("readout.")
+            },
             "optimizer_state_dict": opt.state_dict() if opt is not None else {},
             "compat": compatibility_dict(
                 mcfg, prep, split, dataset_id, head, fingerprint=fingerprint, reservoir_meta=rmeta
@@ -1311,6 +1314,14 @@ def _build_reservoir_model(mcfg: dict, *, input_size: int, head: str, time_scale
 
     res = dict(mcfg.get("reservoir") or {})
     seed = int(res.get("seed", mcfg.get("seed", 42)))
+    if res.get("graph_scope") == "whole_classified_cns":
+        from pdm.models.full_cns import build_full_cns
+
+        model = build_full_cns(input_size, time_scale_s, source_path=res.get("source_path"),
+                               seed=seed, leak=float(res.get("leak", 0.2)),
+                               spectral_radius=float(res.get("spectral_radius", 0.9)),
+                               input_scale=float(res.get("input_scale", 0.1)), head=head)
+        return model, _reservoir_meta_from_model(model, mcfg)
     requested = int(res.get("n_nodes", 1000))
     graph_mode = str(res.get("graph_mode") or "synthetic_fixture")
     graph, parent_prov, resolved_n = prepare_run_graph(
@@ -1346,6 +1357,9 @@ def _write_connectome_artifacts(rdir: Path, model) -> None:
 
     cdir = Path(rdir) / "connectome"
     cdir.mkdir(parents=True, exist_ok=True)
+    if hasattr(model, "write_artifacts"):
+        model.write_artifacts(cdir)
+        return
     graph = getattr(model, "graph", None)
     provenance = dict(getattr(model, "provenance", {}) or {})
     if graph is not None:
@@ -1390,6 +1404,19 @@ def _load_reservoir_from_artifacts(run_path: Path, blob: dict, meta: dict, devic
     from pdm.connectome.graph import graph_from_payload
     from pdm.connectome.weights import load_reservoir_weights
     from pdm.io_util import read_json
+
+    if (Path(run_path) / "connectome" / "recurrent.npz").is_file():
+        from pdm.models.full_cns import load_full_cns
+
+        if str(device) != "cpu":
+            raise ValueError("Full CNS sparse runtime currently requires CPU")
+        model = load_full_cns(Path(run_path) / "connectome", meta)
+        readout = {k.removeprefix("readout."): v for k, v in blob["model_state_dict"].items()
+                   if k.startswith("readout.")}
+        model.readout.load_state_dict(readout, strict=True)
+        model.rul_transform = str(meta.get("rul_transform", "linear"))
+        model.rul_reference_s = float(meta.get("rul_reference_s", 60.0))
+        return model
 
     weights_path = Path(run_path) / "connectome" / "weights.npz"
     if not weights_path.exists():

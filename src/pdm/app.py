@@ -129,6 +129,9 @@ def _dataset() -> str:
 
 
 def _device_box() -> None:
+    if st.session_state.get("screen_selection") == "Neural Activity Explorer":
+        st.sidebar.caption("Compute device: **CPU · sparse connectome**")
+        return
     info = resolve_device("auto")
     st.sidebar.caption(f"Compute device: **{info.name}**")
     if info.fallback_reason:
@@ -473,6 +476,34 @@ def screen_train(dataset_id: str) -> None:
     if not processed_ready(dataset_id):
         st.warning("Prepare data on the Data screen first. There is no dummy training path.")
         return
+    arch = st.selectbox(
+        "Architecture", ["gru", "lstm", "fly_connectome_reservoir", "random_reservoir"], index=0,
+    )
+    if dataset_id == "bearings" and arch == "fly_connectome_reservoir":
+        st.subheader("Train the complete MaleCNS")
+        st.write("All classified neurons and their directed connections participate in every measurement. "
+                 "A new forecast readout is fitted from scratch using whole-bearing cross-validation, "
+                 "with separate interval calibration.")
+        st.caption("Full chronological histories · 20-measurement warmup · CPU sparse computation. "
+                   "The population is determined by the source annotations; it is not a neuron-count setting.")
+        start, stop = st.columns(2)
+        if start.button("Train full MaleCNS from scratch", disabled=worker_alive(), type="primary"):
+            spawn_worker({"kind": "train_full_cns", "dataset_id": "bearings"})
+            st.rerun()
+        if stop.button("Stop", disabled=not worker_alive()):
+            request_stop()
+            st.rerun()
+        ws = read_status()
+        if worker_alive():
+            st.info(ws.get("message") or "Training the full connectome. This can take several minutes.")
+            _auto_refresh()
+        elif ws.get("status") == "failed":
+            st.error(ws.get("error"))
+        elif ws.get("status") == "completed":
+            st.success("Training completed. Open Neural Activity Explorer to run the saved model.")
+        elif ws.get("status") == "cancelled":
+            st.info("Training cancelled.")
+        return
     cfg = load_dataset_config(dataset_id)
     mcfg = model_defaults(cfg)
     bundle = load_processed(dataset_id)
@@ -511,11 +542,6 @@ def screen_train(dataset_id: str) -> None:
     if int(st.session_state.get(cap_key) or 0) != next_cap:
         st.session_state[cap_key] = next_cap
     st.session_state[prev_key] = smoke
-    arch = st.selectbox(
-        "Architecture",
-        ["gru", "lstm", "fly_connectome_reservoir", "random_reservoir"],
-        index=0,
-    )
     epochs = st.number_input("Epochs", min_value=1, max_value=200, value=int(mcfg["max_epochs"]))
     hist = st.number_input(
         "History length (measurements)", min_value=2, max_value=128, value=int(mcfg["history_length"])
@@ -932,7 +958,7 @@ def _neural_test_run_ready(dataset_id: str, rec: dict) -> bool:
         return False
     return (
         isinstance(provenance, dict)
-        and provenance.get("sampling_method") == "seeded_bfs_soma_xyz"
+        and provenance.get("sampling_method") == "all_classified_neurons"
         and isinstance(profile, dict)
         and profile.get("version") == 1
         and profile.get("ready") is True
