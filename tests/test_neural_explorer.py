@@ -11,7 +11,6 @@ from pdm.paths import project_root
 from pdm.visualization.explorer import (
     ANATOMY_MISSING_CAPTION,
     EXPLORER_DISCLAIMER,
-    EXPLORER_MODES,
     RESERVOIR_REQUIRED_MESSAGE,
     SOMA_DOWNSAMPLE_CAPTION,
     build_explorer_payload,
@@ -118,9 +117,36 @@ def _explorer_harness(
         fake_row["parent_is_synthetic"] = parent_is_synthetic
     monkeypatch.setattr("pdm.data.prepare.processed_ready", lambda ds: ds == "bearings")
     monkeypatch.setattr("pdm.data.prepare.load_processed", lambda ds: bundle)
+    monkeypatch.setattr("pdm.replay.bind_replay_to_run", lambda *args: {**bundle, "current_fingerprint": bundle["fingerprint"]})
     monkeypatch.setattr("pdm.experiments.list_runs", lambda ds=None: [fake_row])
     monkeypatch.setattr("pdm.experiments.run_dir", lambda ds, rid: rdir)
     monkeypatch.setattr("pdm.worker.worker_alive", lambda: worker_alive)
+    monkeypatch.setattr("pdm.visualization.simulation_ui.worker_alive", lambda: worker_alive)
+    # The operational screen opens a saved model directly, without a Build trace
+    # prerequisite. Supply a small real checkpoint boundary for this UI harness.
+    (rdir / "best.pt").write_bytes(b"ui fixture checkpoint")
+    (cdir / "graph.json").write_text(json.dumps({"node_order": [str(i) for i in range(n_nodes)], "edges": []}))
+
+    def _ui_model(*_args):
+        import networkx as nx
+
+        from pdm.models import FlyConnectomeReservoir
+        from pdm.preprocessing import Preprocessor
+
+        graph_doc = json.loads((cdir / "graph.json").read_text())
+        nodes = graph_doc.get("node_order") or graph_doc.get("nodes") or []
+        graph = nx.DiGraph()
+        graph.add_nodes_from(nodes)
+        graph.add_edges_from(zip(nodes, nodes[1:]), weight=1.0)
+        model = FlyConnectomeReservoir(graph, input_size=1, seed=4, provenance=provenance)
+        prep = Preprocessor(
+            feature_names=["horizontal_rms"], log1p_features=[], scaler_mean=[0.0],
+            scaler_scale=[1.0], time_scale_s=100.0, fill_values={"horizontal_rms": 0.0},
+            dataset_id="bearings",
+        )
+        return model, prep, {"history_length": 5}
+
+    monkeypatch.setattr("pdm.visualization.simulation_ui._simulation_model", _ui_model)
     if captured is not None:
         monkeypatch.setattr("pdm.cli.spawn_worker", lambda job: captured.update(job) or captured)
     return rdir, split, fake_row
@@ -192,23 +218,20 @@ def test_gru_run_does_not_show_fake_biological_activity(monkeypatch, tmp_path, t
         is_synthetic=False,
     )
     monkeypatch.setattr("pdm.visualization.trace.predict_with_trace", _no_inline)
-    monkeypatch.setattr("pdm.app.run_trace_job", _no_inline)
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     text = _app_text(at)
     assert EXPLORER_DISCLAIMER in text
     assert RESERVOIR_REQUIRED_MESSAGE in text
-    btn = next(b for b in at.button if "Build trace" in b.label)
-    btn.click()
-    at.run()
+    assert not any(b.label == "Build trace" for b in at.button)
     assert not at.exception
     assert RESERVOIR_REQUIRED_MESSAGE in _app_text(at)
     assert inline["n"] == 0
 
 
 def test_worker_busy_shows_error_not_inline(monkeypatch, tmp_path, tiny_bearing_tables):
-    """When worker busy, Build trace shows error caption, not inline trace."""
+    """A busy worker blocks operational inference and spawning another job."""
     from streamlit.testing.v1 import AppTest
 
     inline = {"n": 0}
@@ -229,19 +252,15 @@ def test_worker_busy_shows_error_not_inline(monkeypatch, tmp_path, tiny_bearing_
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables, worker_alive=True)
     monkeypatch.setattr("pdm.visualization.trace.predict_with_trace", _no_inline)
     monkeypatch.setattr("pdm.visualization.trace.run_trace_job", _no_job)
-    monkeypatch.setattr("pdm.app.run_trace_job", _no_job)
     monkeypatch.setattr("pdm.cli.spawn_worker", _no_spawn)
     monkeypatch.setattr("pdm.app.spawn_worker", _no_spawn)
 
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
-    btn = next(b for b in at.button if "Build trace" in b.label)
-    btn.click()
-    at.run()
+    assert not any(b.label == "Build trace" for b in at.button)
     assert not at.exception
-    errors = "\n".join(str(w.value) for w in at.error)
-    assert "A heavy job is already running. Please wait." in errors
+    assert "A heavy job is already running. Please wait." in _app_text(at)
     assert inline["n"] == 0
     assert spawned["n"] == 0
 
@@ -366,27 +385,19 @@ def test_frontend_vendor_files_present():
     assert Path(FRONTEND / "index.html").is_file()
 
 
-def test_explorer_comparison_widget_no_exception(monkeypatch, tmp_path, tiny_bearing_tables):
-    """Comparison table and demo button render without raising."""
+def test_explorer_opens_test_controls_without_trace_or_demo(monkeypatch, tmp_path, tiny_bearing_tables):
+    """The screen opens the practical test run without historical mode setup."""
     from streamlit.testing.v1 import AppTest
-
-    from pdm.connectome.provenance import SYNTHETIC_DISCLAIMER
 
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
-    assert not at.exception
     _open_explorer(at)
     assert not at.exception
-    text = _app_text(at)
-    assert "Architecture comparison" in text
-    assert SYNTHETIC_DISCLAIMER in text
-    assert any("Load demo scenario" in b.label for b in at.button)
-    assert any("Build trace" in b.label for b in at.button)
-    demo = next(b for b in at.button if "Load demo scenario" in b.label)
-    demo.click()
-    at.run()
-    assert not at.exception
+    labels = {b.label for b in at.button}
+    assert {"Start test run", "Next measurement", "Reset test run"} <= labels
+    assert "Build trace" not in labels
+    assert "Load demo scenario" not in labels
     assert SYNTHETIC_DISCLAIMER in _app_text(at)
 
 
@@ -402,9 +413,8 @@ def test_explorer_plain_language_copy(monkeypatch, tmp_path, tiny_bearing_tables
     assert "computational units" in text.lower()
     assert EXPLORER_DISCLAIMER in text
     assert SYNTHETIC_DISCLAIMER in text
-    assert "Architecture comparison" in text
-    assert any("Build trace" in b.label for b in at.button)
-    assert any("Load demo scenario" in b.label for b in at.button)
+    assert "Choose a model and equipment unit" in text
+    assert any(b.label == "Start test run" for b in at.button)
 
 
 def test_overlay_show_gt_does_not_move_predicted_zone(tiny_bearing_tables):
@@ -607,7 +617,7 @@ def test_idle_live_json_does_not_set_selected_rul(monkeypatch, tmp_path, tiny_be
     assert "12.5" not in metrics
 
 
-def test_architecture_comparison_heading_once(monkeypatch, tmp_path, tiny_bearing_tables):
+def test_operational_screen_omits_architecture_comparison(monkeypatch, tmp_path, tiny_bearing_tables):
     from streamlit.testing.v1 import AppTest
 
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
@@ -616,7 +626,7 @@ def test_architecture_comparison_heading_once(monkeypatch, tmp_path, tiny_bearin
     _open_explorer(at)
     md = [str(getattr(w, "value", w)) for w in at.markdown]
     exact = [v for v in md if str(v).replace("*", "").strip() == "Architecture comparison"]
-    assert len(exact) == 1
+    assert len(exact) == 0
 
 
 def test_unit_window_dataset_probe_is_train_unit(tiny_bearing_tables):
@@ -1440,26 +1450,16 @@ def test_ui_helper_soma_oserror_forces_schematic(monkeypatch):
     assert ANATOMY_MISSING_CAPTION in caps
 
 
-def test_explorer_modes_and_build_demo_buttons(monkeypatch, tmp_path, tiny_bearing_tables):
+def test_explorer_has_one_operational_flow(monkeypatch, tmp_path, tiny_bearing_tables):
     from streamlit.testing.v1 import AppTest
 
-    assert EXPLORER_MODES == (
-        "Overview",
-        "Equipment replay",
-        "Inside prediction window",
-        "Alert inspection",
-    )
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
-    assert any("Build trace" in b.label for b in at.button)
-    assert any("Load demo scenario" in b.label for b in at.button)
-    mode_opts = [list(r.options) for r in at.radio]
-    assert any(
-        all(any(mode in str(opt) for opt in opts) for mode in EXPLORER_MODES)
-        for opts in mode_opts
-    )
+    assert not any(r.label == "Mode" for r in at.radio)
+    assert not any(b.label in {"Build trace", "Load demo scenario"} for b in at.button)
+    assert any(b.label == "Start test run" for b in at.button)
 
 
 def _assert_schematic_cns_payload(captured: list[dict]) -> dict:
@@ -1504,6 +1504,7 @@ def test_synthetic_harness_not_malecns_anatomy(monkeypatch, tmp_path, tiny_beari
         },
     )
     monkeypatch.setattr("pdm.visualization.component.neural_activity_explorer", _cap)
+    monkeypatch.setattr("pdm.visualization.simulation_ui.neural_activity_explorer", _cap)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
@@ -1529,11 +1530,14 @@ def test_real_connectome_without_soma_shows_anatomy_missing(monkeypatch, tmp_pat
         is_synthetic=False,
         disclaimer="",
     )
+    captured = []
+    monkeypatch.setattr("pdm.visualization.simulation_ui.neural_activity_explorer", lambda **kw: captured.append(kw))
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     assert not at.exception
-    assert ANATOMY_MISSING_CAPTION in _app_text(at)
+    assert "cannot show every computing neuron" in _app_text(at)
+    assert captured == []
 
 
 def test_explorer_junk_soma_schema_caption_no_exception(monkeypatch, tmp_path, tiny_bearing_tables):
@@ -1556,7 +1560,7 @@ def test_explorer_junk_soma_schema_caption_no_exception(monkeypatch, tmp_path, t
     assert not at.exception
     text = _app_text(at)
     assert "Columns found" in text
-    assert ANATOMY_MISSING_CAPTION in text
+    assert "cannot show every computing neuron" in text
 
 
 def test_explorer_soma_arrow_oserror_no_exception(monkeypatch, tmp_path, tiny_bearing_tables):
@@ -1581,7 +1585,7 @@ def test_explorer_soma_arrow_oserror_no_exception(monkeypatch, tmp_path, tiny_be
     assert not at.exception
     text = _app_text(at)
     assert "arrow failed" in text
-    assert ANATOMY_MISSING_CAPTION in text
+    assert "cannot show every computing neuron" in text
 
 
 def test_explorer_explicit_weights_path_caption_no_exception(monkeypatch, tmp_path, tiny_bearing_tables):
@@ -1611,7 +1615,7 @@ def test_explorer_explicit_weights_path_caption_no_exception(monkeypatch, tmp_pa
     assert not at.exception
     text = _app_text(at)
     assert "is not a soma anatomy table" in text
-    assert ANATOMY_MISSING_CAPTION in text
+    assert "cannot show every computing neuron" in text
 
 
 def test_random_rewire_synthetic_parent_not_flyem_anatomy_missing(
@@ -1651,6 +1655,7 @@ def test_random_rewire_synthetic_parent_not_flyem_anatomy_missing(
         },
     )
     monkeypatch.setattr("pdm.visualization.component.neural_activity_explorer", _cap)
+    monkeypatch.setattr("pdm.visualization.simulation_ui.neural_activity_explorer", _cap)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
@@ -1683,7 +1688,7 @@ def test_random_rewire_real_parent_without_soma_anatomy_missing(
     at.run()
     _open_explorer(at)
     assert not at.exception
-    assert ANATOMY_MISSING_CAPTION in _app_text(at)
+    assert "cannot show every computing neuron" in _app_text(at)
 
 
 def test_live_snapshot_source_does_not_stamp_hull_or_context():
@@ -1736,6 +1741,7 @@ def test_explorer_train_live_compact_key_does_not_hijack_overlay(
     monkeypatch.setattr("pdm.worker.read_status", lambda: {"status": "training", "kind": "train"})
     monkeypatch.setattr("pdm.app.read_status", lambda: {"status": "training", "kind": "train"})
     monkeypatch.setattr("pdm.visualization.component.neural_activity_explorer", _cap)
+    monkeypatch.setattr("pdm.visualization.simulation_ui.neural_activity_explorer", _cap)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
@@ -1821,22 +1827,25 @@ def test_soma_viz_provenance_does_not_overwrite_run_provenance(monkeypatch, tmp_
     assert rec.get("n_points") is None
 
 
-def test_explorer_docs_schematic_fallback_and_n_model():
+def test_explorer_docs_single_flow_anatomy_history_and_validation():
     text = (project_root() / "docs" / "neural_activity_explorer.md").read_text(encoding="utf-8")
     assert EXPLORER_DISCLAIMER in text
     assert SYNTHETIC_DISCLAIMER in text
-    assert ANATOMY_MISSING_CAPTION in text
-    assert "layout_positions()" in text
-    assert "schematic, not FlyEM anatomy" in text
-    assert "n_model" in text
-    assert "n_viz" in text
-    assert "n_nodes_display" in text
-    assert "Neuroglancer" in text
-    assert "iframe" in text.lower()
-    assert "AppTest does not certify WebGL look" in text
     assert RESERVOIR_REQUIRED_MESSAGE in text
-    assert "Math.random" in text
     assert "A heavy job is already running. Please wait." in text
+    assert "one scenario" in text
+    assert "no Modes selector or trace-building prerequisite" in text
+    assert "Every computing body ID" in text
+    assert "blocks incomplete anatomy" in text
+    assert "Spring coordinates are schematic, never anatomical" in text
+    assert "state width and anatomical coverage must match" in text
+    assert "persistent chronological state" in text
+    assert "interval_profile.json" in text
+    assert "dataset fingerprint" in text
+    assert "Ground-truth visibility does not change inference" in text
+    assert "Payload tests do not certify appearance" in text
+    assert "desktop and mobile" in text
+    assert "browser console" in text
     fly = (project_root() / "docs" / "fly_connectome.md").read_text(encoding="utf-8")
     assert "Soma xyz (viz only)" in fly
     assert "malecns_visualization.md" in fly
@@ -1870,3 +1879,105 @@ def test_malecns_visualization_doc_reference_urls_and_allowlist():
     assert "iframe" in text.lower()
 
 
+
+
+def test_anatomy_never_uses_spring_coordinates_even_inside_soma_bounds():
+    from pdm.connectome.anatomy import SomaTable
+
+    soma = SomaTable(positions={"a": [0, 0, 0], "b": [2, 2, 2]}, provenance={}, is_synthetic=False, n_points=2)
+    payload = build_explorer_payload(
+        nodes=["fragment"], edges=[], positions={"fragment": [1, 1, 1]},
+        states=np.ones((1, 1)), inputs=np.ones((1, 1)), frame_map=[],
+        flags={"graph_mode": "real_connectome"}, soma=soma, n_model=1,
+    )
+    assert payload["positions"] == {}
+    assert payload["flags"]["n_with_soma"] == 0
+    assert payload["flags"]["n_unmatched_reservoir"] == 1
+    assert payload["states"] == [[1.0]]
+
+
+def test_equipment_simulation_clock_ground_truth_and_busy(monkeypatch, tmp_path, tiny_bearing_tables):
+    from streamlit.testing.v1 import AppTest
+
+    from pdm.connectome.sources import load_synthetic_fixture
+    from pdm.models import FlyConnectomeReservoir
+    from pdm.preprocessing import Preprocessor
+    from pdm.visualization import simulation_ui
+
+    rdir, _, _ = _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
+    (rdir / "best.pt").write_bytes(b"test checkpoint")
+    prep = Preprocessor(
+        feature_names=["horizontal_rms"], log1p_features=[], scaler_mean=[0.0],
+        scaler_scale=[1.0], time_scale_s=100.0, fill_values={"horizontal_rms": 0.0},
+        dataset_id="bearings",
+    )
+    model = FlyConnectomeReservoir(load_synthetic_fixture().graph, input_size=1, seed=4)
+    nodes = list(model.node_order)
+    (rdir / "connectome" / "graph.json").write_text(json.dumps({"node_order": nodes, "edges": []}))
+    monkeypatch.setattr(simulation_ui, "_simulation_model", lambda *args: (model, prep, {"history_length": 5}))
+    monkeypatch.setattr(simulation_ui, "worker_alive", lambda: False)
+    captured = {}
+    monkeypatch.setattr(simulation_ui, "neural_activity_explorer", lambda **kw: captured.update(kw))
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=30)
+    at.run()
+    _open_explorer(at)
+    assert not at.exception
+    assert not at.error
+    assert "Collecting history" in _app_text(at)
+    slider = next(w for w in at.slider if w.label == "Measurement")
+    slider.set_value(7).run()
+    assert not at.exception
+    assert not at.error
+    assert len(captured["states"]) == 1
+    assert captured["flags"]["synchronized"] is True
+    now = captured["frame_map"][0]["timestamp_s"]
+    pred = captured["predicted_rul_s"]
+    chart = at.get("plotly_chart")[0]
+    chart_meta = json.loads(chart.proto.spec)["layout"]["meta"]
+    assert chart_meta["now_x"] == now / 60
+    assert chart_meta["stored_predicted_rul_s"] == pred
+    next(w for w in at.checkbox if w.label == "Show ground truth").set_value(False).run()
+    assert captured["frame_map"][0]["timestamp_s"] == now
+    assert captured["predicted_rul_s"] == pred
+    next(w for w in at.button if w.label == "Next measurement").click().run()
+    assert captured["frame_map"][0]["timestamp_s"] > now
+    next(w for w in at.button if w.label == "Start test run").click().run()
+    assert not at.exception
+    next(w for w in at.button if w.label == "Pause test run").click().run()
+    assert not at.exception
+    frozen = captured["frame_map"][0]["timestamp_s"]
+    at.run()
+    assert captured["frame_map"][0]["timestamp_s"] == frozen
+    next(w for w in at.button if w.label == "Reset test run").click().run()
+    assert not at.exception
+    assert captured["predicted_rul_s"] is None
+    assert captured["states"] == []
+    monkeypatch.setattr(simulation_ui, "worker_alive", lambda: True)
+    monkeypatch.setattr(simulation_ui, "simulate_step", lambda *args: (_ for _ in ()).throw(AssertionError("busy inference")))
+    next(w for w in at.button if w.label == "Next measurement").click().run()
+    assert not at.exception
+    assert "A heavy job is already running. Please wait." in _app_text(at)
+
+
+def test_equipment_simulation_shorter_data_resets_cursor(monkeypatch, tmp_path, tiny_bearing_tables):
+    from streamlit.testing.v1 import AppTest
+
+    _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
+    from pdm.replay import bind_replay_to_run
+
+    bound = bind_replay_to_run("bearings", "bearings_fly_explorer")
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=20)
+    at.run()
+    _open_explorer(at)
+    next(w for w in at.slider if w.label == "Measurement").set_value(7).run()
+    assert not at.exception
+    shorter = {
+        **bound,
+        "features": bound["features"].groupby("unit_id", sort=False).head(3).copy(),
+        "current_fingerprint": {"dataset_version": "replaced-data"},
+    }
+    monkeypatch.setattr("pdm.replay.bind_replay_to_run", lambda *args: shorter)
+    at.run()
+    assert not at.exception
+    assert not at.error
+    assert next(w for w in at.slider if w.label == "Measurement").value == 0

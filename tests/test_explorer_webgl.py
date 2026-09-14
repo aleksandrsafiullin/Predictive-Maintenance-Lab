@@ -357,14 +357,13 @@ def test_webgl_fallback_grep_rejects_additive_context():
         _assert_webgl_context_nonadditive(leaky)
 
 
-def test_anatomy_edge_hide_and_cam_limits():
-    """Anatomy hides edges at large context; wheel can enter the cloud."""
+def test_anatomy_connections_are_optional_and_camera_can_enter_cloud():
+    """A brain silhouette stays readable by default; real edges are opt-in."""
     src = _main_js()
-    assert re.search(r"ANATOMY_EDGE_HIDE_CTX\s*=\s*5000", src)
+    assert re.search(r"ANATOMY_EDGE_CAP\s*=\s*350", src)
     select = _js_fn_body(src, "function selectDrawnEdges")
-    assert "ANATOMY_EDGE_HIDE_CTX" in select
     assert re.search(
-        r"isAnatomy\(\)\s*&&\s*contextPositions\.length\s*>=\s*ANATOMY_EDGE_HIDE_CTX",
+        r"isAnatomy\(\)\s*&&\s*flags\.show_connections\s*!==\s*true",
         select,
     )
     limits = _js_fn_body(src, "function camDistLimits")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
@@ -145,39 +146,38 @@ def _bfs_subgraph_from_df(
     if n <= 0:
         return [], df.iloc[0:0].copy()
 
-    start = all_nodes[int(rng.integers(0, len(all_nodes)))]
-    if isinstance(start, np.generic):
-        start = start.item()
-
+    # Retry whole weak components; never pad a BFS with disconnected bodies.
+    # The first seed draw remains identical to the legacy sampler.
+    start_index = int(rng.integers(0, len(all_nodes)))
+    candidates = np.concatenate([all_nodes[start_index:], all_nodes[:start_index]])
+    exhausted: set = set()
+    largest: list = []
     seen_list: list = []
-    seen_set: set = set()
-    queued: set = {start}
-    queue: list = [start]
-
-    while queue and len(seen_list) < n:
-        cur = queue.pop(0)
-        if cur in seen_set:
+    for start in candidates:
+        if start in exhausted:
             continue
-        seen_list.append(cur)
-        seen_set.add(cur)
-
-        lo = int(np.searchsorted(src_sorted, cur, side="left"))
-        hi = int(np.searchsorted(src_sorted, cur, side="right"))
-        out_nbrs = dst_fwd[lo:hi]
-
-        lo2 = int(np.searchsorted(dst_sorted, cur, side="left"))
-        hi2 = int(np.searchsorted(dst_sorted, cur, side="right"))
-        in_nbrs = src_bwd[lo2:hi2]
-
-        nbrs = np.concatenate([out_nbrs, in_nbrs])
-        new_nbrs = [nb for nb in nbrs.tolist() if nb not in queued]
-        rng.shuffle(new_nbrs)
-        queue.extend(new_nbrs)
-        queued.update(new_nbrs)
-
+        queued = {start}
+        queue = deque([start])
+        seen_list = []
+        while queue and len(seen_list) < n:
+            cur = queue.popleft()
+            seen_list.append(cur)
+            lo = int(np.searchsorted(src_sorted, cur, side="left"))
+            hi = int(np.searchsorted(src_sorted, cur, side="right"))
+            lo2 = int(np.searchsorted(dst_sorted, cur, side="left"))
+            hi2 = int(np.searchsorted(dst_sorted, cur, side="right"))
+            nbrs = np.unique(np.concatenate([dst_fwd[lo:hi], src_bwd[lo2:hi2]]))
+            new_nbrs = [nb for nb in nbrs.tolist() if nb not in queued]
+            rng.shuffle(new_nbrs)
+            queue.extend(new_nbrs)
+            queued.update(new_nbrs)
+        if len(seen_list) == n:
+            break
+        exhausted.update(seen_list)
+        if len(seen_list) > len(largest):
+            largest = seen_list
     if len(seen_list) < n:
-        extra = [nd for nd in all_nodes.tolist() if nd not in seen_set]
-        seen_list.extend(extra[: n - len(seen_list)])
+        seen_list = largest
 
     node_ids = seen_list[:n]
     node_set = set(node_ids)
@@ -186,6 +186,43 @@ def _bfs_subgraph_from_df(
     sub_df = df[mask].reset_index(drop=True)
 
     return [str(nd) for nd in node_ids], sub_df
+
+
+def _read_soma_induced_weights(path: Path, eligible_ids: list[str]) -> pd.DataFrame:
+    """Filter Feather v2 record batches before materializing a pandas edge table.
+
+    The compressed weights file expands to several GB. Reading the full table
+    and only then filtering caused paging on 16 GB machines. Retain just the
+    soma-induced graph, with native integer body IDs and exact source weights.
+    """
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+
+    with pa.memory_map(str(path), "r") as source:
+        reader = ipc.open_file(source)
+        src, dst, weight = _map_malemcns_columns(pd.DataFrame(columns=reader.schema.names))
+        cols = [src, dst, weight]
+        schema = pa.schema([reader.schema.field(c) for c in cols])
+        eligible = {}
+        for col in (src, dst):
+            dtype = schema.field(col).type
+            values = [int(n) for n in eligible_ids] if pa.types.is_integer(dtype) else eligible_ids
+            # Reuse the Index's hash engine across record batches. pc.is_in
+            # rebuilds the 140k-body lookup on every call/batch.
+            eligible[col] = pd.Index(pa.array(values, type=dtype).to_numpy())
+        batches = []
+        for i in range(reader.num_record_batches):
+            batch = reader.get_batch(i).select(cols)
+            mask = (
+                eligible[src].get_indexer(batch.column(src).to_numpy(zero_copy_only=False)) >= 0
+            ) & (
+                eligible[dst].get_indexer(batch.column(dst).to_numpy(zero_copy_only=False)) >= 0
+            )
+            selected = batch.filter(pa.array(mask))
+            if selected.num_rows:
+                batches.append(selected)
+        table = pa.Table.from_batches(batches, schema=schema)
+        return table.to_pandas()
 
 
 def load_malemcns_subgraph(
@@ -239,7 +276,14 @@ def load_malemcns_subgraph(
     LOGGER.info("Loading MaleCNS subgraph: n_nodes=%d seed=%d from %s", n_nodes, seed, loc)
     fhash = file_hash_if_present(loc)
 
-    frame = pd.read_feather(loc)
+    from pdm.connectome.anatomy import find_soma_table_path, load_soma_table
+
+    soma_path = find_soma_table_path(loc.parent)
+    soma = load_soma_table(soma_path) if soma_path is not None else None
+    frame = (
+        _read_soma_induced_weights(loc, list(soma.positions))
+        if soma is not None else pd.read_feather(loc)
+    )
     src_col, dst_col, weight_col = _map_malemcns_columns(frame)
 
     if weight_threshold is not None:
@@ -264,10 +308,12 @@ def load_malemcns_subgraph(
             frame[src_col].isin(native_set) & frame[dst_col].isin(native_set),
             [src_col, dst_col, weight_col],
         ].reset_index(drop=True)
+    else:
+        sub_df = frame[[src_col, dst_col, weight_col]].iloc[:0]
 
     edges = [
-        {"src": str(row[src_col]), "dst": str(row[dst_col]), "weight": float(row[weight_col])}
-        for _, row in sub_df.iterrows()
+        {"src": str(src), "dst": str(dst), "weight": float(weight)}
+        for src, dst, weight in sub_df[[src_col, dst_col, weight_col]].itertuples(index=False, name=None)
     ]
     graph = graph_from_edges(edges, node_ids)
 
@@ -292,7 +338,11 @@ def load_malemcns_subgraph(
             "is_synthetic": False,
             "documented_gcs_uri": MALEMCNS_GCS_URI,
             "full_graph_materialized": False,
-            "sampling_method": "seeded_bfs",
+            "sampling_method": "seeded_bfs_soma_xyz" if soma is not None else "seeded_bfs",
+            "soma_file_hash": soma.provenance.get("file_hash") if soma is not None else None,
+            "soma_local_path": str(soma_path) if soma_path is not None else None,
+            "n_with_soma_available": len(soma.positions) if soma is not None else None,
+            "anatomy_sampling": "finite_soma_xyz" if soma is not None else "anatomy_missing",
             "weight_threshold": weight_threshold,
             "weight_threshold_note": threshold_note,
         },

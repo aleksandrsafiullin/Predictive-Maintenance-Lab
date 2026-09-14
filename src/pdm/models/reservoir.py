@@ -93,11 +93,13 @@ class LeakyESN(nn.Module):
         if head_norm not in {"rul", "weibull"}:
             raise ValueError("head must be rul or weibull")
         mode = str(state_mode or "window_reset").strip().lower()
-        if mode != "window_reset":
-            raise ValueError(f"unsupported state_mode={state_mode!r}; only 'window_reset' is implemented")
+        if mode not in {"window_reset", "continuous"}:
+            raise ValueError(f"unsupported state_mode={state_mode!r}")
         self.alpha = float(alpha)
         self.leak = self.alpha
         self.state_mode = mode
+        self.rul_transform = "linear"
+        self.rul_reference_s = 60.0
         self.head_type = head_norm
         self.time_scale_s = float(time_scale_s)
         self.n_nodes = n_nodes
@@ -128,6 +130,11 @@ class LeakyESN(nn.Module):
 
     def _postprocess(self, raw: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.head_type == "rul":
+            if self.rul_transform == "log1p":
+                value = torch.expm1(torch.clamp(raw, min=0.0, max=20.0)) * self.rul_reference_s / self.time_scale_s
+                return value if raw.dim() == 1 else value.squeeze(-1)
+            if self.rul_transform != "linear":
+                raise ValueError(f"Unsupported RUL transform: {self.rul_transform}")
             # ReLU, not Softplus — diverges from RULHead so ridge on y_norm is exact.
             if raw.dim() == 1:
                 return F.relu(raw)

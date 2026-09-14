@@ -1539,8 +1539,8 @@ def test_stop_flag_sets_cancelled_not_completed(monkeypatch, tmp_path):
     assert status not in {"completed", "stopped"}
 
 
-def test_app_explorer_comparison_by_label_no_exception(tmp_path, monkeypatch):
-    """Explorer + comparison widgets must not raise; screens stay selectable by label."""
+def test_app_operational_explorer_by_label_no_exception(tmp_path, monkeypatch):
+    """The one-flow explorer stays selectable without legacy comparison/mode widgets."""
     from streamlit.testing.v1 import AppTest
 
     from pdm.paths import project_root
@@ -1566,7 +1566,9 @@ def test_app_explorer_comparison_by_label_no_exception(tmp_path, monkeypatch):
             parts.append(str(getattr(widget, "value", widget)))
     text = "\n".join(parts)
     assert EXPLORER_DISCLAIMER in text
-    assert "Architecture comparison" in text
+    assert "Architecture comparison" not in text
+    assert not any(widget.label == "Mode" for widget in at.radio)
+    assert not any(widget.label == "Build trace" for widget in at.button)
     radio.set_value("Test & Replay")
     at.run()
     assert not at.exception

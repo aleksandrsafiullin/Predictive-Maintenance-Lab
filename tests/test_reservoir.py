@@ -4,6 +4,7 @@ import inspect
 import json
 from pathlib import Path
 
+import networkx as nx
 import numpy as np
 import pandas as pd
 import pytest
@@ -535,16 +536,24 @@ def _train_tiny_reservoir(tmp_path, monkeypatch, tiny_bearing_tables, **kwargs):
 def test_frozen_reservoir_weights_not_updated():
     graph = _cycle_graph(8)
     model = FlyConnectomeReservoir(graph, input_size=3, head="rul", seed=1)
+    # Exercise a live ReLU branch deterministically: random initial readouts can
+    # all be negative, yielding zero gradients without testing weight freezing.
+    with torch.no_grad():
+        model.readout.W_x.fill_(0.1)
+        model.readout.W_u.fill_(0.1)
+        model.readout.b.fill_(1.0)
     w_before = model.W_res.detach().cpu().clone()
     win_before = model.W_in.detach().cpu().clone()
     b_before = model.b_res.detach().cpu().clone()
     trainable = [p for p in model.parameters() if p.requires_grad]
     assert trainable
     assert not model.W_res.requires_grad
+    readout_before = [p.detach().clone() for p in trainable]
     opt = torch.optim.AdamW(trainable, lr=0.05)
-    x = torch.randn(4, 5, 3)
-    y = torch.rand(4)
+    x = torch.linspace(-0.5, 0.5, 4 * 5 * 3).reshape(4, 5, 3)
+    y = torch.zeros(4)
     pred = model(x)
+    assert torch.all(pred > 0)
     loss = torch.nn.functional.smooth_l1_loss(pred, y)
     loss.backward()
     opt.step()
@@ -552,6 +561,7 @@ def test_frozen_reservoir_weights_not_updated():
     assert torch.equal(model.W_in.detach().cpu(), win_before)
     assert torch.equal(model.b_res.detach().cpu(), b_before)
     assert any(p.grad is not None and torch.any(p.grad != 0) for p in trainable)
+    assert any(not torch.equal(p.detach(), before) for p, before in zip(trainable, readout_before, strict=True))
 
 
 def test_filters_ridge_raises_before_targets(monkeypatch):
@@ -1404,3 +1414,87 @@ def test_acceptance_test_names_present():
     ]
     missing = [name for name in required if f"def {name}(" not in blob]
     assert missing == []
+
+
+def test_soma_induced_sampling_connected_and_provenanced(tmp_path, monkeypatch):
+    from pdm.connectome.anatomy import SOMA_ALLOWLIST, load_soma_table
+    from pdm.connectome.sources import load_malemcns_subgraph
+    from pdm.visualization.explorer import build_ui_explorer_payload, clear_soma_table_cache
+
+    monkeypatch.setattr("pdm.connectome.anatomy.default_soma_dir", lambda: tmp_path)
+    clear_soma_table_cache()
+    # IDs beyond float64's exact integer range must survive the native join.
+    base = 2**53 + 100
+    ids = [base + i for i in range(10)]
+    weights = tmp_path / "weights.feather"
+    pd.DataFrame({
+        "body_pre": ids[:-1] + [ids[0], ids[1]],
+        "body_post": ids[1:] + [7, 8], "weight": [2] * 11,
+    }).to_feather(weights)
+    soma_path = tmp_path / SOMA_ALLOWLIST[0]
+    pd.DataFrame({"bodyId": ids + [7, 8], "somaLocation": [
+        [float(i), float(i % 2), 10.0] for i in range(10)
+    ] + [None, [1.0, float("nan"), 1.0]]}).to_feather(soma_path)
+    a = load_malemcns_subgraph(weights, 8, 7)
+    b = load_malemcns_subgraph(weights, 8, 7)
+    assert list(a.graph) == list(b.graph)
+    assert len(a.graph) == 8
+    assert nx.is_weakly_connected(a.graph)
+    assert set(a.graph) <= set(map(str, ids))
+    assert a.provenance["sampling_method"] == "seeded_bfs_soma_xyz"
+    assert a.provenance["soma_file_hash"] == load_soma_table(soma_path).provenance["file_hash"]
+    assert a.provenance["n_with_soma_available"] == 10
+    payload, error = build_ui_explorer_payload(
+        nodes=list(a.graph), edges=[], positions={}, states=np.zeros((2, 8)),
+        frame_map=[], flags={"graph_mode": "real_connectome"},
+        n_model=8, context_cap=0,
+    )
+    assert error is None
+    assert payload["flags"]["hull_mode"] == "malecns_anatomy"
+    assert payload["flags"]["n_with_soma"] == 8
+    assert len(payload["positions"]) == 8
+    assert payload["context_positions"] == []
+
+
+def test_bfs_retries_components_without_disconnected_padding(tmp_path):
+    from pdm.connectome.sources import _bfs_subgraph_from_df
+
+    df = pd.DataFrame({"src": [0, 2, 3, 4, 5], "dst": [1, 3, 4, 5, 6]})
+    for seed in range(10):
+        nodes, sub = _bfs_subgraph_from_df(df, "src", "dst", 5, seed)
+        assert len(nodes) == 5
+        assert nx.is_connected(nx.from_pandas_edgelist(sub, "src", "dst"))
+    nodes, sub = _bfs_subgraph_from_df(df, "src", "dst", 7, 2)
+    assert len(nodes) == 5  # caller reports insufficient connected size
+    assert nx.is_connected(nx.from_pandas_edgelist(sub, "src", "dst"))
+
+
+def test_simulation_causality_and_neuron_processing(tiny_bearing_tables):
+    from pdm.visualization.simulation import neuron_details, simulate_step
+
+    features, _ = tiny_bearing_tables
+    prep = _bearings_prep()
+    model = _tiny_fly(prep, seed=42)
+    uid = str(features["unit_id"].iloc[0])
+    unit = features.loc[features["unit_id"].astype(str) == uid].sort_values("timestamp_s")
+    now = float(unit.iloc[6]["timestamp_s"])
+    trace = simulate_step(features, uid, now, model, prep, 5)
+    changed = features.copy()
+    changed.loc[changed["timestamp_s"] > now, "horizontal_rms"] = 1e9
+    changed["rul_s"] = -1e10  # evaluator labels are never features
+    other = simulate_step(changed, uid, now, model, prep, 5)
+    np.testing.assert_array_equal(trace["states"], other["states"])
+    assert trace["predicted_rul_s"] == other["predicted_rul_s"]
+    ordinary = Predictor(model, prep, history_length=5).predict_from_history(unit.iloc[:7])
+    assert trace["predicted_rul_s"] == pytest.approx(ordinary["predicted_rul_s"], rel=1e-6)
+    p = trace["processing"]
+    reconstructed = ((1 - p["leak"]) * p["previous_state"] + p["leak"] * np.tanh(
+        p["input_drive"] + p["recurrent_drive"] + p["bias"]
+    ))
+    np.testing.assert_allclose(reconstructed, trace["states"], atol=1e-6)
+    sensors, neighbors = neuron_details(trace, model, prep, 0)
+    assert sensors["Input contribution"].sum() == pytest.approx(p["input_drive"][-1, 0], rel=1e-5, abs=1e-6)
+    assert neighbors["Recurrent contribution"].sum() == pytest.approx(p["recurrent_drive"][-1, 0], abs=1e-6)
+    early = simulate_step(features, uid, float(unit.iloc[0]["timestamp_s"]), model, prep, 5)
+    assert early["predicted_rul_s"] is None
+    assert early["states"].shape[0] == 0

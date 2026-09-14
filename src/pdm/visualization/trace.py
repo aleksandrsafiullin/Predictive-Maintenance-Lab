@@ -56,6 +56,10 @@ def predict_with_trace(
         return empty
 
     hist_len = int(history_length) if history_length is not None else max(int(n_hist), 1)
+    if getattr(model, "state_mode", None) == "continuous":
+        from pdm.visualization.simulation import continuous_trace
+
+        return continuous_trace(history_rows, model, prep, hist_len)
     prepared = prepare_history_window(
         history_rows,
         prep,

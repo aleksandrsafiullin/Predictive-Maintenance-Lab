@@ -13,6 +13,48 @@ from pdm.windows import recompute_filter_gap_before, resolve_filter_gap_params
 ReplayLog = list[dict[str, Any]]
 
 
+def _continuous_bearing_predictions(
+    measurements: pd.DataFrame,
+    predictor: Predictor,
+    forecast_profile: Mapping[str, Any] | None,
+) -> pd.DataFrame:
+    """One causal kernel pass per acquisition segment, shared with neural replay.
+
+    Batching an entire segment does not expose future samples to an earlier ESN
+    state. Outcome columns never enter preprocessing or the forecast filter.
+    """
+    from pdm.forecasting import predict_failure_interval
+    from pdm.visualization.simulation import continuous_trace
+
+    frame = measurements.sort_values("timestamp_s").reset_index(drop=True)
+    timestamps = frame["timestamp_s"].to_numpy(dtype=float)
+    if not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) <= 0):
+        raise ValueError("Measurement timestamps must be finite and strictly increasing")
+    gaps = frame.get("gap_before", pd.Series(False, index=frame.index)).fillna(False).to_numpy(bool)
+    starts = np.unique(np.r_[0, np.flatnonzero(gaps)])
+    raw = np.full(len(frame), np.nan)
+    seen = np.zeros(len(frame), dtype=int)
+    for start, end in zip(starts, np.r_[starts[1:], len(frame)], strict=True):
+        trace = continuous_trace(frame.iloc[start:end], predictor.model, predictor.prep, predictor.history_length)
+        raw[start:end] = trace["raw_rul_s"]
+        seen[start:end] = np.arange(1, end - start + 1)
+    warmup = int(predictor.history_length)
+    if forecast_profile is not None:
+        if int(forecast_profile.get("warmup_measurements", warmup)) != warmup:
+            raise ValueError("Forecast profile warmup does not match the saved model")
+        result = predict_failure_interval(timestamps, raw, forecast_profile, gap_before=gaps)
+        method = "continuous_empirical_interval"
+    else:
+        result = pd.DataFrame({"timestamp_s": timestamps, "raw_rul_s": raw,
+                               "predicted_rul_s": np.where(seen >= warmup, raw, np.nan)})
+        method = "continuous_raw_readout"
+    ready = (seen >= warmup) & np.isfinite(result["predicted_rul_s"].to_numpy(float))
+    result["status"] = np.where(seen < warmup, "Collecting history", np.where(ready, "ok", "No valid prediction"))
+    result["valid_history_reason"] = np.where(seen < warmup, "insufficient_length", "")
+    result["forecast_method"] = method
+    return result
+
+
 def bind_replay_to_run(dataset_id: str, run_id: str, *, force: bool = False) -> dict[str, Any]:
     """Require fingerprint match, then bind replay to the run snapshot split."""
     from pdm.evaluate import bind_evaluation_to_run
@@ -76,6 +118,7 @@ def replay_unit(
     train_units: pd.DataFrame | None = None,
     pressure_limit_pa: float = 600.0,
     truth_units: pd.DataFrame | None = None,
+    forecast_profile: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Predictor never receives ground-truth RUL or future rows.
 
@@ -90,11 +133,16 @@ def replay_unit(
     engine.reset_unit(unit_id)
     preds: ReplayLog = []
     alerts: ReplayLog = []
+    continuous = None
+    if (len(src) and dataset_id == "bearings"
+            and getattr(getattr(predictor, "model", None), "state_mode", None) == "continuous"):
+        continuous = _continuous_bearing_predictions(src.measurements, predictor, forecast_profile)
     for step in range(len(src)):
         prefix = src.prefix(step)
         row = prefix.iloc[-1]
         t = float(row["timestamp_s"])
-        pred = predictor.predict_from_history(prefix)
+        pred = (continuous.iloc[step].to_dict() if continuous is not None
+                else predictor.predict_from_history(prefix))
         # Includes short prefix and gap/quality warmup from valid_history_window.
         collecting = pred.get("status") == "Collecting history"
         observed_limit = False
@@ -135,6 +183,9 @@ def replay_unit(
             "alert_status": snap["status"],
             "step": step,
         }
+        for key in ("raw_rul_s", "lower_rul_s", "upper_rul_s", "forecast_method"):
+            if key in pred:
+                rec[key] = pred[key]
         if "differential_pressure" in row.index and pd.notna(row.get("differential_pressure")):
             rec["differential_pressure"] = float(row["differential_pressure"])
         if "time_original" in row.index and pd.notna(row.get("time_original")):

@@ -1,0 +1,91 @@
+/* Scoped to this page; other laboratory screens retain their own theme. */
+body:has(.brain-lab-shell) {
+  --lab-bg: #080d15; --lab-panel: #101925; --lab-line: #263447;
+  --lab-text: #edf4fa; --lab-muted: #8fa3b7; --lab-cyan: #61d8ee; --lab-amber: #f2be68;
+  background: var(--lab-bg); color: var(--lab-text);
+}
+body:has(.brain-lab-shell) [data-testid="stAppViewContainer"],
+body:has(.brain-lab-shell) [data-testid="stMain"] {background: var(--lab-bg); color: var(--lab-text);}
+body:has(.brain-lab-shell) [data-testid="stHeader"] {background: transparent;}
+body:has(.brain-lab-shell) [data-testid="stSidebarCollapsedControl"] {background:#152231; border:1px solid #2b3c50; border-radius:8px;}
+body:has(.brain-lab-shell) [data-testid="stSidebarCollapsedControl"] * {color:#b9d9e6 !important;}
+body:has(.brain-lab-shell) [data-testid="stMainBlockContainer"] {max-width: 1900px; padding: 1.1rem 2.5rem 3rem;}
+body:has(.brain-lab-shell) [data-testid="stSidebar"] {background: #0d1420; border-right: 1px solid #1c293a; color: var(--lab-text);}
+body:has(.brain-lab-shell) [data-testid="stSidebar"] * {color: inherit;}
+body:has(.brain-lab-shell) [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {color: var(--lab-muted);}
+body:has(.brain-lab-shell) [data-testid="stMarkdownContainer"],
+body:has(.brain-lab-shell) [data-testid="stWidgetLabel"] {color: var(--lab-text);}
+body:has(.brain-lab-shell) [data-testid="stCaptionContainer"] {color: var(--lab-muted); font-size: .78rem;}
+body:has(.brain-lab-shell) [data-baseweb="select"] > div,
+body:has(.brain-lab-shell) [data-baseweb="input"] > div {background: #121e2c; border-color: var(--lab-line); color: var(--lab-text);}
+body:has(.brain-lab-shell) [data-testid="stButton"] button {background: #162232; border: 1px solid #2b3c50; color: #dce9f7; border-radius: 8px; font-weight: 550; min-height: 2.6rem; transition: border-color .2s, background .2s;}
+body:has(.brain-lab-shell) [data-testid="stButton"] button:hover {background: #1c2d40; border-color: #61d8ee; color: white;}
+body:has(.brain-lab-shell) [data-testid="stButton"] button[kind="primary"] {background: #61d8ee; border-color: #61d8ee; color: #08141b;}
+body:has(.brain-lab-shell) [data-testid="stButton"] button:focus-visible {outline: 2px solid #f2be68; outline-offset: 3px;}
+body:has(.brain-lab-shell) [data-testid="stExpander"] {border-color: #263447; background: #0e1723; border-radius: 10px;}
+body:has(.brain-lab-shell) [data-testid="stExpander"] details summary {color: #dbe8f3;}
+body:has(.brain-lab-shell) [data-testid="stCode"] pre {background: #080d15; color: #b5d7e5;}
+body:has(.brain-lab-shell) [data-testid="stSlider"] [data-testid="stTickBar"] {color: #8fa3b7;}
+.brain-lab-shell {display:none;}
+/* React Aria controls in current Streamlit, including portalled menus. */
+body:has(.brain-lab-shell) [role="group"]:has(> input[role="combobox"]) {background:#121e2c; border:1px solid #304257; border-radius:8px;}
+body:has(.brain-lab-shell) input[role="combobox"],
+body:has(.brain-lab-shell) [role="group"]:has(> input[role="combobox"]) button {background:transparent; color:#dce9f7;}
+body:has(.brain-lab-shell) [role="listbox"],
+body:has(.brain-lab-shell) [role="option"] {background:#121e2c; color:#dce9f7;}
+body:has(.brain-lab-shell) [role="option"][data-focused="true"],
+body:has(.brain-lab-shell) [role="option"][aria-selected="true"] {background:#233b4f; color:#8ce7f5;}
+body:has(.brain-lab-shell) [data-testid="stButton"] button[kind="primary"] [data-testid="stMarkdownContainer"] {color:#08141b;}
+body:has(.brain-lab-shell) [data-testid="stSlider"] [data-orientation="horizontal"] > [data-orientation="horizontal"] > div:first-child {background:linear-gradient(to right,#61d8ee 0%,#61d8ee var(--lab-progress,0%),#334459 var(--lab-progress,0%),#334459 100%);}
+body:has(.brain-lab-shell) [data-testid="stSlider"] div[data-rac]:has(> div > input[type="range"]) {background:#61d8ee; border-color:#61d8ee; box-shadow:0 0 0 3px #61d8ee20;}
+body:has(.brain-lab-shell) [data-testid="stRadioOption"][data-selected="true"] > div > div > div:first-child {background:#61d8ee;}
+.lab-hero {display:flex; justify-content:space-between; align-items:center; gap:24px; padding:0 0 8px;}
+.lab-eyebrow {font-size:10px; letter-spacing:2.3px; color:#61d8ee; font-weight:650; margin-bottom:8px;}
+.lab-hero h1 {font-size:clamp(28px,2.5vw,36px); font-weight:620; letter-spacing:-1.3px; line-height:1.1; margin:0; padding:0; color:#edf4fa;}
+.lab-title-dot {color:#61d8ee;}
+.lab-hero p {font-size:13px; margin:9px 0 0; color:#8fa3b7;}
+.lab-specimen {display:flex; flex-direction:column; align-items:flex-end; gap:5px; text-align:right;}
+.lab-specimen-label {font-size:9px; letter-spacing:1.7px; color:#8fa3b7;}
+.lab-specimen strong {font-size:20px; font-weight:500; letter-spacing:-.5px; color:#edf4fa;}
+.lab-specimen > span:last-child {font-size:11px; color:#8fa3b7;}
+.st-key-lab_controls {border:1px solid #263447; background:#101925; border-radius:12px; padding:12px 18px 2px; margin-bottom:0;}
+.st-key-lab_controls [data-testid="stVerticalBlock"] {gap:.5rem;}
+.st-key-lab_controls [data-testid="stButton"] button {min-height:2.25rem;}
+.st-key-lab_controls [data-testid="stSlider"] {padding-right:20px;}
+.lab-metrics {display:grid; grid-template-columns:1fr 1.2fr 1.1fr 1fr; gap:12px; margin:0 0 6px;}
+.lab-metric {position:relative; overflow:hidden; min-width:0; padding:14px 18px 12px; border:1px solid #263447; border-radius:12px; background:linear-gradient(130deg,#142131,#101925 80%);}
+.lab-metric:before {content:""; position:absolute; top:0; left:18px; width:30px; height:2px; background:#50647a;}
+.lab-tone-cyan:before {background:#61d8ee;}.lab-tone-amber:before {background:#f2be68;}
+.lab-metric-label {font-size:9px; letter-spacing:1.35px; color:#9aadc0; font-weight:600; white-space:nowrap;}
+.lab-metric-value {font-size:clamp(23px,2vw,32px); line-height:1.15; letter-spacing:-1px; font-variant-numeric:tabular-nums; margin:7px 0; color:#edf4fa; white-space:normal; overflow-wrap:anywhere;}
+.lab-tone-cyan .lab-metric-value {color:#86e5f3;}.lab-tone-amber .lab-metric-value {color:#f2ce93;}
+.lab-metric-value small {font-size:11px; color:#8fa3b7; letter-spacing:0; margin-left:7px;}
+.lab-value-warmup {font-size:18px; line-height:1.9; letter-spacing:-.4px;}
+.lab-metric-detail {font-size:10px; line-height:1.5; color:#8fa3b7;}
+.lab-status {letter-spacing:1px; font-size:9px; color:#8fa3b7;}
+.lab-status:before {content:""; display:inline-block; width:5px; height:5px; border-radius:50%; background:#8fa3b7; margin-right:6px; vertical-align:1px;}
+.lab-status.is-running {color:#61d8ee;}.lab-status.is-running:before {background:#61d8ee; box-shadow:0 0 8px #61d8ee66;}
+.st-key-lab_brain_panel,.st-key-lab_forecast_panel {border:1px solid #263447; border-radius:14px; overflow:hidden; background:#101925;}
+.st-key-lab_brain_panel [data-testid="stVerticalBlock"],.st-key-lab_forecast_panel [data-testid="stVerticalBlock"] {gap:0;}
+.lab-panel-heading {min-height:48px; display:flex; align-items:center; justify-content:space-between; gap:8px; border-bottom:1px solid #263447; padding:8px 17px;}
+.lab-panel-heading > div {display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;}
+.lab-panel-number {font-size:10px; font-variant-numeric:tabular-nums; color:#61d8ee;}
+.lab-panel-heading strong {font-size:14px; font-weight:550; color:#edf4fa;}
+.lab-panel-subtitle {font-size:10px; color:#8fa3b7;}
+.lab-panel-badge {font-size:9px; color:#9fb8c7; border:1px solid #334659; padding:3px 6px; border-radius:4px; white-space:nowrap;}
+.lab-panel-foot {padding:10px 16px 13px; border-top:1px solid #203044; font-size:10px; color:#8fa3b7; line-height:1.5; min-height:44px;}
+.lab-panel-foot strong {color:#b3c7d6; font-weight:500;}
+.lab-explanation {display:flex; justify-content:space-between; gap:20px; font-size:11px; color:#8fa3b7; padding:9px 2px; line-height:1.6;}
+.lab-explanation b {color:#b7c9d9; font-weight:500;}
+@media(max-width:1000px) {.lab-metrics {grid-template-columns:repeat(2,minmax(0,1fr));}.lab-metric-value {font-size:28px;}}
+@media(max-width:640px) {
+ body:has(.brain-lab-shell) [data-testid="stMainBlockContainer"] {padding:1.25rem 1rem 2rem;}
+ .lab-hero {align-items:flex-start; gap:12px;padding-bottom:12px;}.lab-hero h1 {font-size:28px;letter-spacing:-1px;}.lab-eyebrow {font-size:8px;letter-spacing:1.2px;}
+ .lab-hero p {font-size:11px;}.lab-specimen {display:none;}.lab-metrics {gap:8px;}.lab-metric {padding:13px 12px 10px;}
+ .lab-metric-label {font-size:8px;letter-spacing:.6px;}.lab-metric-value {font-size:23px;}.lab-metric-value small {display:block;font-size:9px;margin:4px 0 0;letter-spacing:.2px;}.lab-metric-detail {font-size:9px;}
+ .lab-value-warmup {font-size:15px;}.lab-panel-subtitle {display:none;}.lab-explanation {display:block;}.st-key-lab_controls {padding:10px 12px 0;}
+ .lab-explanation > * {display:block;}.lab-explanation > * + * {margin-top:8px;}
+ .st-key-lab_transport [data-testid="stHorizontalBlock"] {flex-wrap:wrap;gap:8px;}
+ .st-key-lab_transport [data-testid="stColumn"] {width:calc(50% - 4px);flex:1 1 calc(50% - 4px);min-width:0;}
+ .st-key-lab_transport [data-testid="stButton"] button {font-size:12px;padding:5px 8px;}
+}

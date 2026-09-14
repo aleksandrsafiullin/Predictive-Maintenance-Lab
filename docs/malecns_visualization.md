@@ -1,6 +1,6 @@
-# MaleCNS visualization (optional, viz only)
+# MaleCNS anatomy and model provenance
 
-Local Streamlit WebGL explorer can overlay a **soma context cloud** on a trained fly-connectome reservoir. This is display. It does **not** set ESN `n_nodes`, does not retrain, and does not rewrite run `provenance.json`.
+The operational WebGL explorer displays every computing reservoir neuron inside a **soma context cloud**. The cloud is display only; soma eligibility also determines new graph sampling. Visualization never rewrites the trained run's `provenance.json`.
 
 MaleCNS / FlyEM Male CNS data is **CC-BY**. Place files yourself; the loader never downloads.
 
@@ -12,7 +12,7 @@ Do **not** embed a Neuroglancer iframe. Do **not** add CAVE / Neuroglancer / neu
 - Explore hub: https://male-cns.janelia.org/explore/
 - Download hub: https://male-cns.janelia.org/download/
 
-CI and `pdm doctor` never fetch them. Missing soma → labeled schematic fallback (`hull_mode=schematic_cns`), never a silent FlyEM label.
+CI and `pdm doctor` never fetch them. Low-level diagnostic views can use a labeled schematic fallback. The operational brain test run instead blocks a real model when any computing neuron lacks curated anatomy.
 
 ## Allowlist (no glob)
 
@@ -39,7 +39,7 @@ Mapped columns (do not invent names): `bodyId` / `body_id` / `bodyid` / `body` p
 |------|----------------------------------|-----|
 | Weights feather | `body_pre` / `body_post` / `weight` — **no xyz** | ESN subgraph (BFS 500–2000). Not a soma table. |
 | `syn-points-*` | synapse xyz | **Not** soma xyz. Skip by name. |
-| Body-annotations feather | soma xyz keyed by body id | Explorer N_viz context only. |
+| Body-annotations feather | soma xyz keyed by body id | Eligibility for new graph sampling; reservoir positions and optional context. |
 
 Do **not** raise ESN `n_nodes` to ~166k to match the soma file. Reservoir width stays the run’s BFS subgraph.
 
@@ -69,3 +69,25 @@ That record is **not** written over `runs/<dataset>/<run_id>/connectome/provenan
 Train writes `connectome/layout.json` via `layout_positions()` spring (2D or 3D). That file is **schematic**, not FlyEM anatomy. Explorer joins soma xyz at **read time**. See [neural_activity_explorer.md](neural_activity_explorer.md).
 
 `--smoke` is not a quality claim. AppTest does not certify WebGL look.
+
+## Soma-aware sampling for new models
+
+New `real_connectome` graphs use the allowlisted annotations file **beside the
+selected weights file** when it is present. Only bodies with finite soma xyz are
+eligible. BFS runs on the induced synapse graph; it retries another component if
+needed, never pads with disconnected bodies. If no component is large enough,
+training reports insufficient connected size. Missing annotations retain the
+all-body BFS and the labeled anatomy fallback. No files are downloaded.
+
+Graph provenance records `sampling_method=seeded_bfs_soma_xyz`,
+`soma_file_hash`, `soma_local_path`, and `n_with_soma_available`. The soma reader's
+own provenance remains separate. Node count stays 500–2000. This changes the
+sampled graph, not the ESN update equation or the readout method.
+
+Existing checkpoints retain their original graph and weights. The September 13
+1000-node checkpoint has 116 soma matches and is blocked in the new operational
+brain test run. A newly trained anatomy-complete model displays all 1000 computing
+neurons. The 40,000 gray context points never compute or receive model states.
+A spring position inside an anatomical bounding box is never accepted as anatomy.
+Low-level diagnostic payloads may retain unmatched IDs numerically; they are not
+accepted as a complete operational scene.

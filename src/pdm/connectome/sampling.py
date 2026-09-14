@@ -66,24 +66,24 @@ def sample_connected_subgraph(graph: nx.DiGraph, n_nodes: int, seed: int) -> lis
     if n <= 0:
         return []
     rng = np.random.default_rng(int(seed))
-    start = nodes[int(rng.integers(0, len(nodes)))]
     undirected = graph.to_undirected()
+    # Choose a component large enough before BFS; disconnected padding is invalid.
+    components = [sorted(c) for c in nx.connected_components(undirected)]
+    eligible = sorted(nid for c in components if len(c) >= n for nid in c)
+    if not eligible:
+        raise ValueError(f"No connected component has {n} nodes")
+    start = eligible[int(rng.integers(0, len(eligible)))]
     seen: list[str] = []
     queued = {start}
     queue = [start]
     while queue and len(seen) < n:
         cur = queue.pop(0)
-        if cur in seen:
-            continue
         seen.append(cur)
-        nbrs = [as_node_id(nb) for nb in undirected.neighbors(cur) if as_node_id(nb) not in queued]
+        nbrs = sorted(as_node_id(nb) for nb in undirected.neighbors(cur) if as_node_id(nb) not in queued)
         rng.shuffle(nbrs)
         queue.extend(nbrs)
         queued.update(nbrs)
-    if len(seen) < n:
-        extra = [nid for nid in nodes if nid not in set(seen)]
-        seen.extend(extra[: n - len(seen)])
-    return seen[:n]
+    return seen
 
 
 def induced_subgraph(graph: nx.DiGraph, node_ids: list[str]) -> nx.DiGraph:
@@ -186,7 +186,7 @@ def prepare_run_graph(
         resolved = subgraph.number_of_nodes()
         if not src.is_synthetic and subgraph.number_of_nodes() < int(n_nodes):
             raise ValueError(
-                f"real_connectome n_nodes={n_nodes} exceeds available graph size "
+                f"real_connectome n_nodes={n_nodes} exceeds available connected graph size "
                 f"{subgraph.number_of_nodes()}"
             )
     else:

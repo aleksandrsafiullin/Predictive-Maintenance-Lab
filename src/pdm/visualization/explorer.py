@@ -248,6 +248,8 @@ _ANATOMY_FLAG_KEYS = (
     "context_downsampled",
     "anatomy_missing",
     "n_unmatched_reservoir",
+    "n_with_soma",
+    "n_reservoir_visible",
     "anatomy_scale",
     "context_caption",
 )
@@ -316,7 +318,7 @@ def build_explorer_payload(
     if inp.ndim != 2:
         inp = np.zeros((int(arr.shape[0]), 0), dtype=float)
     pos: dict[str, list[float]] = {}
-    src_pos = anatomy_rec.get("positions") if anatomy_rec.get("positions") else positions
+    src_pos = anatomy_rec["positions"] if "positions" in anatomy_rec else positions
     for key, val in (src_pos or {}).items():
         xyz = _as_xyz(val)
         if xyz is not None:
@@ -557,6 +559,15 @@ def explorer_anatomy_captions(
             out.append(f"N_viz={int(n_viz)} vs N_model={int(n_model)}")
         elif n_viz is not None:
             out.append(f"N_viz={int(n_viz)}")
+    if flags.get("hull_mode") == "malecns_anatomy" and "n_with_soma" in flags:
+        matched = int(flags["n_with_soma"])
+        display = int(flags.get("n_nodes_display") or n_model or 0)
+        visible = int(flags.get("n_reservoir_visible") or 0)
+        out.append(
+            f"{matched} / {display} reservoir cells have soma xyz; "
+            f"{display - matched} compute without curated soma coordinates. "
+            f"{visible} reservoir cells drawn. Context cells do not compute."
+        )
     caption = str(flags.get("context_caption") or "")
     if flags.get("context_downsampled") and not caption:
         caption = SOMA_DOWNSAMPLE_CAPTION

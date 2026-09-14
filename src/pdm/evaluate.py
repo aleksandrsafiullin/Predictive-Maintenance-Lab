@@ -1052,6 +1052,7 @@ def generate_split_predictions(
     train_units: pd.DataFrame,
     pressure_limit_pa: float,
     truth_units: pd.DataFrame,
+    forecast_profile: Mapping[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Replay every listed unit. Predictions.csv stays H/K-independent after export."""
     from pdm.replay import replay_unit
@@ -1077,6 +1078,7 @@ def generate_split_predictions(
             train_units=train_units,
             pressure_limit_pa=pressure_limit_pa,
             truth_units=truth_units,
+            forecast_profile=forecast_profile,
         )
         pred_frames.append(out["predictions"])
     if not pred_frames:
@@ -1222,6 +1224,15 @@ def evaluate_run(
         verify_checkpoint_hash=not force,
     )
     predictor = Predictor(model, prep, history_length=int(meta["history_length"]), device=dev.torch_device)
+    forecast_profile = None
+    if getattr(model, "state_mode", None) == "continuous" and (rdir / "interval_profile.json").is_file():
+        from pdm.forecasting import load_interval_profile
+
+        forecast_profile = load_interval_profile(rdir)
+        # Reusing a previously inspected holdout cannot become a blind benchmark
+        # merely because an alert policy was frozen later.
+        if forecast_profile.get("evaluation_status") == "exploratory_reused_holdout":
+            blind_benchmark = False
     h = float(policy["H_trigger"])
     k = int(policy["confirmation_count"])
     live_limit = live_cfg.get("pressure_limit_pa")
@@ -1240,6 +1251,7 @@ def evaluate_run(
         train_units=train_units,
         pressure_limit_pa=pressure_limit_pa,
         truth_units=units,
+        forecast_profile=forecast_profile,
     )
     if not preds.empty:
         preds = attach_actual_rul(preds, units, dataset_id)
@@ -1280,6 +1292,17 @@ def evaluate_run(
         if bound.get("snapshot_metrics_version") is not None:
             eval_cfg["snapshot_metrics_version"] = bound.get("snapshot_metrics_version")
         eval_cfg["pressure_limit_pa"] = pressure_limit_pa
+        if getattr(model, "state_mode", None) == "continuous":
+            eval_cfg["state_mode"] = "continuous"
+            eval_cfg["forecast_method"] = (
+                "continuous_empirical_interval" if forecast_profile is not None else "continuous_raw_readout"
+            )
+        if forecast_profile is not None:
+            from pdm.io_util import sha256_file
+
+            eval_cfg["interval_profile_sha256"] = sha256_file(rdir / "interval_profile.json")
+            eval_cfg["evaluation_status"] = forecast_profile.get("evaluation_status", "empirical_calibration")
+            eval_cfg["interval_coverage_guarantee"] = False
         if expected_ckpt and str(expected_ckpt) != str(ckpt_sha):
             eval_cfg["expected_checkpoint_hash"] = str(expected_ckpt)
         atomic_write_json(staging / "evaluation_config.json", eval_cfg)
@@ -1296,6 +1319,9 @@ def evaluate_run(
             bound=bound,
             rdir=rdir,
         )
+        for key in ("state_mode", "forecast_method", "interval_profile_sha256", "evaluation_status", "interval_coverage_guarantee"):
+            if key in eval_cfg:
+                metrics[key] = eval_cfg[key]
         atomic_write_json(staging / "metrics.json", metrics)
         atomic_write_text(staging / "metrics_by_unit.csv", by_unit.to_csv(index=False))
         run_alert_evaluation(
@@ -1643,4 +1669,3 @@ def run_alert_evaluation(
         if pred_path.read_bytes() != pred_bytes:
             raise RuntimeError(f"run_alert_evaluation must not rewrite {pred_path}")
     return result
-

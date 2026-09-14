@@ -165,6 +165,16 @@ class Predictor:
         return self._predict_from_prepared(history_rows)
 
     def _predict_from_prepared(self, history_rows) -> dict[str, Any]:
+        if getattr(self.model, "state_mode", None) == "continuous":
+            from pdm.visualization.simulation import continuous_trace
+
+            trace = continuous_trace(history_rows, self.model, self.prep, self.history_length)
+            result = {key: trace[key] for key in (
+                "predicted_rul_s", "status", "n_history", "valid_history_reason"
+            )}
+            if result["status"] == "predicted":
+                result["status"] = "ok"
+            return result
         prepared = prepare_history_window(
             history_rows,
             self.prep,

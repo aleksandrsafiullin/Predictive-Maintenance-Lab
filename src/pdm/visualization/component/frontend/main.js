@@ -6,6 +6,7 @@
     var hudBanner = document.getElementById("hud-banner");
     var hudLine = document.getElementById("hud-line");
     var hudHint = document.getElementById("hud-hint");
+    var hudLegend = document.getElementById("hud-legend");
 
     var nodes = [];
     var edges = [];
@@ -28,11 +29,14 @@
     var lastY = 0;
     var camDist = 1;
     var renderer = null;
+    var needsRender = true;
+    var renderCount = 0;
     var placed = [];
     var contextPositions = [];
     var hullPolyline = [];
     var cachedBounds = null;
     var lastFitKey = "";
+    var lastGeometryMode = "";
 
     var playBtn;
     var pauseBtn;
@@ -46,8 +50,7 @@
     var CANVAS_H_COMPACT = 360;
     var FOV_ANATOMY = 42;
     var FOV_SCHEMATIC = 48;
-    var ANATOMY_EDGE_HIDE_CTX = 5000;
-    var ANATOMY_EDGE_CAP = 2000;
+    var ANATOMY_EDGE_CAP = 350;
 
     function hasThree() {
         return typeof THREE !== "undefined" && THREE.WebGLRenderer && THREE.BufferGeometry;
@@ -91,6 +94,9 @@
     }
 
     function canvasHeight() {
+        if (flags.synchronized) {
+            return 570;
+        }
         return isCompact() ? CANVAS_H_COMPACT : CANVAS_H;
     }
 
@@ -112,6 +118,9 @@
 
     function reservoirActive(v, peak) {
         var p = peak > 0 ? peak : 1;
+        if (flags.synchronized) {
+            return Math.abs(Number(v) || 0) > 1e-8;
+        }
         return Math.abs(Number(v) || 0) >= ACTIVITY_T * p;
     }
 
@@ -215,6 +224,18 @@
 
     function colorFromValue(v, peak) {
         var t = clamp(Math.abs(Number(v) || 0) / peak, 0, 1);
+        if (isAnatomy()) {
+            // Signed values from the actual model. Zero remains a visible cell;
+            // brightness is a display transfer function, never an activation.
+            var amount = Math.sqrt(t);
+            var target = Number(v) < 0 ? [0.38, 0.85, 0.93] : [0.95, 0.75, 0.41];
+            return {
+                r: lerp(0.30, target[0], amount),
+                g: lerp(0.39, target[1], amount),
+                b: lerp(0.45, target[2], amount),
+                t: t
+            };
+        }
         t = t * t;
         var r;
         var g;
@@ -563,7 +584,7 @@
         if (!edges || !edges.length || !nodes.length) {
             return out;
         }
-        if (isAnatomy() && contextPositions.length >= ANATOMY_EDGE_HIDE_CTX) {
+        if (isAnatomy() && flags.show_connections !== true) {
             return out;
         }
         var indexOf = {};
@@ -625,6 +646,9 @@
     }
 
     function currentTimestamp() {
+        if (flags.synchronized && flags.now_timestamp_s != null) {
+            return Number(flags.now_timestamp_s);
+        }
         if (!frameMap || !frameMap.length) {
             return null;
         }
@@ -634,7 +658,14 @@
     }
 
     function applyArgs(args) {
+        needsRender = true;
         args = args || {};
+        var nextFlags = args.flags || {};
+        var nextInputs = args.inputs || [];
+        var geometryMode = String(nextFlags.hull_mode || "schematic_cns") + "|" +
+            Boolean(nextFlags.show_connections) + "|" + Boolean(nextFlags.show_anatomy_envelope) + "|" +
+            (nextInputs[0] ? nextInputs[0].length : 0);
+        var rebuild = geometryMode !== lastGeometryMode || !sameSceneGeometry(args);
         nodes = args.nodes || [];
         edges = args.edges || [];
         positions = args.positions || {};
@@ -642,11 +673,19 @@
         inputs = args.inputs || [];
         frameMap = args.frame_map || [];
         flags = args.flags || {};
+        if (flags.synchronized) {
+            playing = false;
+            frameIndex = 0;
+        }
+        controls.style.display = flags.synchronized ? "none" : "flex";
         predictedRul = args.predicted_rul_s != null ? args.predicted_rul_s : null;
         contextPositions = args.context_positions || [];
         hullPolyline = args.hull_polyline || [];
-        placeReservoirNodes();
-        maybeResetCameraFit();
+        if (rebuild) {
+            placeReservoirNodes();
+            maybeResetCameraFit();
+        }
+        lastGeometryMode = geometryMode;
         canvas.style.height = canvasHeight() + "px";
         var bounds = frameBounds();
         if (modeName() === "Alert inspection") {
@@ -664,9 +703,56 @@
         }
         updateFrameLabel();
         if (renderer && renderer.rebuild) {
-            renderer.rebuild();
+            if (rebuild) {
+                renderer.rebuild();
+            } else {
+                renderer.peak = flags.activity_scale || maxAbs(states);
+                renderer.inPeak = maxAbs(inputs);
+                renderer.resize();
+            }
         }
         syncFrameHeight();
+    }
+
+    function sameXYZ(a, b) {
+        if (!a || !b) { return a === b; }
+        return Number(a[0]) === Number(b[0]) && Number(a[1]) === Number(b[1]) &&
+            Number(a[2] || 0) === Number(b[2] || 0);
+    }
+
+    function sameXYZList(a, b) {
+        if (a.length !== b.length) { return false; }
+        for (var i = 0; i < a.length; i++) {
+            if (!sameXYZ(a[i], b[i])) { return false; }
+        }
+        return true;
+    }
+
+    function sameSceneGeometry(args) {
+        // Streamlit sends fresh objects for every observation. Compare coordinates
+        // without allocating a JSON string or rebuilding 40k context GPU buffers.
+        var nextNodes = args.nodes || [];
+        var nextPositions = args.positions || {};
+        var nextState = args.states && args.states[0];
+        if (nextNodes.length !== nodes.length || (nextNodes.length || (nextState ? nextState.length : 0)) !== nNodes()) {
+            return false;
+        }
+        for (var i = 0; i < nodes.length; i++) {
+            var id = String(nodes[i]);
+            if (id !== String(nextNodes[i]) || !sameXYZ(positions[id], nextPositions[id])) { return false; }
+        }
+        if (!sameXYZList(contextPositions, args.context_positions || []) ||
+            !sameXYZList(hullPolyline, args.hull_polyline || [])) { return false; }
+        // Hidden anatomical connections have no geometry, regardless of count.
+        if (!isAnatomy() || flags.show_connections === true) {
+            var nextEdges = args.edges || [];
+            if (nextEdges.length !== edges.length) { return false; }
+            for (var j = 0; j < edges.length; j++) {
+                if (String(edges[j].src) !== String(nextEdges[j].src) ||
+                    String(edges[j].dst) !== String(nextEdges[j].dst)) { return false; }
+            }
+        }
+        return true;
     }
 
     function updateFrameLabel() {
@@ -680,28 +766,28 @@
 
     function updateHud(values) {
         var peak = renderer && renderer.peak ? renderer.peak : 1;
-        var active = 0;
-        var i;
         var vis = renderer && renderer.visIndex;
-        var idxs = vis && vis.length ? vis : null;
-        var nHud = idxs ? idxs.length : values.length;
-        for (i = 0; i < nHud; i++) {
-            var vi = idxs ? idxs[i] : i;
-            if (Math.abs(Number(values[vi] || 0)) >= ACTIVITY_T * peak) {
-                active += 1;
-            }
-        }
-        var pct = nHud ? Math.round((100 * active) / nHud) : 0;
+        var nHud = vis ? vis.length : 0;
         var ts = currentTimestamp();
         var rul = predictedRulValue();
-        var bits = ["frame " + Math.floor(frameIndex)];
+        var bits = flags.synchronized ? [] : ["frame " + Math.floor(frameIndex)];
+        var timeScale = Number(flags.time_scale) > 0 ? Number(flags.time_scale) : 60;
+        var timeUnit = String(flags.time_unit || "min");
         if (ts != null && isFinite(ts)) {
-            bits.push("t=" + ts.toFixed(3) + "s");
+            bits.push("Now " + (ts / timeScale).toFixed(1) + " " + timeUnit);
         }
-        if (rul != null && isFinite(rul)) {
+        var interval = flags.failure_window_s;
+        if (flags.synchronized && interval && interval.length === 2 &&
+            interval[0] != null && interval[1] != null &&
+            isFinite(interval[0]) && isFinite(interval[1]) && Number(interval[0]) <= Number(interval[1])) {
+            bits.push("Failure window " +
+                (Number(interval[0]) / timeScale).toFixed(1) + "–" +
+                (Number(interval[1]) / timeScale).toFixed(1) + " " + timeUnit);
+        }
+        if (!flags.synchronized && rul != null && isFinite(rul)) {
             bits.push("predicted RUL " + rul.toFixed(3) + "s");
         }
-        bits.push(pct + "% nodes above activity threshold");
+        bits.push(nHud + " / " + nNodes() + " neurons");
         if (hudLine) {
             hudLine.textContent = bits.join("  ·  ");
         }
@@ -719,22 +805,40 @@
             if (flags && flags.anatomy_missing) {
                 parts.push("Anatomical soma coordinates are missing; showing a labeled schematic.");
             }
-            if (flags && flags.context_caption) {
+            if (!flags.synchronized && flags.context_caption) {
                 parts.push(String(flags.context_caption));
-            } else if (flags && flags.context_downsampled) {
+            } else if (!flags.synchronized && flags.context_downsampled) {
                 parts.push("Soma context downsampled for display");
             }
             hudBanner.textContent = parts.join("  ·  ");
         }
         if (hudHint) {
-            hudHint.textContent = isAnatomy()
+            hudHint.textContent = flags.synchronized
+                ? (flags.continuous_history === false ? "Recorded history" : "Continuous history") + " · Drag to rotate · wheel to zoom"
+                : isAnatomy()
                 ? "Drag to rotate · wheel to zoom into the cloud · Play runs in this view"
                 : "Drag to rotate · wheel to zoom · Play runs in this view";
         }
+        if (hudLegend) {
+            hudLegend.style.display = isAnatomy() ? "block" : "none";
+            hudLegend.textContent = String(flags.signal_label || "State") + " · cyan: negative · amber: positive · brightness: magnitude" +
+                " · scale ±" + Number(peak).toPrecision(3) +
+                (contextPositions.length ? "\nDim gray: anatomical reference only" : "");
+        }
+        // Read-only observability for browser verification of the actual draw set.
+        canvas.dataset.drawnNeurons = String(vis ? vis.length : 0);
+        canvas.dataset.modelNeurons = String(nNodes());
+        canvas.dataset.contextCells = String(contextPositions.length);
+        canvas.dataset.timestampS = ts == null ? "" : String(ts);
+        canvas.dataset.geometryBuilds = String(renderer && renderer.rebuildCount || 0);
     }
 
     function syncFrameHeight() {
         if (window.Streamlit && window.Streamlit.setFrameHeight) {
+            if (flags.synchronized) {
+                window.Streamlit.setFrameHeight(canvasHeight());
+                return;
+            }
             var h = Math.max(document.body.scrollHeight, canvasHeight() + 88);
             window.Streamlit.setFrameHeight(isCompact() ? Math.max(h, 460) : Math.max(h, 700));
         }
@@ -779,6 +883,7 @@
         });
         frameSlider.addEventListener("input", function () {
             playing = false;
+            needsRender = true;
             frameIndex = Number(frameSlider.value) || 0;
             updateFrameLabel();
         });
@@ -902,7 +1007,7 @@
                 "uniform float uMul;" +
                 "void main(){ vCol=color; vec4 mv=modelViewMatrix*vec4(position,1.0);" +
                 "gl_Position=projectionMatrix*mv;" +
-                "gl_PointSize=max(aSize*uMul*(36.0/max(-mv.z,0.4)), 0.75); }",
+                "gl_PointSize=clamp(aSize*uMul*(36.0/max(-mv.z,0.4)), 2.2, 13.0); }",
             fragmentShader:
                 "varying vec3 vCol; void main(){ vec2 p=gl_PointCoord*2.0-1.0; float d=dot(p,p);" +
                 "if(d>1.0) discard; if(dot(vCol,vCol)<0.00015) discard; float a=exp(-d*" +
@@ -922,10 +1027,10 @@
                 "uniform float uMul;" +
                 "void main(){ vCol=color; vec4 mv=modelViewMatrix*vec4(position,1.0);" +
                 "gl_Position=projectionMatrix*mv;" +
-                "gl_PointSize=max(aSize*uMul*(36.0/max(-mv.z,0.4)), 0.7); }",
+                "gl_PointSize=clamp(aSize*uMul*(36.0/max(-mv.z,0.4)), 1.0, 1.8); }",
             fragmentShader:
                 "varying vec3 vCol; void main(){ vec2 p=gl_PointCoord*2.0-1.0; float d=dot(p,p);" +
-                "if(d>1.0) discard; float a=exp(-d*6.2)*0.38; gl_FragColor=vec4(vCol,a); }",
+                "if(d>1.0) discard; float a=exp(-d*3.5)*0.30; gl_FragColor=vec4(vCol,a); }",
             transparent: true,
             blending: THREE.NormalBlending,
             depthWrite: false
@@ -934,10 +1039,10 @@
 
     function ThreeRenderer() {
         this.scene = new THREE.Scene();
-        this.scene.background = new THREE.Color(0x04070c);
+        this.scene.background = new THREE.Color(0x0b131d);
         this.camera = new THREE.PerspectiveCamera(FOV_SCHEMATIC, 1, 0.002, 40);
         this.gl = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: false });
-        this.gl.setClearColor(0x04070c, 1);
+        this.gl.setClearColor(0x0b131d, 1);
         this.gl.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
         this.core = null;
         this.idle = null;
@@ -957,8 +1062,15 @@
     }
 
     ThreeRenderer.prototype.rebuild = function () {
+        this.rebuildCount = (this.rebuildCount || 0) + 1;
         while (this.scene.children.length) {
-            this.scene.remove(this.scene.children[0]);
+            var child = this.scene.children[0];
+            if (child.geometry && child.geometry.dispose) { child.geometry.dispose(); }
+            if (child.material) {
+                if (child.material.map && child.material.map.dispose) { child.material.map.dispose(); }
+                if (child.material.dispose) { child.material.dispose(); }
+            }
+            this.scene.remove(child);
         }
         placeReservoirNodes();
         cachedBounds = null;
@@ -980,7 +1092,7 @@
         var idleCol = new Float32Array(Math.max(nv, 1) * 3);
         var sz = new Float32Array(Math.max(nv, 1));
         var idleSz = new Float32Array(Math.max(nv, 1));
-        var idleRgb = isAnatomy() ? [0.03, 0.038, 0.048] : [0.055, 0.08, 0.11];
+        var idleRgb = isAnatomy() ? [0.22, 0.26, 0.30] : [0.055, 0.08, 0.11];
         for (i = 0; i < nv; i++) {
             idleCol[i * 3] = idleRgb[0];
             idleCol[i * 3 + 1] = idleRgb[1];
@@ -1004,7 +1116,9 @@
         geom.setAttribute("color", this.colorAttr);
         geom.setAttribute("aSize", this.sizeAttr);
         this.idle = new THREE.Points(idleGeom, pointShader(1.0, false));
-        this.core = new THREE.Points(geom, pointShader(1.0, true));
+        // Normal blending preserves signed colours where anatomical cells overlap.
+        // Additive emission would turn dense groups into a white patch.
+        this.core = new THREE.Points(geom, pointShader(1.0, !isAnatomy()));
         if (!isAnatomy()) {
             this.haloSizeAttr = new THREE.BufferAttribute(new Float32Array(Math.max(nv, 1)), 1);
             var haloGeom = new THREE.BufferGeometry();
@@ -1061,9 +1175,9 @@
                     cpos[i * 3] = cp[0];
                     cpos[i * 3 + 1] = cp[1];
                     cpos[i * 3 + 2] = cp[2];
-                    ccol[i * 3] = 0.36;
-                    ccol[i * 3 + 1] = 0.4;
-                    ccol[i * 3 + 2] = 0.45;
+                    ccol[i * 3] = 0.31;
+                    ccol[i * 3 + 1] = 0.43;
+                    ccol[i * 3 + 2] = 0.54;
                     csz[i] = 3.1 * cScale;
                 }
                 var cg = new THREE.BufferGeometry();
@@ -1072,7 +1186,9 @@
                 cg.setAttribute("aSize", new THREE.BufferAttribute(csz, 1));
                 this.scene.add(new THREE.Points(cg, contextDustMaterial(0.85)));
             }
-            var hullVerts = hullLineVerts();
+            // The soma cloud supplies the real silhouette. Its projected convex
+            // hull is only a bounding envelope and is not a brain surface.
+            var hullVerts = flags.show_anatomy_envelope ? hullLineVerts() : [];
             if (hullVerts.length) {
                 var hlg = new THREE.BufferGeometry();
                 hlg.setAttribute("position", new THREE.BufferAttribute(hullVerts, 3));
@@ -1159,7 +1275,7 @@
             this.scene.add(makeLabelSprite("sensor window", 0, -2.38, 0.2));
         }
 
-        this.peak = maxAbs(states);
+        this.peak = flags.activity_scale || maxAbs(states);
         this.inPeak = maxAbs(inputs);
         this.resize();
     };
@@ -1182,7 +1298,7 @@
             for (i = 0; i < nv; i++) {
                 var ni = vis[i];
                 var c = colorFromValue(values[ni] || 0, this.peak);
-                var active = reservoirActive(values[ni] || 0, this.peak);
+                var active = anatomy || reservoirActive(values[ni] || 0, this.peak);
                 this.colorAttr.array[i * 3] = active ? c.r : 0;
                 this.colorAttr.array[i * 3 + 1] = active ? c.g : 0;
                 this.colorAttr.array[i * 3 + 2] = active ? c.b : 0;
@@ -1195,9 +1311,9 @@
                     this.idleSizeAttr.array[i] = active ? 0 : (anatomy ? 0.82 : 1.1) * nScale;
                 }
                 if (this.idleColorAttr) {
-                    this.idleColorAttr.array[i * 3] = anatomy ? 0.03 : 0.055;
-                    this.idleColorAttr.array[i * 3 + 1] = anatomy ? 0.038 : 0.08;
-                    this.idleColorAttr.array[i * 3 + 2] = anatomy ? 0.048 : 0.11;
+                    this.idleColorAttr.array[i * 3] = anatomy ? 0.22 : 0.055;
+                    this.idleColorAttr.array[i * 3 + 1] = anatomy ? 0.26 : 0.08;
+                    this.idleColorAttr.array[i * 3 + 2] = anatomy ? 0.30 : 0.11;
                 }
                 if (this.haloSizeAttr) {
                     this.haloSizeAttr.array[i] = active
@@ -1335,6 +1451,7 @@
         if (!this.gl) {
             return;
         }
+        this.rebuildCount = (this.rebuildCount || 0) + 1;
         placeReservoirNodes();
         cachedBounds = null;
         this.visIndex = [];
@@ -1376,7 +1493,7 @@
                 this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.contextBuf);
                 this.gl.bufferData(this.gl.ARRAY_BUFFER, cpos, this.gl.STATIC_DRAW);
             }
-            var hullVerts = hullLineVerts();
+            var hullVerts = flags.show_anatomy_envelope ? hullLineVerts() : [];
             if (hullVerts.length) {
                 this.nHullLine = hullVerts.length / 3;
                 this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.hullLineBuf);
@@ -1413,7 +1530,7 @@
             this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.sensorBuf);
             this.gl.bufferData(this.gl.ARRAY_BUFFER, sp, this.gl.STATIC_DRAW);
         }
-        this.peak = maxAbs(states);
+        this.peak = flags.activity_scale || maxAbs(states);
         this.inPeak = maxAbs(inputs);
         this.resize();
     };
@@ -1522,7 +1639,7 @@
         for (i = 0; i < n; i++) {
             var ni = vis[i];
             var c = colorFromValue(values[ni] || 0, this.peak);
-            var active = reservoirActive(values[ni] || 0, this.peak);
+            var active = anatomy || reservoirActive(values[ni] || 0, this.peak);
             col[i * 3] = active ? c.r : 0;
             col[i * 3 + 1] = active ? c.g : 0;
             col[i * 3 + 2] = active ? c.b : 0;
@@ -1545,7 +1662,7 @@
         lookAt(view, pose.eye, pose.target, pose.up);
         var mvp = mul4(proj, view);
 
-        gl.clearColor(0.0157, 0.0275, 0.047, 1);
+        gl.clearColor(0.0431, 0.0745, 0.1137, 1);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         gl.disable(gl.DEPTH_TEST);
         gl.enable(gl.BLEND);
@@ -1579,7 +1696,7 @@
             gl.enableVertexAttribArray(aPos);
             gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
             gl.disableVertexAttribArray(aCol);
-            gl.vertexAttrib3f(aCol, 0.38, 0.43, 0.48);
+            gl.vertexAttrib3f(aCol, 0.18, 0.22, 0.27);
             gl.disableVertexAttribArray(aSize);
             gl.vertexAttrib1f(aSize, 2.0);
             gl.drawArrays(gl.POINTS, 0, this.nContext);
@@ -1643,13 +1760,17 @@
         gl.enableVertexAttribArray(aPos);
         gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
         gl.disableVertexAttribArray(aCol);
-        gl.vertexAttrib3f(aCol, anatomy ? 0.035 : 0.06, anatomy ? 0.045 : 0.09, anatomy ? 0.055 : 0.12);
+        gl.vertexAttrib3f(aCol, anatomy ? 0.22 : 0.06, anatomy ? 0.26 : 0.09, anatomy ? 0.30 : 0.12);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.idleSizeBuf);
         gl.enableVertexAttribArray(aSize);
         gl.vertexAttribPointer(aSize, 1, gl.FLOAT, false, 0, 0);
         gl.drawArrays(gl.POINTS, 0, n);
 
-        gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+        if (anatomy) {
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        } else {
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+        }
         gl.uniform1f(uSize, anatomy ? 1.25 : 1.55);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.buf);
         gl.enableVertexAttribArray(aPos);
@@ -1706,6 +1827,7 @@
 
     function tick(ts) {
         requestAnimationFrame(tick);
+        var previousFrame = frameIndex;
         var bounds = frameBounds();
         if (playing && nFrames() > 0 && bounds.end >= bounds.start) {
             if (!lastTs) {
@@ -1728,11 +1850,16 @@
         }
         if (!dragging && hullMode() === "schematic_cns") {
             rotY += 0.00032;
+            needsRender = true;
         }
+        if (frameIndex !== previousFrame) needsRender = true;
+        if (!needsRender) return;
+        needsRender = false;
         var values = sampleState(frameIndex);
         var inRow = sampleInputs(frameIndex);
         if (renderer && renderer.render) {
             renderer.render(values, inRow);
+            canvas.dataset.renderCount = String(++renderCount);
         }
         updateHud(values);
     }
@@ -1742,6 +1869,12 @@
         lastX = ev.clientX;
         lastY = ev.clientY;
     });
+    document.getElementById("reset-view").addEventListener("click", function () {
+        needsRender = true;
+        camDist = 1;
+        rotY = isAnatomy() ? 0.12 : 0.72;
+        rotX = isAnatomy() ? 0.06 : 0.28;
+    });
     window.addEventListener("mouseup", function () {
         dragging = false;
     });
@@ -1750,6 +1883,7 @@
             return;
         }
         rotY += (ev.clientX - lastX) * 0.01;
+        needsRender = true;
         rotX = clamp(rotX + (ev.clientY - lastY) * 0.01, -1.15, 1.15);
         lastX = ev.clientX;
         lastY = ev.clientY;
@@ -1761,10 +1895,12 @@
             var limits = camDistLimits();
             var next = camDist * (ev.deltaY > 0 ? 1.1 : 0.9);
             camDist = clamp(next, limits.min, limits.max);
+            needsRender = true;
         },
         { passive: false }
     );
     window.addEventListener("resize", function () {
+        needsRender = true;
         if (renderer && renderer.resize) {
             renderer.resize();
         }

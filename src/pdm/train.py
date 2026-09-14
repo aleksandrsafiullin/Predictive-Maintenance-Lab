@@ -504,6 +504,18 @@ def _try_live_activity_snapshot(
         return False
 
 
+def _assert_window_training_supported(model_config: dict[str, Any]) -> None:
+    """The generic trainer builds reset windows; continuous runs use another pipeline."""
+    reservoir = model_config.get("reservoir") or {}
+    mode = str(model_config.get("state_mode") or reservoir.get("state_mode") or "window_reset")
+    transform = str(model_config.get("rul_transform") or reservoir.get("rul_transform") or "linear")
+    if mode == "continuous" or transform != "linear":
+        raise ValueError(
+            "Continuous/log-target reservoir training cannot use the generic window trainer. "
+            "Use .venv/bin/python scripts/train_brain_forecast.py to create a new trained run."
+        )
+
+
 def run_training(
     dataset_id: str,
     *,
@@ -527,6 +539,13 @@ def run_training(
         if log:
             log(msg)
 
+    if resume_run_id:
+        saved_dir = dataset_runs(dataset_id) / resume_run_id
+        saved_config = _load_saved_run_task_config(saved_dir) or {}
+        _assert_window_training_supported(saved_config.get("model") or {})
+        saved_status_path = saved_dir / "status.json"
+        if saved_status_path.exists():
+            _assert_window_training_supported(read_json(saved_status_path))
     cfg = load_dataset_config(dataset_id)
     yaml_readout = ((cfg.get("model") or {}).get("reservoir") or {}).get("readout")
     _assert_filters_ridge_forbidden(
@@ -534,6 +553,8 @@ def run_training(
     )
     mcfg = model_defaults(cfg)
     mcfg["architecture"] = architecture.lower()
+    if is_reservoir(mcfg["architecture"]):
+        _assert_window_training_supported(mcfg)
     reservoir = dict(mcfg.get("reservoir") or {})
     if n_nodes is not None:
         reservoir["n_nodes"] = int(n_nodes)
@@ -1198,6 +1219,8 @@ def _save_ckpt(
                 "input_scale": rmeta["input_scale"],
                 "seed": rmeta["seed"],
                 "readout": rmeta["readout"],
+                "rul_transform": getattr(model, "rul_transform", "linear"),
+                "rul_reference_s": float(getattr(model, "rul_reference_s", 60.0)),
             }
         )
         if rmeta.get("parent_graph_hash") is not None:
@@ -1410,6 +1433,10 @@ def _load_reservoir_from_artifacts(run_path: Path, blob: dict, meta: dict, devic
         node_order=node_order,
         frozen_weights=(arrays["W_in"], arrays["W_res"], arrays["b_res"]),
     )
+    model.rul_transform = str(meta.get("rul_transform", "linear"))
+    model.rul_reference_s = float(meta.get("rul_reference_s", 60.0))
+    if model.rul_transform not in {"linear", "log1p"} or model.rul_reference_s <= 0:
+        raise ValueError("Invalid saved RUL output transform")
     readout_sd = {
         k: v for k, v in blob["model_state_dict"].items() if str(k).startswith("readout.")
     }

@@ -65,7 +65,9 @@ def downsample_context_ids(ids: Sequence[str], cap: int) -> tuple[list[str], boo
     ordered = sorted((as_node_id(n) for n in ids), key=body_id_sort_key)
     n = len(ordered)
     limit = int(cap)
-    if n <= limit or limit <= 0:
+    if limit <= 0:
+        return [], bool(n)
+    if n <= limit:
         return ordered, False
     idx = np.unique(np.linspace(0, n - 1, num=limit, dtype=np.int64))
     return [ordered[int(i)] for i in idx.tolist()], True
@@ -271,19 +273,13 @@ def _join_reservoir_somas(
 ) -> tuple[dict[str, list[float]], int]:
     """Match reservoir ids to soma xyz. Never pile unmatched onto one centroid.
 
-    Payload xyz is used only when it already sits in the soma AABB (same space).
-    Spring / schematic coordinates fail that test and are omitted from the cloud.
+    Only an explicit soma join establishes anatomical coordinates.
+    A spring coordinate inside the soma AABB is still not anatomy.
     """
     out: dict[str, list[float]] = {}
     n_unmatched = 0
-    payload = payload_positions or {}
-    aabb = _soma_aabb(soma_positions)
     for nid in nodes:
         xyz = _as_xyz(soma_positions.get(nid))
-        if xyz is None:
-            alt = _as_xyz(payload.get(nid))
-            if alt is not None and aabb is not None and _xyz_in_aabb(alt, aabb[0], aabb[1]):
-                xyz = alt
         if xyz is None:
             n_unmatched += 1
             continue
@@ -546,6 +542,8 @@ def build_anatomy_scene(
         "context_downsampled": bool(context_downsampled),
         "anatomy_missing": bool(anatomy_missing),
         "n_unmatched_reservoir": int(n_unmatched),
+        "n_with_soma": sum(nid in soma_pos for nid in nodes),
+        "n_reservoir_visible": len(reservoir_pos),
         "anatomy_scale": float(anatomy_scale),
         "context_caption": caption,
         "graph_mode": mode,

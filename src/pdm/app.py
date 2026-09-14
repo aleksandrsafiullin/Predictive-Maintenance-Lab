@@ -4,6 +4,7 @@ import json
 import math
 import os
 import time
+from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -47,7 +48,7 @@ from pdm.experiments import (
     resolve_evaluation_artifacts,
     run_dir,
 )
-from pdm.paths import dataset_raw, run_traces_dir
+from pdm.paths import dataset_raw
 from pdm.replay import (
     END_OF_OBSERVED_DATA,
     active_warning_episode_time_s,
@@ -76,33 +77,23 @@ from pdm.visualization.comparison import (
     comparison_sections,
 )
 from pdm.visualization.component import neural_activity_explorer
-from pdm.visualization.demo import get_demo_instructions, load_demo_scenario
 from pdm.visualization.explorer import (
     EXPLORER_DISCLAIMER,
-    EXPLORER_MODES,
-    INLINE_TRACE_MAX_NODES,
     LIVE_CONTEXT_CAP,
     RESERVOIR_REQUIRED_MESSAGE,
     WORKER_BUSY_MESSAGE,
-    alert_jump_target,
     build_ui_explorer_payload,
-    collect_alert_rows,
     explorer_anatomy_captions,
     explorer_overlay_clock,
     fallback_positions,
     is_active_train_live,
     load_scene_from_run,
-    selected_trace_predicted_rul,
-    slice_trace_to_alert,
     soma_join_allowed,
-    stored_alert_prediction,
     subset_scene,
     synthetic_banner_required,
 )
-from pdm.visualization.export import load_trace
 from pdm.visualization.live import load_live_activity
-from pdm.visualization.overlay import OVERLAY_HISTORY_CAPTION, build_work_overlay_figure
-from pdm.visualization.trace import run_trace_job
+from pdm.visualization.simulation_ui import render_equipment_simulation
 from pdm.worker import read_status, request_stop, worker_alive
 
 st.set_page_config(page_title="Predictive Maintenance Lab", layout="wide")
@@ -115,7 +106,6 @@ REPLAY_MODE_RESEARCH = "Research"
 REPLAY_MODES = (REPLAY_MODE_VALIDATION, REPLAY_MODE_TEST, REPLAY_MODE_RESEARCH)
 REPLAY_PLAY_INTERVAL_S = 0.4
 _REPLAY_VIEW_KEY = "_replay_view"
-_EXPLORER_DEMO_KEY = "_explorer_demo_run"
 _REPLAY_SESSION_KEYS = (
     "replay_cache",
     "replay_alert_episodes",
@@ -126,8 +116,15 @@ _REPLAY_SESSION_KEYS = (
 )
 
 
+def _pause_neural_runs() -> None:
+    """Changing views or equipment never silently resumes an old test clock."""
+    for key, value in st.session_state.items():
+        if str(key).startswith("equipment_sim:") and isinstance(value, dict) and "playing" in value:
+            value["playing"] = False
+
+
 def _dataset() -> str:
-    choice = st.sidebar.radio("Dataset", ["Bearings", "Filters"], horizontal=True)
+    choice = st.sidebar.radio("Dataset", ["Bearings", "Filters"], horizontal=True, on_change=_pause_neural_runs)
     return "bearings" if choice == "Bearings" else "filters"
 
 
@@ -148,27 +145,37 @@ def _data_state(dataset_id: str) -> str:
     return "not_ready"
 
 
-def _status_chip() -> dict:
+def _status_chip(*, compact: bool = False) -> dict:
     st_ = read_status()
     alive = worker_alive()
     st.sidebar.write("Worker:", "running" if alive else "idle")
-    st.sidebar.json({k: st_.get(k) for k in ("status", "dataset_id", "run_id", "epoch", "message", "error") if k in st_ or st_.get(k)})
+    details = {k: st_.get(k) for k in ("status", "dataset_id", "run_id", "epoch", "message", "error") if k in st_ or st_.get(k)}
+    if compact:
+        with st.sidebar.expander("Job details", expanded=bool(st_.get("error"))):
+            st.json(details)
+    else:
+        st.sidebar.json(details)
     if st_.get("status") in {"cancelled", "stopped"}:
         st.sidebar.caption(f"Job interrupted ({st_.get('status')})")
     return st_
 
 
 def main() -> None:
-    st.title("Predictive Maintenance Lab")
-    st.info("Historical replay — not a live equipment connection")
+    if "screen_selection" not in st.session_state and st.query_params.get("view") == "brain":
+        st.session_state["screen_selection"] = "Neural Activity Explorer"
     dataset_id = _dataset()
     _device_box()
     page = st.sidebar.radio(
         "Screen",
         options=["Data", "Train", "Test & Replay", "Neural Activity Explorer"],
         index=0,
+        key="screen_selection",
+        on_change=_pause_neural_runs,
     )
-    _status_chip()
+    if page != "Neural Activity Explorer":
+        st.title("Predictive Maintenance Lab")
+        st.info("Historical replay — not a live equipment connection")
+    _status_chip(compact=page == "Neural Activity Explorer")
     if page == "Data":
         screen_data(dataset_id)
     elif page == "Train":
@@ -690,7 +697,7 @@ def screen_train(dataset_id: str) -> None:
 def _explorer_mode_label(mode: str) -> str:
     return {
         "Overview": "Overview — full window",
-        "Equipment replay": "Equipment replay — follow Test & Replay time",
+        "Equipment replay": "Equipment replay — run the model step by step",
         "Inside prediction window": "Inside prediction window — what the model saw",
         "Alert inspection": "Alert inspection — at a stored warning",
     }.get(mode, mode)
@@ -811,14 +818,13 @@ def _render_train_live_activity(
 
 def _render_explorer_intro() -> None:
     st.markdown(
-        "This tool watches a **connectome reservoir** read a bearing or filter history window "
-        "and estimate **remaining useful life**. Glowing dots are **computational units** whose "
-        "values come from the same inference as the forecast — not a living fly recording."
+        "Run recorded equipment measurements through a **fly connectome reservoir**. "
+        "Its computational units process the observed history to estimate **remaining useful life** "
+        "and a possible failure-time range. The brain activity and forecast share one test-run clock."
     )
     st.markdown(
-        "1. **Sensor window** — recent measurements fed into the reservoir  \n"
-        "2. **Reservoir activity** — computational units lighting up  \n"
-        "3. **Remaining-life estimate** — predicted time until failure / 600 Pa"
+        "Choose a model and equipment unit, then start the test run. "
+        "Inspect sensor input, recurrent activity and the forecast beside the recorded outcome."
     )
 
 
@@ -914,298 +920,111 @@ def _render_architecture_comparison(dataset_id: str) -> None:
         st.dataframe(synth, width="stretch", hide_index=True)
 
 
+def _neural_test_run_ready(dataset_id: str, rec: dict) -> bool:
+    """Prefer a model prepared for complete anatomy and calibrated replay."""
+    if str(rec.get("graph_mode") or "") != "real_connectome" or rec.get("is_synthetic"):
+        return False
+    rdir = run_dir(dataset_id, str(rec["run_id"]))
+    try:
+        provenance = json.loads((rdir / "connectome" / "provenance.json").read_text())
+        profile = json.loads((rdir / "interval_profile.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return False
+    return (
+        isinstance(provenance, dict)
+        and provenance.get("sampling_method") == "seeded_bfs_soma_xyz"
+        and isinstance(profile, dict)
+        and profile.get("version") == 1
+        and profile.get("ready") is True
+    )
+
+
+def _explorer_run_label(run_id: str) -> str:
+    parts = str(run_id).rsplit("_", 3)
+    if len(parts) == 4:
+        try:
+            stamp = datetime.strptime(parts[1] + parts[2], "%Y%m%d%H%M%S")
+            return f"{stamp:%d %b · %H:%M} · {parts[3]}"
+        except ValueError:
+            pass
+    return str(run_id)
+
+
 def screen_explorer(dataset_id: str) -> None:
-    st.header(f"Neural Activity Explorer — {LABELS[dataset_id]}")
-    st.caption(EXPLORER_DISCLAIMER)
-    _render_explorer_intro()
+    from pdm.visualization.presentation import apply_explorer_style
+
+    apply_explorer_style()
+    with st.sidebar.expander("About this model"):
+        st.caption(EXPLORER_DISCLAIMER)
+        _render_explorer_intro()
 
     table = [r for r in list_runs(dataset_id) if r.get("has_best") or r.get("has_last")]
     reservoir_rows = [r for r in table if is_reservoir(str(r.get("architecture") or ""))]
-    selector_rows = reservoir_rows if reservoir_rows else table
-    if not selector_rows:
-        st.warning("No saved model. Train a reservoir run first.")
-        _render_architecture_comparison(dataset_id)
+    if not reservoir_rows:
+        st.warning("No saved reservoir model. Train a connectome reservoir first.")
+        if table:
+            st.info(RESERVOIR_REQUIRED_MESSAGE)
         return
 
-    if st.button("Load demo scenario"):
-        demo = load_demo_scenario(dataset_id)
-        if demo is None:
-            st.info(get_demo_instructions())
-            st.caption(SYNTHETIC_DISCLAIMER)
-        else:
-            st.session_state[_EXPLORER_DEMO_KEY] = str(demo.get("run_id") or "")
-            st.warning(SYNTHETIC_DISCLAIMER)
-            st.caption("Demo uses a synthetic test graph — not a biological connectome.")
-            st.rerun()
-
+    # list_runs is newest first. A completed anatomy/interval run takes priority
+    # over a stale selection handed over from the legacy replay screen.
+    ready_rows = [r for r in reservoir_rows if _neural_test_run_ready(dataset_id, r)]
+    real_rows = [r for r in reservoir_rows if str(r.get("graph_mode") or "") == "real_connectome"
+                 and not r.get("is_synthetic")]
+    preferred_rows = ready_rows or real_rows or reservoir_rows
     view = st.session_state.get(_REPLAY_VIEW_KEY) or {}
-    run_ids = [str(r["run_id"]) for r in selector_rows]
-    preferred_run = str(
-        st.session_state.get(_EXPLORER_DEMO_KEY) or view.get("run_id") or ""
-    )
-    run_index = run_ids.index(preferred_run) if preferred_run in run_ids else 0
-    run_id = st.selectbox("Run", run_ids, index=run_index)
-    rec = next((r for r in selector_rows if str(r.get("run_id")) == str(run_id)), {})
+    preferred_run = str(view.get("run_id") or "")
+    preferred_ids = [str(r["run_id"]) for r in preferred_rows]
+    if preferred_run not in preferred_ids:
+        preferred_run = preferred_ids[0]
+    run_ids = [str(r["run_id"]) for r in reservoir_rows]
+    st.sidebar.markdown("#### Experiment setup")
+    run_id = st.sidebar.selectbox("Run", run_ids, index=run_ids.index(preferred_run),
+                                 format_func=_explorer_run_label, on_change=_pause_neural_runs)
+    rec = next(r for r in reservoir_rows if str(r["run_id"]) == str(run_id))
     rdir = run_dir(dataset_id, run_id)
     scene = load_scene_from_run(rdir)
-    is_synthetic = synthetic_banner_required(rec, scene)
-    graph_mode = str(rec.get("graph_mode") or scene.get("graph_mode") or "")
-    if is_synthetic:
+    if synthetic_banner_required(rec, scene):
         st.warning(SYNTHETIC_DISCLAIMER)
-        st.caption(SYNTHETIC_DISCLAIMER)
-
-    arch = str(rec.get("architecture") or "")
-    reservoir = is_reservoir(arch)
-    if not reservoir:
-        st.info(RESERVOIR_REQUIRED_MESSAGE)
-
-    mode = st.radio(
-        "Mode",
-        list(EXPLORER_MODES),
-        horizontal=True,
-        format_func=_explorer_mode_label,
-    )
-
-    bundle = None
-    unit_ids: list[str] = []
-    if processed_ready(dataset_id):
-        bundle = load_processed(dataset_id)
-        units = bundle["units"]
-        unit_ids = [str(u) for u in units["unit_id"].tolist()]
-    preferred_unit = str(view.get("unit_id") or st.session_state.get("replay_unit") or "")
-    uid = None
-    if unit_ids:
-        uidx = unit_ids.index(preferred_unit) if preferred_unit in unit_ids else 0
-        uid = st.selectbox("Unit", unit_ids, index=uidx)
-    else:
-        st.warning("Prepare data first.")
-
-    alert_ts = None
-    alert_episode = None
-    if mode == "Alert inspection":
-        rows = collect_alert_rows(rdir, None)
-        if not rows:
-            st.caption("Select an alert to view its trace")
-            st.caption(
-                "No alert episodes for this run. Alert inspection reads existing alerts.csv when present."
-            )
-        else:
-            labels = [
-                (
-                    f"{item.get('unit_id')} @ {item.get('timestamp_s')} "
-                    f"({item.get('type') or item.get('alert_status') or 'alert'})"
-                )
-                for item in rows
-            ]
-            pick = st.selectbox("Alert episode", labels)
-            alert_episode = rows[labels.index(pick)]
-            jump = alert_jump_target(alert_episode) or {}
-            alert_ts = jump.get("timestamp_s")
-            jump_unit = jump.get("unit_id")
-            if jump_unit:
-                uid = str(jump_unit)
-            st.caption(
-                "Predicted RUL is the stored evaluation prediction, not a rescore from future rows."
-            )
-            stored = stored_alert_prediction(alert_episode)
-            if stored is not None:
-                st.metric("Stored predicted RUL (s)", f"{stored:.4g}")
-
-    n_nodes = int(rec.get("n_nodes") or len(scene.get("nodes") or []) or 0)
-    if st.button("Build trace"):
-        if worker_alive():
-            st.error(WORKER_BUSY_MESSAGE)
-        elif not reservoir:
-            st.info(RESERVOIR_REQUIRED_MESSAGE)
-        elif not uid:
-            st.error("Select a unit first.")
-        elif 0 < n_nodes <= INLINE_TRACE_MAX_NODES:
-            try:
-                run_trace_job(dataset_id, str(run_id), str(uid), lazy=False, device="cpu")
-            except Exception as exc:  # noqa: BLE001
-                st.error(str(exc))
-        else:
-            spawn_worker(
-                {
-                    "kind": "trace",
-                    "dataset_id": dataset_id,
-                    "run_id": str(run_id),
-                    "unit_id": str(uid),
-                    "lazy": False,
-                }
-            )
-            st.rerun()
 
     ws = read_status()
-    live = _active_train_live(ws)
-    if worker_alive() and ws.get("kind") == "trace":
-        st.info("Building trace…")
-        if st.button("Stop", key="explorer_stop"):
-            request_stop()
-            st.rerun()
+    if worker_alive():
+        _pause_neural_runs()
+        st.info(WORKER_BUSY_MESSAGE)
+        if _active_train_live(ws) is not None:
+            _render_train_live_activity(dataset_id, ws, component_key="explorer_train_live")
         _auto_refresh()
-    elif live is not None:
-        _auto_refresh()
-    if live is not None:
-        _render_train_live_activity(dataset_id, ws, component_key="explorer_train_live")
+        return
 
-    trace = None
-    has_trace = False
-    if uid:
-        tdir = run_traces_dir(dataset_id, str(run_id), str(uid))
-        if (tdir / "meta.json").exists():
-            try:
-                trace = load_trace(tdir)
-                has_trace = True
-            except Exception as exc:  # noqa: BLE001
-                st.error(str(exc))
-                trace = None
-        else:
-            if mode == "Alert inspection":
-                st.caption("Select an alert to view its trace")
-            st.caption("No trace yet. Click Build trace.")
-    if has_trace and str((trace or {}).get("status") or "").startswith("traces require"):
-        st.info(RESERVOIR_REQUIRED_MESSAGE)
-        has_trace = False
-        trace = None
-    if has_trace and mode == "Alert inspection" and alert_episode is not None:
-        trace = slice_trace_to_alert(trace, alert_episode, timestamp_s=alert_ts)
-    elif mode == "Alert inspection" and alert_episode is None and has_trace:
-        st.caption("Select an alert to view its trace")
-
-    display_scene = scene
-    node_order = [str(n) for n in ((trace or {}).get("node_order") or display_scene.get("nodes") or [])]
-    if node_order:
-        display_scene = load_scene_from_run(rdir, node_order=node_order)
-    if not display_scene.get("nodes"):
-        display_scene["nodes"] = node_order
-        display_scene["positions"] = fallback_positions(node_order)
-
-    replay_step = int(st.session_state.get("replay_step", 0) or 0)
-    pred_rul = selected_trace_predicted_rul(trace if has_trace else None)
-    now_s = explorer_overlay_clock(
-        trace if has_trace else None,
-        mode=mode,
-        replay_step=replay_step,
-        alert_ts=alert_ts,
-        view=view,
-        live=live,
-        train_live=live is not None,
-    )
-    flags = {
-        "mode": mode,
-        "replay_step": replay_step,
-        "alert_timestamp_s": alert_ts,
-        "is_synthetic": is_synthetic or bool(display_scene.get("is_synthetic")),
-        "graph_mode": graph_mode or str(display_scene.get("graph_mode") or ""),
-        "architecture": arch,
-        "stored_predicted_rul_s": pred_rul,
-        "phase": "replay" if has_trace else "overview",
-        "now_timestamp_s": now_s,
-        "predicted_event_timestamp_s": (
-            float(now_s) + float(pred_rul) if _finite_number(now_s) and _finite_number(pred_rul) else None
-        ),
-        "history_length": int((trace or {}).get("n_history") or 0)
-        or int(((trace or {}).get("meta") or {}).get("history_length") or 0),
-        "downsampled": False,
-    }
-
-    if reservoir:
-        payload, schema_error = _payload_from_scene_trace(
-            scene=display_scene,
-            trace=trace if has_trace else None,
-            flags=flags,
-            predicted_rul_s=pred_rul,
-            run_dir=rdir,
-            n_model=_run_n_model(rec),
-            join_soma=soma_join_allowed(rec, display_scene),
-        )
-        _emit_explorer_anatomy_captions(
-            payload, is_synthetic=is_synthetic, schema_error=schema_error
-        )
-        neural_activity_explorer(**payload, key="neural_activity_explorer")
-
-    unit_feat = pd.DataFrame()
-    unit_meta = {}
-    if bundle is not None and uid:
-        feats = bundle.get("features")
-        if isinstance(feats, pd.DataFrame) and "unit_id" in feats.columns:
-            unit_feat = feats[feats["unit_id"].astype(str) == str(uid)].copy()
-        units_df = bundle.get("units")
-        if isinstance(units_df, pd.DataFrame) and "unit_id" in units_df.columns:
-            hit = units_df[units_df["unit_id"].astype(str) == str(uid)]
-            if not hit.empty:
-                unit_meta = hit.iloc[0].to_dict()
-
-    show_gt = st.checkbox("Show ground truth", value=False, key="explorer_show_gt")
-    hist_len = int(flags.get("history_length") or 0)
-    if hist_len <= 0 and has_trace:
-        hist_len = len((trace or {}).get("frame_map") or [])
-    overlay_now = now_s
-    if overlay_now is None and not unit_feat.empty and "timestamp_s" in unit_feat.columns:
-        overlay_now = float(pd.to_numeric(unit_feat["timestamp_s"], errors="coerce").max())
-    stored_pred = pred_rul if has_trace else None
-    event_t = unit_meta.get("event_time_s") if unit_meta else None
-    event_obs = bool(int(unit_meta.get("event_observed") or 0)) if unit_meta else False
-    pressure = None
-    if dataset_id == "filters":
-        try:
-            pressure = float(
-                load_run_pressure_limit_pa(rdir, load_dataset_config(dataset_id).get("pressure_limit_pa"))
-            )
-        except Exception:  # noqa: BLE001
-            pressure = 600.0
-    if not unit_feat.empty:
-        fig = build_work_overlay_figure(
-            dataset_id=dataset_id,
-            unit_features=unit_feat,
-            now_timestamp_s=overlay_now,
-            predicted_rul_s=stored_pred if has_trace else None,
-            history_length=hist_len or None,
-            show_gt=bool(show_gt),
-            event_time_s=float(event_t) if _finite_number(event_t) else None,
-            event_observed=event_obs,
-            pressure_limit_pa=pressure,
-        )
-        st.plotly_chart(fig, width="stretch")
-        st.caption(OVERLAY_HISTORY_CAPTION)
-
-    c1, c2, c3, c4 = st.columns(4)
-    filter_scale = dataset_id == "filters"
-    age_s = overlay_now if _finite_number(overlay_now) else None
-    disp_pred = stored_pred if has_trace else None
-    event_pred = None
-    if _finite_number(overlay_now) and _finite_number(disp_pred):
-        event_pred = float(overlay_now) + float(disp_pred)
-    if filter_scale:
-        c1.metric("Operating age (s, internal)", "—" if age_s is None else f"{float(age_s):.1f}")
-        c2.metric(
-            "Predicted RUL (s, internal)",
-            "—" if not _finite_number(disp_pred) else f"{float(disp_pred):.1f}",
-        )
-        c3.metric(
-            "Predicted event (s, internal)",
-            "—" if event_pred is None else f"{event_pred:.1f}",
-        )
-    else:
-        c1.metric("Operating age (min)", "—" if age_s is None else f"{float(age_s) / 60.0:.1f}")
-        c2.metric(
-            "Predicted RUL (min)",
-            "—" if not _finite_number(disp_pred) else f"{float(disp_pred) / 60.0:.1f}",
-        )
-        c3.metric(
-            "Predicted event (min)",
-            "—" if event_pred is None else f"{event_pred / 60.0:.1f}",
-        )
-    alert_rows: list[dict] = []
+    if not processed_ready(dataset_id):
+        st.warning("Prepare data first.")
+        return
     try:
-        alert_rows = collect_alert_rows(rdir, uid) if uid else []
-    except Exception:  # noqa: BLE001
-        alert_rows = []
-    c4.metric("Current status", _explorer_status_label(trace if has_trace else None, alert_rows, overlay_now))
+        bound = bind_replay_to_run(dataset_id, run_id)
+    except IncompatibleDataError as exc:
+        _pause_neural_runs()
+        st.error(str(exc))
+        return
+    except (OSError, ValueError) as exc:
+        _pause_neural_runs()
+        st.error(f"Incompatible data: run snapshot is incomplete ({exc})")
+        return
+    bundle = {
+        **bound,
+        "fingerprint": bound["current_fingerprint"],
+        "dataset_version": bound["current_fingerprint"].get("dataset_version"),
+    }
+    unit_ids = [str(u) for u in bundle["units"]["unit_id"].tolist()]
+    if not unit_ids:
+        st.warning("No equipment units are available in the prepared data.")
+        return
+    test_ids = [str(u) for u in (bundle.get("split") or {}).get("test", [])]
+    preferred_unit = str(view.get("unit_id") or st.session_state.get("replay_unit") or "")
+    if preferred_unit not in unit_ids:
+        preferred_unit = next((u for u in test_ids if u in unit_ids), unit_ids[0])
+    uid = st.sidebar.selectbox("Unit", unit_ids, index=unit_ids.index(preferred_unit), on_change=_pause_neural_runs)
 
-    with st.expander("Run table", expanded=False):
-        _render_architecture_comparison(dataset_id)
+    render_equipment_simulation(dataset_id, rdir, str(uid), bundle)
 
 
 def _replay_pressure_limit_pa(rdir, cfg: dict) -> float:
@@ -1281,7 +1100,12 @@ def _evaluate_job(
     return job
 
 
+def _open_neural_test_run() -> None:
+    st.session_state["screen_selection"] = "Neural Activity Explorer"
+
+
 def screen_replay(dataset_id: str) -> None:
+    st.button("Open neural test run", on_click=_open_neural_test_run)
     st.header(f"Test & Replay — {LABELS[dataset_id]}")
     st.info("Historical replay — not a live equipment connection")
     if dataset_id == "filters" and _filters_scale_unverified():
@@ -1841,6 +1665,16 @@ def _mount_replay_playback(*, playing: bool) -> None:
     _replay_playback()
 
 
+def _current_replay_interval(current) -> tuple[float, float] | None:
+    """Only completed finite forecasts can supply an interval; raw warmup cannot."""
+    if current is None or not _finite_number(current.get("predicted_rul_s")):
+        return None
+    lower, upper = current.get("lower_rul_s"), current.get("upper_rul_s")
+    if not _finite_number(lower) or not _finite_number(upper):
+        return None
+    return (float(lower), float(upper)) if 0 <= float(lower) <= float(upper) else None
+
+
 def _replay_demo_figure(
     *,
     dataset_id: str,
@@ -1910,12 +1744,37 @@ def _replay_demo_figure(
     rul_unit = "s" if filter_scale else "min"
     if len(prefix_pred) and "timestamp_s" in prefix_pred.columns:
         x = prefix_pred["timestamp_s"] / x_scale
+        if {"lower_rul_s", "upper_rul_s"} <= set(prefix_pred.columns):
+            intervals = prefix_pred.apply(_current_replay_interval, axis=1)
+            lower = intervals.map(lambda bounds: bounds[0] / x_scale if bounds is not None else float("nan"))
+            upper = intervals.map(lambda bounds: bounds[1] / x_scale if bounds is not None else float("nan"))
+            if lower.notna().any():
+                fig.add_trace(go.Scatter(
+                    x=x, y=lower, mode="lines", line=dict(width=0),
+                    name="forecast range lower", showlegend=False, hoverinfo="skip",
+                    legendgroup="forecast_range", connectgaps=False,
+                ), row=2, col=1)
+                fig.add_trace(go.Scatter(
+                    x=x, y=upper, mode="lines", line=dict(width=0),
+                    fill="tonexty", fillcolor="rgba(61, 190, 225, 0.22)",
+                    name=f"forecast range ({rul_unit})", legendgroup="forecast_range",
+                    connectgaps=False,
+                ), row=2, col=1)
+                latest_bounds = _current_replay_interval(prefix_pred.iloc[-1])
+                if latest_bounds is not None:
+                    latest_x = float(prefix_pred.iloc[-1]["timestamp_s"]) / x_scale
+                    fig.add_trace(go.Scatter(
+                        x=[latest_x, latest_x], y=[bound / x_scale for bound in latest_bounds],
+                        mode="lines+markers", line=dict(color="#3dbee1", width=3),
+                        marker=dict(size=4), name="latest interval", showlegend=False,
+                    ), row=2, col=1)
         fig.add_trace(
             go.Scatter(
                 x=x,
                 y=prefix_pred["predicted_rul_s"] / x_scale,
                 name=f"neural net RUL ({rul_unit})",
-                mode="lines",
+                mode="lines+markers",
+                marker=dict(size=4),
             ),
             row=2,
             col=1,
@@ -2145,21 +2004,28 @@ def _replay_playback_body() -> None:
     if current is not None or len(prefix_meas):
         c1, c2, c3, c4 = st.columns(4)
         age_s = replay_time if math.isfinite(replay_time) else 0.0
+        scale = 1.0 if filter_scale else 60.0
+        display_unit = "s, internal" if filter_scale else "min"
         rul = current.get("predicted_rul_s") if current is not None else None
-        if filter_scale:
-            c1.metric("Operating age (s, internal)", f"{age_s:.1f}")
-            c2.metric(
-                "Predicted RUL (s, internal)",
-                "—" if rul is None or pd.isna(rul) else f"{float(rul):.1f}",
+        interval = _current_replay_interval(current)
+        c1.metric(f"Operating age ({display_unit})", f"{age_s / scale:.1f}")
+        if interval is not None:
+            # Anchor the absolute failure date to the measurement that generated
+            # this forecast, even if a later observation has no saved prediction.
+            forecast_at = float(current["timestamp_s"])
+            low, high = interval
+            c2.metric(f"Failure window ({display_unit})", f"{(forecast_at + low) / scale:.1f}–{(forecast_at + high) / scale:.1f}")
+            c4.metric(f"Remaining life range ({display_unit})", f"{low / scale:.1f}–{high / scale:.1f}")
+            st.caption(
+                f"Forecast center: {float(rul) / scale:.1f} {display_unit} remaining. "
+                "Empirical forecast range; not a guaranteed failure deadline."
             )
+            if forecast_at != age_s:
+                st.caption(f"Latest saved forecast was made at {_format_replay_clock(forecast_at, dataset_id)}.")
         else:
-            c1.metric("Operating age (min)", f"{age_s / 60.0:.1f}")
-            c2.metric(
-                "Predicted RUL (min)",
-                "—" if rul is None or pd.isna(rul) else f"{float(rul) / 60.0:.1f}",
-            )
+            c2.metric(f"Predicted RUL ({display_unit})", "—" if not _finite_number(rul) else f"{float(rul) / scale:.1f}")
+            c4.metric("Model", run_id)
         c3.metric("Alert", _alert_status_for_row(current, live_alerts, uid, steps=steps, blocked=block_status))
-        c4.metric("Model", run_id)
     if warn_t is not None:
         st.caption(
             f"Warning episode time: {_format_replay_clock(warn_t, dataset_id)} "
