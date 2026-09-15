@@ -62,7 +62,10 @@ def main(argv=None):
     if args.source_path:
         mcfg["reservoir"]["source_path"] = args.source_path
     processed = load_processed("bearings")
-    features, units, split = processed["features"], processed["units"], processed["split"]
+    from pdm.data.quality import training_admission
+
+    features, units = processed["features"], processed["units"]
+    split, cfg["admission_counts"] = training_admission(processed, cfg, 20)
     prep, _ = fit_preprocessor("bearings", features, units, split, cfg)
     print("Building the complete classified MaleCNS; training a new readout from scratch", flush=True)
     model, rmeta = _build_reservoir_model(mcfg, input_size=len(prep.feature_names), head="rul", time_scale_s=prep.time_scale_s)
@@ -185,6 +188,7 @@ def main(argv=None):
                                            "dataset_id": "bearings", "architecture": mcfg["architecture"],
                                            "state_mode": "continuous", "graph_mode": "real_connectome", "n_nodes": model.n_nodes, "rul_transform": transform})
     print(json.dumps({"run_id": run_id, "run_path": str(rdir), "evaluation": report}, indent=2), flush=True)
+    return {"run_id": run_id, "dir": str(rdir), "status": "completed"}
 
 
 def run_cli():

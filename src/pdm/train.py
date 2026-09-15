@@ -92,7 +92,7 @@ class UnitWindowDataset(Dataset):
 
     def __getitem__(self, i: int):
         uid, start, end, target, duration, event = self.index[i]
-        x = np.ascontiguousarray(self.arrays[uid][start : end + 1])
+        x = np.array(self.arrays[uid][start : end + 1], order="C", copy=True)
         ts = self.timestamps[uid][start : end + 1]
         return {
             "x": torch.from_numpy(x),
@@ -534,6 +534,7 @@ def run_training(
     graph_mode: str | None = None,
     readout: str | None = None,
     source_path: str | None = None,
+    events_only: bool = False,
 ) -> dict[str, Any]:
     def _log(msg: str) -> None:
         if log:
@@ -603,7 +604,14 @@ def run_training(
     assert_gap_rule_current(processed.get("fingerprint"))
     features = processed["features"]
     units = processed["units"]
-    split = processed["split"]
+    from pdm.data.quality import training_admission
+
+    if resume_run_id:
+        previous_cfg = _load_saved_run_task_config(dataset_runs(dataset_id) / resume_run_id) or {}
+        events_only = bool(previous_cfg.get("events_only", False))
+    split, admission_counts = training_admission(processed, cfg, int(mcfg["history_length"]), events_only=events_only)
+    cfg["events_only"] = bool(events_only)
+    cfg["admission_counts"] = admission_counts
     head = "rul" if dataset_id == "bearings" else "weibull"
 
     if resume_run_id:
@@ -817,6 +825,8 @@ def run_training(
         "train_windows_per_unit": train_wpu,
         "val_windows_per_unit": val_wpu,
         "selection_metric": sel_spec,
+        "events_only": bool(events_only),
+        "admission_counts": admission_counts,
     }
     if dataset_id == "filters":
         run_cfg["gap"] = {

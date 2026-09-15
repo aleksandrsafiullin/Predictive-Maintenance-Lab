@@ -20,6 +20,10 @@ def simulate_step(features, unit_id, timestamp_s, model, prep, history_length, p
         (features["unit_id"].astype(str) == str(unit_id))
         & (pd.to_numeric(features["timestamp_s"], errors="coerce") <= float(timestamp_s))
     ].sort_values("timestamp_s").copy()
+    if hasattr(model, "encoder"):
+        from pdm.visualization.recurrent_trace import recurrent_trace
+
+        return recurrent_trace(prefix, model, prep, history_length)
     if getattr(model, "state_mode", None) == "continuous":
         return continuous_trace(prefix, model, prep, history_length, previous_trace=previous_trace)
     trace = predict_with_trace(
@@ -29,7 +33,7 @@ def simulate_step(features, unit_id, timestamp_s, model, prep, history_length, p
         return trace
     # Diagnostic decomposition only. States still come from the shared ESN kernel.
     states = torch.from_numpy(trace["states"])
-    inputs = torch.from_numpy(trace["inputs"])
+    inputs = torch.from_numpy(trace["inputs"].copy())
     previous = torch.cat([torch.zeros_like(states[:1]), states[:-1]], dim=0)
     with torch.no_grad():
         trace["processing"] = {
@@ -42,7 +46,7 @@ def simulate_step(features, unit_id, timestamp_s, model, prep, history_length, p
     return trace
 
 
-def continuous_trace(prefix, model, prep, warmup, *, previous_trace=None):
+def continuous_trace(prefix, model, prep, warmup, *, previous_trace=None, should_stop=None):
     """Exact chronological ESN states. Cached prefixes only accelerate append-only steps."""
     frame = prefix.sort_values("timestamp_s").copy().reset_index(drop=True)
     from pdm.visualization.trace import _display_from_raw, _empty_trace
@@ -69,7 +73,7 @@ def continuous_trace(prefix, model, prep, warmup, *, previous_trace=None):
     encoded = apply_preprocessor(prep, frame)
     inputs = encoded[prep.feature_names].to_numpy(dtype=np.float32, copy=True)
     if hasattr(model, "pool_index"):
-        return _full_cns_trace(inputs, ts, model, warmup, previous_trace)
+        return _full_cns_trace(inputs, ts, model, warmup, previous_trace, should_stop=should_stop)
     previous_trace = previous_trace or {}
     old_inputs = previous_trace.get("inputs")
     old_ts = previous_trace.get("timestamps_s")
@@ -148,7 +152,7 @@ def neuron_details(trace, model, prep, node_index: int) -> tuple[pd.DataFrame, p
     return sensors, neighbors
 
 
-def _full_cns_trace(inputs, ts, model, warmup, previous_trace):
+def _full_cns_trace(inputs, ts, model, warmup, previous_trace, *, should_stop=None):
     """Bounded state storage: full current/previous state, causal readouts and raster.
 
     Seeking reconstructs the causal prefix with the same kernel. Playback appends
@@ -170,6 +174,8 @@ def _full_cns_trace(inputs, ts, model, warmup, previous_trace):
     model.eval()
     with torch.no_grad():
         for offset in range(old_n if reuse else 0, len(inputs), 32):
+            if should_stop and should_stop():
+                raise InterruptedError("Evaluation cancelled")
             x = torch.from_numpy(inputs[offset:offset + 32].copy())
             states = model.forward_states(x, x0=x0)
             previous = states[-2] if len(states) > 1 else (x0 if x0 is not None else previous)
@@ -200,3 +206,26 @@ def _full_cns_trace(inputs, ts, model, warmup, previous_trace):
             "valid_history_reason": "" if ready else "insufficient_length", "model_identity": identity,
             "activity_history": history, "activity_history_ids": raster_ids.tolist(),
             "activity_history_timestamps_s": ts[-len(history):], "state_history_complete": False}
+
+
+def window_forecast_history(measurements, model, prep, history_length, *, cached=None):
+    """Complete causal chart prefix, independent of the user's seek path.
+
+    Cache only predictions of earlier prefixes; the current point and every
+    missing point use the ordinary Predictor used by evaluation and export.
+    """
+    from pdm.predict import Predictor
+    from pdm.replay import ReplaySource
+
+    source = ReplaySource(measurements, gap_multiplier=getattr(prep, "gap_multiplier", None),
+                          sampling_interval_s=getattr(prep, "sampling_interval_s", None))
+    saved = cached or {}
+    predictor = Predictor(model, prep, history_length, device="cpu")
+    rows = []
+    for index in range(len(source)):
+        stamp = float(source.measurements.iloc[index].timestamp_s)
+        result = saved.get(stamp)
+        if result is None:
+            result = {"timestamp_s": stamp, **predictor.predict_from_history(source.prefix(index))}
+        rows.append(result)
+    return pd.DataFrame(rows)

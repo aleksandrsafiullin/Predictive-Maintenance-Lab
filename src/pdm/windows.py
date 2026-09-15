@@ -204,7 +204,7 @@ def recompute_filter_gap_before(
     )
     out = out.copy()
     out["delta_t_s"] = dt
-    out["gap_before"] = gaps
+    out["gap_before"] = gaps | out.get("quality_gap_before", False)
     return out
 
 

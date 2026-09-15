@@ -343,9 +343,19 @@ def _measurements_from_csv(
     # Data_No 1–50 is reused in Train_Data_CSV and Test_Data_CSV for different
     # experiments (lengths / Δp series do not match). Namespaced unit_id is the split key.
     ns = "Train" if split_source == "author_train" else "Test"
+    identifiers = pd.to_numeric(df["Data_No"], errors="coerce")
+    valid_ids = np.isfinite(identifiers) & (identifiers > 0) & (identifiers == np.floor(identifiers))
+    if not valid_ids.all():
+        rows = (np.flatnonzero(~valid_ids.to_numpy()) + 2).tolist()
+        raise ValueError(f"{ns} CSV has invalid equipment identifiers at source rows {rows[:20]}; admission cannot assign these records to a series.")
+    df = df.assign(Data_No=identifiers.astype(int))
     rows = []
     for unit_id, g in df.groupby("Data_No", sort=True):
-        g = g.sort_values("Time").copy()
+        g = g.copy()
+        for column in ("Time", "Differential_pressure", "Flow_rate", "Dust_feed"):
+            g[column] = pd.to_numeric(g[column], errors="coerce")
+        order_error = "nonmonotonic_source_time" if (np.diff(g.Time.to_numpy()) < 0).any() else ""
+        g = g.sort_values("Time", kind="stable").copy()
         t_s = _time_to_seconds(g["Time"].to_numpy(), time_factor)
         dp = g["Differential_pressure"].to_numpy(dtype=np.float64)
         flow = g["Flow_rate"].to_numpy(dtype=np.float64)
@@ -366,6 +376,7 @@ def _measurements_from_csv(
         for i in range(len(g)):
             rows.append(
                 {
+                    "_quality_errors": order_error or ("missing_dust" if pd.isna(g["Dust"].iloc[i]) or not str(g["Dust"].iloc[i]).strip() else ""),
                     "dataset_id": "filters",
                     "unit_id": f"{ns}_{int(unit_id)}",
                     "author_data_no": int(unit_id),
@@ -440,7 +451,7 @@ def _test_unit_table(
         unit_id = f"Test_{int(data_no)}"
         g = feat_test[feat_test["unit_id"] == unit_id].sort_values("timestamp_s")
         prefix_end_s = float(g["timestamp_s"].max())
-        official_rul_original = float(last["RUL"])
+        official_rul_original = pd.to_numeric(last["RUL"], errors="coerce")
         official_rul_s = official_rul_original * time_factor
         dp_max = float(g["differential_pressure"].max())
         recs.append(

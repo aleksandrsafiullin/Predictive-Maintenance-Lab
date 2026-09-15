@@ -23,7 +23,7 @@ from pdm.visualization.simulation import neuron_details, simulate_step
 from pdm.worker import worker_alive
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=2)
 def _simulation_model(path: str, checkpoint_stamp: int):
     from pdm.train import load_trained_model
 
@@ -94,12 +94,12 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
     # Reset before constructing the widget or indexing the new table.
     version = bundle.get("dataset_version")
     if session.get("dataset_version") != version:
-        session.update(playing=False, predictions={}, trace=None, at=None, dataset_version=version)
+        session.update(playing=False, predictions={}, forecast_rows={}, trace=None, at=None, dataset_version=version)
         st.session_state[cursor_key] = 0
     cursor = int(st.session_state.get(cursor_key, 0))
     if cursor < 0 or cursor >= len(feat):
         st.session_state[cursor_key] = max(0, min(cursor, len(feat) - 1))
-        session.update(playing=False, predictions={}, trace=None, at=None)
+        session.update(playing=False, predictions={}, forecast_rows={}, trace=None, at=None)
     render_hero(dataset_id, uid, split_label_for_unit(bundle.get("split"), uid))
     with st.container(key="lab_controls"):
         with st.container(key="lab_transport"):
@@ -116,7 +116,7 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
             st.info(WORKER_BUSY_MESSAGE)
             return
         if reset:
-            session.update(playing=False, predictions={}, trace=None, at=None)
+            session.update(playing=False, predictions={}, forecast_rows={}, trace=None, at=None)
             st.session_state[cursor_key] = 0
         elif pause:
             session["playing"] = False
@@ -148,36 +148,28 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
         model, prep, meta = _simulation_model(str(rdir), stamp)
         hist_len = int(meta["history_length"])
         continuous = getattr(model, "state_mode", None) == "continuous"
-        payload, error = _simulation_scene(str(rdir), stamp, _soma_cache_key(None))
-        if not model.is_synthetic:
-            node_ids = list(map(str, model.node_order))
-            anatomy = payload.get("flags") or {}
-            if (anatomy.get("hull_mode") != "malecns_anatomy"
-                or (not anatomy.get("full_cns") and int(anatomy.get("n_with_soma") or 0) != len(node_ids))
-                or set(payload["nodes"]) != set(node_ids)
-                or (not anatomy.get("full_cns") and any(n not in payload["positions"] for n in node_ids))):
-                session["playing"] = False
-                if scheduled:
-                    st.rerun()
-                st.error("This saved model cannot show every computing neuron in the fly brain. Select the new anatomy-complete model.")
-                if error:
-                    st.caption(error)
-                return
-            if not continuous:
-                session["playing"] = False
-                if scheduled:
-                    st.rerun()
-                st.error("Select the new continuous-history model with a calibrated failure interval.")
-                return
+        recurrent = hasattr(model, "encoder")
+        if recurrent:
+            payload, error = {"flags": {}, "positions": {}}, None
+        else:
+            payload, error = _simulation_scene(str(rdir), stamp, _soma_cache_key(None))
+            if error:
+                st.caption(error)
+            if not model.is_synthetic and not payload["flags"].get("full_cns") and int(payload["flags"].get("n_with_soma") or 0) != model.n_nodes:
+                st.caption("This model cannot show every computing neuron in anatomical coordinates. A schematic network layout is used where coordinates are unavailable.")
         profile_path = Path(rdir) / "interval_profile.json"
-        profile = _interval_profile(str(rdir), stamp, profile_path.stat().st_mtime_ns) if continuous else None
-        if continuous:
-            _validate_simulation_profile(profile, hist_len)
-        # Seeking backwards discards future forecast points. Reopening a changed
+        profile = None
+        if continuous and profile_path.is_file():
+            try:
+                profile = _interval_profile(str(rdir), stamp, profile_path.stat().st_mtime_ns)
+                _validate_simulation_profile(profile, hist_len)
+            except ValueError as exc:
+                profile = None
+                st.warning(f"Interval unavailable: {exc}. Showing the raw point forecast.")
         # checkpoint also discards cached predictions and states.
         version = bundle.get("dataset_version")
         if session.get("checkpoint") != stamp or session.get("dataset_version") != version:
-            session.update(predictions={}, trace=None, at=None, checkpoint=stamp, dataset_version=version)
+            session.update(predictions={}, forecast_rows={}, trace=None, at=None, checkpoint=stamp, dataset_version=version)
         if session["at"] != index:
             session["predictions"] = {t: p for t, p in session["predictions"].items() if t <= now}
             session["trace"] = simulate_step(feat, uid, now, model, prep, hist_len, previous_trace=session["trace"])
@@ -186,18 +178,29 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
         pred = trace["predicted_rul_s"]
         if pred is not None:
             session["predictions"][now] = pred
-        if continuous:
+        if profile is not None:
             from pdm.forecasting import predict_failure_interval
 
             points = predict_failure_interval(trace["timestamps_s"], trace["raw_rul_s"], profile)
             latest = points.iloc[-1]
             pred = float(latest["predicted_rul_s"]) if pd.notna(latest["predicted_rul_s"]) else None
             interval = (float(latest["lower_rul_s"]), float(latest["upper_rul_s"])) if pred is not None else None
+        elif not continuous:
+            from pdm.visualization.simulation import window_forecast_history
+
+            points = window_forecast_history(feat.iloc[:index + 1], model, prep, hist_len,
+                                             cached=session.get("forecast_rows"))
+            session["forecast_rows"] = {float(r["timestamp_s"]): r for r in points.to_dict("records")}
+            latest = points.iloc[-1]
+            pred = float(latest.predicted_rul_s) if pd.notna(latest.predicted_rul_s) else None
+            interval = ((float(latest.lower_rul_s), float(latest.upper_rul_s))
+                        if pred is not None and pd.notna(latest.get("lower_rul_s")) else None)
         else:
             points = pd.DataFrame([
                 {"timestamp_s": t, "predicted_rul_s": p} for t, p in sorted(session["predictions"].items())
             ], columns=["timestamp_s", "predicted_rul_s"])
-            interval = None
+            interval = ((float(trace["lower_rul_s"]), float(trace["upper_rul_s"]))
+                        if pred is not None and "lower_rul_s" in trace else None)
     except Exception as exc:  # noqa: BLE001
         session["playing"] = False
         if scheduled:
@@ -236,45 +239,65 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
     scale = 60.0 if dataset_id == "bearings" else 1.0
     unit_label = "min" if dataset_id == "bearings" else "s, internal"
     actual_now = max(event - now, 0) if event is not None else None
+    event_reference_label = "Recorded end"
+    if dataset_id == "filters" and pd.notna(unit.get("official_rul_at_prefix_end_s")):
+        event_reference_label = "Official RUL end"
+        event = float(unit["observation_end_s"]) + float(unit["official_rul_at_prefix_end_s"])
+        actual = np.maximum(event - points["timestamp_s"].to_numpy(), 0)
+        actual_now = max(event - now, 0)
     render_metrics(
-        now=now, interval=interval, history=trace["n_history"], node_count=model.n_nodes,
+        now=now, interval=interval, history=trace["n_history"] if continuous else min(trace["n_history"], hist_len), node_count=model.n_nodes,
         playing=session["playing"], unit_label=unit_label, scale=scale, history_length=hist_len,
-        progress=100 * index / max(len(feat) - 1, 1),
+        progress=100 * index / max(len(feat) - 1, 1), predicted_rul_s=pred,
+        continuous=continuous, interval_method=("Empirical calibrated interval" if profile else trace.get("interval_method")),
     )
     if not predicted:
         st.caption(f"{trace['status']} · {trace['n_history']} / {hist_len} measurements before the first forecast")
-    elif not continuous:
-        st.caption(f"Legacy point forecast: {pred/scale:.2f} {unit_label} remaining; no calibrated interval is available.")
+    elif interval is None:
+        st.caption(f"Point forecast: {pred/scale:.2f} {unit_label} remaining · no calibrated interval available.")
+    else:
+        st.caption("Empirical forecast interval · calibration coverage is not an independent test" if profile else trace.get("interval_method", ""))
     left, right = st.columns([1, 1.35], gap="medium")
     with left, st.container(key="lab_brain_panel"):
-        full_cns = bool(payload["flags"].get("full_cns"))
-        render_panel_header("01", "MaleCNS · whole connectome" if full_cns else "The computing brain",
-                            "MaleCNS v1.0", f"{model.n_nodes:,} computing neurons")
-        if full_cns:
-            st.caption(f"{model.provenance['n_edges']:,} directed connections · {model.provenance['n_synapses']:,} synapses")
-            color, arbors = st.columns([1.3, 1])
-            with color:
-                payload["flags"]["color_mode"] = st.radio("Color", ["Activity", "Cell classes"],
-                                                          horizontal=True, key=key + ":color", label_visibility="collapsed")
-            with arbors:
-                payload["flags"]["show_morphology"] = st.checkbox("Neuron arbors", value=True, key=key + ":arbors")
-                payload["flags"]["show_connections"] = st.checkbox("Connection sample", value=False, key=key + ":edges")
-            history = trace.get("activity_history")
-            if history is not None:
-                payload["activity_history"] = history.tolist()
-                payload["activity_history_timestamps_s"] = trace["activity_history_timestamps_s"].tolist()
-                payload["activity_history_ids"] = [model.node_order[i] for i in trace["activity_history_ids"]]
-        payload["flags"]["compact"] = True
-        neural_activity_explorer(**payload, key=key + ":brain")
-        if full_cns:
-            morph = payload.get("morphology", {})
-            st.caption(f"{visible:,} curated soma/to-soma positions · {model.n_nodes - visible:,} neurons compute without a curated point. "
-                       f"Arbors: {morph.get('n_neurons', 0)} reconstructed neurons. "
-                       "Connection sample: up to 12,000 real pairs, drawn as straight links; not axon paths.")
-            st.caption("MaleCNS data: FlyEM / HHMI Janelia, Cambridge / MRC LMB, Google Research · CC-BY 4.0. "
-                       "Computational states, not biological recordings or spikes.")
+        if recurrent:
+            from pdm.visualization.recurrent_trace import render_recurrent_trace
+
+            render_panel_header("01", model.architecture.upper() + " · recurrent network", "Actual model activity", "SYNCHRONIZED")
+            render_recurrent_trace(trace, model, prep)
         else:
-            st.markdown('<div class="lab-panel-foot">Color and intensity show the current state.</div>', unsafe_allow_html=True)
+            full_cns = bool(payload["flags"].get("full_cns"))
+            random_control = model.architecture == "random_reservoir"
+            render_panel_header("01", "MaleCNS · whole connectome" if full_cns else ("Random reservoir" if random_control else "The computing brain"),
+                                "Engineered control" if random_control else "MaleCNS v1.0", f"{model.n_nodes:,} computing neurons")
+            if random_control:
+                payload["context_positions"] = {}
+                payload["hull_polyline"] = []
+                st.caption("Rewired computational connections and actual node states. Source neuron positions are inherited from the matched fly model; the connections are not biological.")
+            if full_cns:
+                st.caption(f"{model.provenance['n_edges']:,} directed connections · {model.provenance['n_synapses']:,} synapses")
+                color, arbors = st.columns([1.3, 1])
+                with color:
+                    payload["flags"]["color_mode"] = st.radio("Color", ["Activity", "Cell classes"],
+                                                              horizontal=True, key=key + ":color", label_visibility="collapsed")
+                with arbors:
+                    payload["flags"]["show_morphology"] = st.checkbox("Neuron arbors", value=True, key=key + ":arbors")
+                    payload["flags"]["show_connections"] = st.checkbox("Connection sample", value=False, key=key + ":edges")
+                history = trace.get("activity_history")
+                if history is not None:
+                    payload["activity_history"] = history.tolist()
+                    payload["activity_history_timestamps_s"] = trace["activity_history_timestamps_s"].tolist()
+                    payload["activity_history_ids"] = [model.node_order[i] for i in trace["activity_history_ids"]]
+            payload["flags"]["compact"] = True
+            neural_activity_explorer(**payload, key=key + ":brain")
+            if full_cns:
+                morph = payload.get("morphology", {})
+                st.caption(f"{visible:,} curated soma/to-soma positions · {model.n_nodes - visible:,} neurons compute without a curated point. "
+                           f"Arbors: {morph.get('n_neurons', 0)} reconstructed neurons. "
+                           "Connection sample: up to 12,000 real pairs, drawn as straight links; not axon paths.")
+                st.caption("MaleCNS data: FlyEM / HHMI Janelia, Cambridge / MRC LMB, Google Research · CC-BY 4.0. "
+                           "Computational states, not biological recordings or spikes.")
+            else:
+                st.markdown('<div class="lab-panel-foot">Color and intensity show the current state.</div>', unsafe_allow_html=True)
     with right, st.container(key="lab_forecast_panel"):
         render_panel_header("02", "Failure forecast", "Evidence → failure window", "SYNCHRONIZED")
         fig = build_work_overlay_figure(
@@ -282,24 +305,25 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
             predicted_rul_s=pred, history_length=trace["n_history"] if continuous else hist_len, show_gt=show_gt,
             event_time_s=event, event_observed=observed,
             predicted_rul_by_time=points, actual_rul_s=actual,
+            event_reference_label=event_reference_label,
             prediction_interval_s=interval,
         )
         fig.update_layout(height=570, uirevision=key)
         st.plotly_chart(fig, width="stretch", theme=None, key=key + ":chart")
         truth = (
-            f"Actual remaining life: {actual_now/scale:.1f} {unit_label} · recorded endpoint: {event/scale:.1f} {unit_label}"
+            f"Actual remaining life: {actual_now/scale:.1f} {unit_label} · {event_reference_label.lower()}: {event/scale:.1f} {unit_label}"
             if show_gt and actual_now is not None else "Ground truth hidden · forecast uses observed measurements only"
         )
         st.markdown(f'<div class="lab-panel-foot">{truth}</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="lab-explanation"><span><b>One measurement clock.</b> The brain receives observed history; '
+        '<div class="lab-explanation"><span><b>One measurement clock.</b> The model receives observed history; '
         'future recording and actual life are evaluation overlays only.</span>'
-        '<span><b>Empirical interval.</b> Calibrated on separate bearings; it can widen when evidence conflicts. '
-        'The recorded endpoint is a proxy for failure.</span></div>', unsafe_allow_html=True,
+        '<span><b>Forecast range.</b> The interval type is shown above when available. '
+        'Recorded endpoints and actual RUL are evaluation information.</span></div>', unsafe_allow_html=True,
     )
     if index == len(feat) - 1:
         st.caption("End of recorded measurements.")
-    if not has_activity:
+    if recurrent or not has_activity:
         return
     with st.expander("Inspect a computing neuron", expanded=False):
         if hasattr(model, "pool_index"):

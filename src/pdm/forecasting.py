@@ -128,7 +128,7 @@ def trajectory_design(model, prep, features, units, ids, warmup=20):
         group = group.sort_values("timestamp_s")
         u = group[prep.feature_names].to_numpy(np.float32)
         gaps = group.get("gap_before", pd.Series(False, index=group.index)).fillna(False).to_numpy(bool)
-        states = (model.pooled_trajectory(u, gaps) if hasattr(model, "pooled_trajectory")
+        states = (model.pooled_trajectory(u, gaps, should_stop=lambda: stop_path().exists()) if hasattr(model, "pooled_trajectory")
                   else continuous_states(model, u, gaps))
         age = np.arange(len(group))
         start = 0

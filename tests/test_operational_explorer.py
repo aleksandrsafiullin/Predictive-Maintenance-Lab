@@ -80,15 +80,14 @@ def test_operational_explorer_busy_prevents_simulation(operational_screen, monke
     assert WORKER_BUSY_MESSAGE in "\n".join(str(i.value) for i in at.info)
 
 
-def test_operational_explorer_rejects_nonreservoir(operational_screen):
+def test_operational_explorer_supports_nonreservoir(operational_screen):
     at, captured, _, rows = operational_screen
     for row in rows:
         row["architecture"] = "gru"
     at.run()
     assert not at.exception
-    assert captured == []
-    assert not at.selectbox
-    assert any("reservoir" in str(w.value) for w in at.warning)
+    assert len(captured) == 1
+    assert any(s.label == "Run" for s in at.selectbox)
 
 
 def test_changing_equipment_pauses_existing_clock(operational_screen):

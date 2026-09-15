@@ -82,7 +82,7 @@ class FullCNSReservoir(LeakyESN):
                 shape=(self.n_readout_features, self.n_nodes), dtype=np.float32,
             )
 
-    def pooled_trajectory(self, inputs, gap_before=None):
+    def pooled_trajectory(self, inputs, gap_before=None, *, should_stop=None):
         """Pool only the readout, after all 166k recurrent states have computed.
 
         At most 32 full-state frames are kept in training memory. No N×T history
@@ -96,9 +96,7 @@ class FullCNSReservoir(LeakyESN):
             for start, end in zip(starts, np.r_[starts[1:], len(values)], strict=True):
                 x0 = None
                 for offset in range(int(start), int(end), 32):
-                    from pdm.worker import stop_path
-
-                    if stop_path().exists():
+                    if should_stop and should_stop():
                         raise InterruptedError("Full CNS training cancelled")
                     states = self.forward_states(torch.from_numpy(values[offset:min(offset + 32, end)].copy()), x0=x0)
                     x0 = states[-1].clone()

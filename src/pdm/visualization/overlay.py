@@ -56,6 +56,7 @@ def build_work_overlay_figure(
     predicted_rul_by_time: pd.DataFrame | None = None,
     actual_rul_s: np.ndarray | pd.Series | None = None,
     prediction_interval_s: tuple[float, float] | None = None,
+    event_reference_label: str = "Recorded end",
 ) -> go.Figure:
     """Sensor + time-zone overlay. Predicted RUL is never a y-series on the sensor panel.
 
@@ -162,10 +163,10 @@ def build_work_overlay_figure(
         et = float(event_time_s) / scale
         scatter(2, x=[et], y=[0.54], mode="markers", name="recorded endpoint", showlegend=False,
                 marker=dict(symbol="line-ns", size=27, color=coral, line=dict(width=2, color=coral)),
-                hovertemplate=f"Recorded endpoint · %{{x:.1f}} {unit}<extra></extra>")
+                hovertemplate=f"{event_reference_label} · %{{x:.1f}} {unit}<extra></extra>")
         # Separate annotation rows prevent Now, center and ground truth collisions.
         fig.add_annotation(x=1, y=1, xref="x2 domain", yref="y2 domain", xanchor="right",
-                           text=f"Recorded end {et:.1f}", showarrow=False,
+                           text=f"{event_reference_label} {et:.1f}", showarrow=False,
                            font=dict(size=10, color=coral), yshift=11)
 
     lane_values = [float(v) for v in (now_x, zone_x0, zone_x1, event_x) if _finite(v)]

@@ -88,7 +88,11 @@ def run_job(job: dict) -> None:
         return stop_path().exists()
 
     try:
-        if kind == "prepare":
+        if kind == "train_matrix":
+            from pdm.batch import run_batch
+
+            run_batch(job)
+        elif kind == "prepare":
             from pdm.data.prepare import prepare_dataset
 
             write_status({"status": "preparing", "dataset_id": job["dataset_id"], "kind": kind})
@@ -143,6 +147,8 @@ def run_job(job: dict) -> None:
                 graph_mode=job.get("graph_mode"),
                 readout=job.get("readout"),
                 source_path=job.get("source_path"),
+                seed=job.get("seed"),
+                events_only=bool(job.get("events_only", False)),
             )
         elif kind in {"evaluate", "replay_predict"}:
             from pdm.evaluate import evaluate_run

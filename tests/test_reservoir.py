@@ -1105,7 +1105,7 @@ def test_trace_artifact_reload(tiny_bearing_tables, tmp_path):
     assert meta["n_nodes"] == 8
 
 
-def test_predict_with_trace_gru_note(tiny_bearing_tables):
+def test_predict_with_trace_gru_states(tiny_bearing_tables):
     from pdm.models import PDMNet
 
     features, _units = tiny_bearing_tables
@@ -1113,11 +1113,13 @@ def test_predict_with_trace_gru_note(tiny_bearing_tables):
     hist, uid = _unit_history(features, 5)
     gru = PDMNet(len(prep.feature_names), hidden_size=8, architecture="gru", head="rul", time_scale_s=1.0)
     out = predict_with_trace(hist, uid, gru, prep, history_length=5)
-    assert out["status"] == "traces require reservoir model"
+    assert out["status"] == "predicted"
+    assert out["states"].shape == (5, 8)
     pred = Predictor(gru, prep, history_length=5).predict_from_history(hist, with_trace=True)
-    assert pred.get("trace_note") == "traces require reservoir model"
-    assert pred["status"] in {"ok", "Collecting history", "No valid prediction"}
-    assert "states" not in pred or pred["status"] != "predicted"
+    assert pred["status"] == "predicted"
+    assert pred["states"].shape == (5, 8)
+    ordinary = Predictor(gru, prep, history_length=5).predict_from_history(hist)
+    assert pred["predicted_rul_s"] == ordinary["predicted_rul_s"]
 
 
 def test_lazy_skips_per_neuron(tiny_bearing_tables):

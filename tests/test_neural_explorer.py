@@ -34,7 +34,7 @@ def _screen_radio(at):
     """Find the Screen radio by its options containing known screen names."""
     for radio in at.sidebar.radio:
         opts = list(radio.options)
-        if "Data" in opts and "Train" in opts and "Test & Replay" in opts:
+        if "Data Quality" in opts and "Training" in opts and "Model Report" in opts:
             return radio
     raise AssertionError("Screen radio not found")
 
@@ -138,7 +138,12 @@ def _explorer_harness(
         graph = nx.DiGraph()
         graph.add_nodes_from(nodes)
         graph.add_edges_from(zip(nodes, nodes[1:]), weight=1.0)
-        model = FlyConnectomeReservoir(graph, input_size=1, seed=4, provenance=provenance)
+        if architecture in {"gru", "lstm"}:
+            from pdm.models import PDMNet
+
+            model = PDMNet(1, hidden_size=n_nodes, architecture=architecture)
+        else:
+            model = FlyConnectomeReservoir(graph, input_size=1, seed=4, provenance=provenance)
         prep = Preprocessor(
             feature_names=["horizontal_rms"], log1p_features=[], scaler_mean=[0.0],
             scaler_scale=[1.0], time_scale_s=100.0, fill_values={"horizontal_rms": 0.0},
@@ -153,7 +158,7 @@ def _explorer_harness(
 
 
 def _open_explorer(at):
-    _screen_radio(at).set_value("Neural Activity Explorer")
+    _screen_radio(at).set_value("Model Report")
     at.run()
     assert not at.exception
     return at
@@ -168,7 +173,7 @@ def test_explorer_screen_present_in_app():
     assert not at.exception
     radio = _screen_radio(at)
     opts = list(radio.options)
-    assert opts == ["Data", "Train", "Test & Replay", "Neural Activity Explorer"]
+    assert opts == ["Data Quality", "Training", "Model Report", "Compare Models"]
 
 
 def test_explorer_caption_present(monkeypatch, tmp_path, tiny_bearing_tables):
@@ -200,7 +205,7 @@ def test_synthetic_banner_present(monkeypatch, tmp_path, tiny_bearing_tables):
 
 
 def test_gru_run_does_not_show_fake_biological_activity(monkeypatch, tmp_path, tiny_bearing_tables):
-    """GRU/LSTM runs show the reservoir-required note, not fake fly activity."""
+    """GRU reports show their computed recurrent state without a fly graph."""
     from streamlit.testing.v1 import AppTest
 
     inline = {"n": 0}
@@ -222,11 +227,11 @@ def test_gru_run_does_not_show_fake_biological_activity(monkeypatch, tmp_path, t
     at.run()
     _open_explorer(at)
     text = _app_text(at)
-    assert EXPLORER_DISCLAIMER in text
-    assert RESERVOIR_REQUIRED_MESSAGE in text
+    assert EXPLORER_DISCLAIMER not in text
+    assert "GRU" in text
     assert not any(b.label == "Build trace" for b in at.button)
     assert not at.exception
-    assert RESERVOIR_REQUIRED_MESSAGE in _app_text(at)
+    assert RESERVOIR_REQUIRED_MESSAGE not in _app_text(at)
     assert inline["n"] == 0
 
 
@@ -361,11 +366,11 @@ def test_screen_switch_by_label(monkeypatch, tmp_path):
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    _screen_radio(at).set_value("Neural Activity Explorer")
+    _screen_radio(at).set_value("Model Report")
     at.run()
     assert not at.exception
     assert EXPLORER_DISCLAIMER in _app_text(at)
-    _screen_radio(at).set_value("Train")
+    _screen_radio(at).set_value("Training")
     at.run()
     assert not at.exception
     text = _app_text(at)
@@ -1537,7 +1542,7 @@ def test_real_connectome_without_soma_shows_anatomy_missing(monkeypatch, tmp_pat
     _open_explorer(at)
     assert not at.exception
     assert "cannot show every computing neuron" in _app_text(at)
-    assert captured == []
+    assert captured  # Missing anatomy no longer blocks the model report.
 
 
 def test_explorer_junk_soma_schema_caption_no_exception(monkeypatch, tmp_path, tiny_bearing_tables):

@@ -354,10 +354,9 @@ def filter_prefix_backtest_table(pred: pd.DataFrame, units: pd.DataFrame) -> pd.
     if pred.empty:
         return pred.copy()
     official = _official_rul_map(units)
-    ends = last_row_per_unit(pred)
-    t_last = {
-        str(row["unit_id"]): float(row["timestamp_s"]) for _, row in ends.iterrows()
-    }
+    # The official label belongs to the saved source endpoint. A missing
+    # prediction row must never move this clock earlier.
+    t_last = {str(row["unit_id"]): float(row["observation_end_s"]) for _, row in units.iterrows()}
     actual = []
     for _, row in pred.iterrows():
         uid = str(row["unit_id"])
@@ -799,7 +798,8 @@ def bind_evaluation_to_run(
     if resolve_split_hash(run_fp) is None:
         run_fp["split_hash"] = split_hash(run_split)
 
-    processed_dir = resolve_processed_dir(dataset_id)
+    version = run_fp.get("dataset_version")
+    processed_dir = resolve_processed_dir(dataset_id, version) if version else resolve_processed_dir(dataset_id)
     live_split_path = processed_dir / "split.json"
     live_split = read_json(live_split_path) if live_split_path.exists() else {}
     current_fp = dict(load_processed_fingerprint(processed_dir, live_split, dataset_id))
@@ -807,10 +807,23 @@ def bind_evaluation_to_run(
         current_fp["split_hash"] = split_hash(live_split)
 
     assert_gap_rule_current(current_fp)
+    if run_fp.get("quality_policy_hash"):
+        for field in ("quality_policy_hash", "quality_records_hash"):
+            if run_fp.get(field) != current_fp.get(field):
+                raise IncompatibleDataError([field])
+        if sha256_file(processed_dir / "quality_records.parquet") != run_fp.get("quality_records_hash"):
+            raise IncompatibleDataError(["quality_records_hash"])
 
-    differing = fingerprint_mismatches(run_fp, current_fp)
+    source_split = run_fp.get("source_split_hash")
+    comparison_fp = dict(current_fp)
+    if source_split and source_split == current_fp.get("split_hash"):
+        for part in ("train", "validation", "test"):
+            if not set(run_split.get(part, [])).issubset(live_split.get(part, [])):
+                raise IncompatibleDataError(["split_hash"], "Run membership is not a subset of its source snapshot")
+        comparison_fp["split_hash"] = run_fp.get("split_hash")
+    differing = fingerprint_mismatches(run_fp, comparison_fp)
     _extend_unique(differing, _processed_file_hash_mismatches(run_fp, processed_dir))
-    _extend_unique(differing, _live_split_hash_mismatch(run_fp, live_split))
+    _extend_unique(differing, _live_split_hash_mismatch({**run_fp, "split_hash": source_split or run_fp.get("split_hash")}, live_split))
     _extend_unique(differing, _checkpoint_hash_mismatch(run_fp, rdir))
 
     exp_snap = load_experiment_snapshot(rdir)
@@ -826,7 +839,7 @@ def bind_evaluation_to_run(
     if differing and not force:
         raise IncompatibleDataError(differing)
 
-    processed = load_processed(dataset_id)
+    processed = load_processed(dataset_id, version) if version else load_processed(dataset_id)
     return {
         "split": run_split,
         "features": processed["features"],
@@ -853,7 +866,7 @@ _FILTER_TIME_SCALE_REPORT_KEYS = (
     "original_time_unit",
 )
 
-METRICS_VERSION = "v1"
+METRICS_VERSION = "v2_quality_forecast"
 _ALERT_DEPENDENT_PRED_COLUMNS = ("alert_status",)
 ALERT_UNIT_COLUMNS = (
     "n_alert_episodes",
@@ -1053,6 +1066,8 @@ def generate_split_predictions(
     pressure_limit_pa: float,
     truth_units: pd.DataFrame,
     forecast_profile: Mapping[str, Any] | None = None,
+    should_stop=None,
+    progress_cb=None,
 ) -> pd.DataFrame:
     """Replay every listed unit. Predictions.csv stays H/K-independent after export."""
     from pdm.replay import replay_unit
@@ -1063,7 +1078,9 @@ def generate_split_predictions(
     k = int(policy["confirmation_count"])
     reset = float(policy.get("reset_factor", 1.2))
     pred_frames: list[pd.DataFrame] = []
-    for uid in unit_ids:
+    for unit_index, uid in enumerate(unit_ids, 1):
+        if progress_cb:
+            progress_cb({"unit_id": uid, "unit_index": unit_index, "unit_total": len(unit_ids)})
         meas = features[features["unit_id"] == uid]
         out = replay_unit(
             meas,
@@ -1079,6 +1096,7 @@ def generate_split_predictions(
             pressure_limit_pa=pressure_limit_pa,
             truth_units=truth_units,
             forecast_profile=forecast_profile,
+            should_stop=should_stop,
         )
         pred_frames.append(out["predictions"])
     if not pred_frames:
@@ -1101,7 +1119,7 @@ def _write_reservoir_traces(
     from pdm.visualization.export import save_trace
     from pdm.visualization.trace import is_reservoir_module, predict_with_trace
 
-    if not is_reservoir_module(model):
+    if not is_reservoir_module(model) and not hasattr(model, "encoder"):
         return
     hist_len = int(history_length)
     for uid in unit_ids:
@@ -1131,11 +1149,12 @@ def _write_reservoir_traces(
             is_synthetic=bool(getattr(model, "is_synthetic", True)),
             states=trace["states"],
             inputs=trace["inputs"],
-            contributions=trace["contributions"],
+            contributions=trace.get("contributions", {}),
+            cell_states=trace.get("cell_states"),
             frame_map=trace["frame_map"],
             node_order=trace["node_order"],
             predicted_rul_s=trace["predicted_rul_s"],
-            raw_prediction=trace["raw_prediction"],
+            raw_prediction=trace.get("raw_prediction"),
             status=trace["status"],
             time_scale_s=float(getattr(model, "time_scale_s", 1.0)),
             head=str(getattr(model, "head_type", "")),
@@ -1156,6 +1175,8 @@ def evaluate_run(
     device: str = "cpu",
     force: bool = False,
     with_trace: bool = False,
+    should_stop=None,
+    progress_cb=None,
 ) -> dict[str, Any]:
     from pdm.config import load_dataset_config
     from pdm.device import resolve_device
@@ -1252,9 +1273,17 @@ def evaluate_run(
         pressure_limit_pa=pressure_limit_pa,
         truth_units=units,
         forecast_profile=forecast_profile,
+        should_stop=should_stop,
+        progress_cb=progress_cb,
     )
     if not preds.empty:
         preds = attach_actual_rul(preds, units, dataset_id)
+        if dataset_id == "filters" and split_name == "test":
+            preds = filter_prefix_backtest_table(preds, units)
+        if dataset_id == "filters":
+            from pdm.benchmark import add_survival_scores
+
+            preds = add_survival_scores(preds, units)
     pred_export = prediction_export_frame(preds)
     if with_trace:
         _write_reservoir_traces(
@@ -1292,6 +1321,8 @@ def evaluate_run(
         if bound.get("snapshot_metrics_version") is not None:
             eval_cfg["snapshot_metrics_version"] = bound.get("snapshot_metrics_version")
         eval_cfg["pressure_limit_pa"] = pressure_limit_pa
+        if dataset_id == "filters" and split_name == "test":
+            eval_cfg["truth_annotation_method"] = "official_prefix_end_plus_elapsed"
         if getattr(model, "state_mode", None) == "continuous":
             eval_cfg["state_mode"] = "continuous"
             eval_cfg["forecast_method"] = (
@@ -1301,12 +1332,21 @@ def evaluate_run(
             from pdm.io_util import sha256_file
 
             eval_cfg["interval_profile_sha256"] = sha256_file(rdir / "interval_profile.json")
+            eval_cfg["interval_calibration_ids"] = forecast_profile.get("calibration_ids", [])
             eval_cfg["evaluation_status"] = forecast_profile.get("evaluation_status", "empirical_calibration")
             eval_cfg["interval_coverage_guarantee"] = False
         if expected_ckpt and str(expected_ckpt) != str(ckpt_sha):
             eval_cfg["expected_checkpoint_hash"] = str(expected_ckpt)
         atomic_write_json(staging / "evaluation_config.json", eval_cfg)
         atomic_write_text(staging / "predictions.csv", pred_export.to_csv(index=False))
+        from pdm.io_util import sha256_file
+
+        eval_cfg.update({key: run_fp.get(key) for key in ("quality_policy_hash", "quality_records_hash", "quality_policy_version")})
+        eval_cfg["predictions_sha256"] = sha256_file(staging / "predictions.csv")
+        if (rdir / "benchmark_context.json").is_file():
+            eval_cfg["evaluate_mask"]["blind_benchmark"] = False
+            eval_cfg["evaluation_status"] = "validation_selection" if split_name == "validation" else "exploratory_reused_holdout"
+        atomic_write_json(staging / "evaluation_config.json", eval_cfg)
         metrics, by_unit = build_rul_metrics(
             preds,
             dataset_id=dataset_id,
@@ -1322,6 +1362,13 @@ def evaluate_run(
         for key in ("state_mode", "forecast_method", "interval_profile_sha256", "evaluation_status", "interval_coverage_guarantee"):
             if key in eval_cfg:
                 metrics[key] = eval_cfg[key]
+        if dataset_id == "filters" and split_name == "validation" and "survival_nll" in preds:
+            finite_nll = preds[np.isfinite(preds.survival_nll)]
+            nll_by_unit = finite_nll.groupby("unit_id").survival_nll.mean()
+            metrics.update(primary_metric="survival_nll", survival_nll=float(nll_by_unit.mean()),
+                           nll_unit_count=len(nll_by_unit), n_observed_events=int(units[units.unit_id.isin(unit_ids)].event_observed.sum()),
+                           event_mae=summarize_rul_table(preds).get("equal_weight_unit_mae"))
+            by_unit["survival_nll"] = by_unit.unit_id.map(nll_by_unit)
         atomic_write_json(staging / "metrics.json", metrics)
         atomic_write_text(staging / "metrics_by_unit.csv", by_unit.to_csv(index=False))
         run_alert_evaluation(

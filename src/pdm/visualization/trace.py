@@ -49,13 +49,17 @@ def predict_with_trace(
     """
     node_order = [str(n) for n in list(getattr(model, "node_order", []) or [])]
     n_hist = len(history_rows)
+    hist_len = int(history_length) if history_length is not None else max(int(n_hist), 1)
+    if hasattr(model, "encoder"):
+        from pdm.visualization.recurrent_trace import recurrent_trace
+
+        return recurrent_trace(history_rows, model, prep, hist_len, _resolve_device(model, device))
     empty = _empty_trace(model, node_order, n_hist)
     if not is_reservoir_module(model):
         empty["status"] = "traces require reservoir model"
         empty["valid_history_reason"] = "traces require a reservoir run"
         return empty
 
-    hist_len = int(history_length) if history_length is not None else max(int(n_hist), 1)
     if getattr(model, "state_mode", None) == "continuous":
         from pdm.visualization.simulation import continuous_trace
 
@@ -79,7 +83,7 @@ def predict_with_trace(
     dev = _resolve_device(model, device)
     model = model.to(dev)
     model.eval()
-    x = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).to(dev)
+    x = torch.from_numpy(np.array(arr, order="C", copy=True)).unsqueeze(0).to(dev)
     with torch.no_grad():
         # Shared leaky kernel — LeakyESN.forward_states → leaky_forward_states.
         states_t = model.forward_states(x)
@@ -102,7 +106,11 @@ def predict_with_trace(
     contrib["raw"] = np.asarray(raw_seq_np, dtype=np.float32)
     raw_prediction = raw_last.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
     frame_map = _frame_map(window, uid, prediction_index)
+    from pdm.predict import model_forecast
+
+    distribution = model_forecast(model, x) if model.head_type == "weibull" else {"raw_rul_s": value}
     return {
+        **distribution,
         "predicted_rul_s": value,
         "raw_prediction": raw_prediction,
         "states": states_np,
@@ -126,8 +134,8 @@ def run_trace_job(
     device: str = "cpu",
 ) -> dict[str, Any]:
     """Write ``runs/<dataset_id>/<run_id>/traces/<unit_id>/``. Stop → ``cancelled``."""
-    from pdm.data.prepare import load_processed
     from pdm.paths import dataset_runs, run_traces_dir
+    from pdm.replay import bind_replay_to_run
     from pdm.train import load_trained_model
     from pdm.visualization.export import save_trace
 
@@ -137,12 +145,12 @@ def run_trace_job(
     model, prep, meta = load_trained_model(rdir, device=device, which="best")
     if should_stop is not None and should_stop():
         return {"status": "cancelled"}
-    if not is_reservoir_module(model):
+    if not is_reservoir_module(model) and not hasattr(model, "encoder"):
         return {
             "status": "completed",
             "trace_note": "traces require reservoir model",
         }
-    packed = load_processed(dataset_id)
+    packed = bind_replay_to_run(dataset_id, run_id)
     features = packed["features"]
     if unit_id is None:
         raise ValueError("trace job requires unit_id")
@@ -180,11 +188,12 @@ def run_trace_job(
         is_synthetic=bool(getattr(model, "is_synthetic", True)),
         states=trace["states"],
         inputs=trace["inputs"],
-        contributions=trace["contributions"],
+        contributions=trace.get("contributions", {}),
+        cell_states=trace.get("cell_states"),
         frame_map=trace["frame_map"],
         node_order=trace["node_order"],
         predicted_rul_s=trace["predicted_rul_s"],
-        raw_prediction=trace["raw_prediction"],
+        raw_prediction=trace.get("raw_prediction"),
         status=trace["status"],
         time_scale_s=float(getattr(model, "time_scale_s", prep.time_scale_s)),
         head=str(getattr(model, "head_type", "")),

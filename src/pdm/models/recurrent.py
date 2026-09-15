@@ -79,6 +79,11 @@ class PDMNet(nn.Module):
         time_scale_s: float = 1.0,
     ) -> None:
         super().__init__()
+        self.architecture = architecture
+        self.state_mode = "window_reset"
+        self.n_nodes = int(hidden_size) * int(num_layers)
+        self.node_order = [f"L{layer + 1}:h{unit + 1}" for layer in range(num_layers) for unit in range(hidden_size)]
+        self.is_synthetic = False
         self.encoder = RecurrentEncoder(input_size, hidden_size, num_layers, architecture)
         self.head_type = head
         self.time_scale_s = float(time_scale_s)

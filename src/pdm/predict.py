@@ -139,16 +139,15 @@ class Predictor:
     ) -> dict[str, Any]:
         """history_rows: raw measurement rows sorted by time, only observations <= t.
 
-        Ordinary predict does not allocate or write traces. Pass ``with_trace=True``
-        to delegate to ``predict_with_trace`` for reservoir models. GRU/LSTM keep the
-        normal prediction and a note — no fake neuron traces.
+        Pass ``with_trace=True`` for the architecture's actual computed states.
+        Trace collection preserves the point forecast and the saved memory mode.
         """
         if with_trace:
             from pdm.visualization.trace import is_reservoir_module, predict_with_trace
 
             if is_reservoir_module(self.model):
                 uid = str(unit_id) if unit_id is not None else ""
-                return predict_with_trace(
+                result = predict_with_trace(
                     history_rows,
                     uid,
                     self.model,
@@ -159,10 +158,17 @@ class Predictor:
                     gap_multiplier=self.gap_multiplier,
                     sampling_interval_s=self.sampling_interval_s,
                 )
-            out = self._predict_from_prepared(history_rows)
-            out["trace_note"] = "traces require reservoir model"
-            return out
-        return self._predict_from_prepared(history_rows)
+            else:
+                from pdm.visualization.recurrent_trace import recurrent_trace
+
+                result = recurrent_trace(history_rows, self.model, self.prep, self.history_length, self.device)
+        else:
+            result = self._predict_from_prepared(history_rows)
+        timestamps = pd.to_numeric(history_rows.get("timestamp_s", pd.Series(dtype=float)), errors="coerce")
+        result["timestamp_s"] = float(timestamps.max()) if timestamps.notna().any() else None
+        result["ready"] = result.get("predicted_rul_s") is not None and result.get("status") in {"ok", "predicted"}
+        result["state_mode"] = getattr(self.model, "state_mode", "window_reset")
+        return result
 
     def _predict_from_prepared(self, history_rows) -> dict[str, Any]:
         if getattr(self.model, "state_mode", None) == "continuous":
@@ -174,6 +180,8 @@ class Predictor:
             )}
             if result["status"] == "predicted":
                 result["status"] = "ok"
+            result["raw_rul_s"] = float(trace["raw_rul_s"][-1]) if len(trace.get("raw_rul_s", [])) else None
+            result["forecast_method"] = "continuous_raw_readout"
             return result
         prepared = prepare_history_window(
             history_rows,
@@ -191,9 +199,9 @@ class Predictor:
                 "valid_history_reason": prepared["valid_history_reason"],
             }
         arr = prepared["inputs"]
-        x = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).to(self.device)
-        rul = self.model.predicted_rul_s(x)
-        value = float(rul.detach().cpu().reshape(-1)[0].item())
+        x = torch.from_numpy(np.array(arr, order="C", copy=True)).unsqueeze(0).to(self.device)
+        output = model_forecast(self.model, x)
+        value = output["predicted_rul_s"]
         if not np.isfinite(value) or value < 0:
             return {
                 "predicted_rul_s": None,
@@ -202,8 +210,37 @@ class Predictor:
                 "valid_history_reason": "",
             }
         return {
-            "predicted_rul_s": value,
+            **output,
             "status": "ok",
             "n_history": n,
             "valid_history_reason": "",
         }
+
+
+@torch.no_grad()
+def model_forecast(model, x):
+    """Point forecast and optional distribution from the same saved model head."""
+    import math
+
+    from pdm.losses import weibull_median_rul
+
+    result = {"forecast_method": "window_point", "interval_method": None}
+    if getattr(model, "head_type", None) == "weibull":
+        lam, k = model(x)
+        value = float(weibull_median_rul(lam, k, model.time_scale_s).reshape(-1)[0].cpu())
+        scale = float(lam.reshape(-1)[0].cpu()) * model.time_scale_s
+        shape = float(k.reshape(-1)[0].cpu())
+        result.update(weibull_scale_s=scale, weibull_shape=shape,
+                      interval_method="Weibull distribution (5–95%; not empirically calibrated)",
+                      forecast_method="window_weibull")
+        try:
+            lo = scale * (-math.log(0.95)) ** (1 / shape)
+            hi = scale * (-math.log(0.05)) ** (1 / shape)
+        except (OverflowError, ZeroDivisionError):
+            lo = hi = float("nan")
+        if np.isfinite([lo, hi]).all() and 0 <= lo <= hi:
+            result.update(lower_rul_s=lo, upper_rul_s=hi)
+    else:
+        value = float(model.predicted_rul_s(x).reshape(-1)[0].cpu())
+    result.update(predicted_rul_s=value, raw_rul_s=value)
+    return result

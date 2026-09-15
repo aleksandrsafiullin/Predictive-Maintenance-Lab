@@ -2737,6 +2737,9 @@ def test_filter_endpoint_baseline_comparison(tmp_path, monkeypatch, tiny_filter_
     back = filter_prefix_backtest_table(pred, units)
     t1 = back[back["unit_id"] == "Test_1"].sort_values("timestamp_s")
     assert t1["actual_rul_s"].tolist() == [86.0, 80.0]
+    # Losing the final prediction cannot move the official source endpoint.
+    truncated = filter_prefix_backtest_table(pred.iloc[[0, 2]], units)
+    assert truncated["actual_rul_s"].tolist() == [86.0, 82.0]
     metrics, by_unit = build_rul_metrics(
         pred,
         dataset_id="filters",
@@ -2818,6 +2821,8 @@ def test_filter_endpoint_baseline_comparison(tmp_path, monkeypatch, tiny_filter_
     for uid in split["test"]:
         row = by.set_index("unit_id").loc[uid]
         assert row["prefix_end_actual_rul_s"] == pytest.approx(float(official.loc[uid]))
+        last_prediction = pred_live.loc[pred_live.unit_id == uid].sort_values("timestamp_s").iloc[-1]
+        assert last_prediction.actual_rul_s == pytest.approx(float(official.loc[uid]))
 
 
 def _write_tiny_filter_checkpoint(rdir, prep, split, fp, *, history_length: int = 3) -> None:
@@ -3180,17 +3185,17 @@ def _predictor_feature_tensor(
     predictor: Predictor, history: pd.DataFrame
 ) -> tuple[np.ndarray, dict]:
     captured: list[np.ndarray] = []
-    orig = predictor.model.predicted_rul_s
+    orig = predictor.model.forward
 
     def _hook(x):
         captured.append(x.detach().cpu().numpy().copy())
         return orig(x)
 
-    predictor.model.predicted_rul_s = _hook
+    predictor.model.forward = _hook
     try:
         out = predictor.predict_from_history(history)
     finally:
-        predictor.model.predicted_rul_s = orig
+        predictor.model.forward = orig
     assert captured, (
         f"Predictor skipped the feature path; status={out.get('status')} "
         f"reason={out.get('valid_history_reason')}"
@@ -4257,4 +4262,3 @@ def test_replay_log_has_no_future_rows():
     other = filter_replay_alert_log(alerts, unit_id="B", replay_time_s=t)
     assert set(other["unit_id"].astype(str)) == {"B"}
     assert 30.0 not in set(other["timestamp_s"])
-

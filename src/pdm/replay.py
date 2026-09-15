@@ -17,6 +17,7 @@ def _continuous_bearing_predictions(
     measurements: pd.DataFrame,
     predictor: Predictor,
     forecast_profile: Mapping[str, Any] | None,
+    should_stop=None,
 ) -> pd.DataFrame:
     """One causal kernel pass per acquisition segment, shared with neural replay.
 
@@ -35,7 +36,9 @@ def _continuous_bearing_predictions(
     raw = np.full(len(frame), np.nan)
     seen = np.zeros(len(frame), dtype=int)
     for start, end in zip(starts, np.r_[starts[1:], len(frame)], strict=True):
-        trace = continuous_trace(frame.iloc[start:end], predictor.model, predictor.prep, predictor.history_length)
+        if should_stop and should_stop():
+            raise InterruptedError("Evaluation cancelled")
+        trace = continuous_trace(frame.iloc[start:end], predictor.model, predictor.prep, predictor.history_length, should_stop=should_stop)
         raw[start:end] = trace["raw_rul_s"]
         seen[start:end] = np.arange(1, end - start + 1)
     warmup = int(predictor.history_length)
@@ -119,6 +122,7 @@ def replay_unit(
     pressure_limit_pa: float = 600.0,
     truth_units: pd.DataFrame | None = None,
     forecast_profile: Mapping[str, Any] | None = None,
+    should_stop=None,
 ) -> dict[str, Any]:
     """Predictor never receives ground-truth RUL or future rows.
 
@@ -136,8 +140,10 @@ def replay_unit(
     continuous = None
     if (len(src) and dataset_id == "bearings"
             and getattr(getattr(predictor, "model", None), "state_mode", None) == "continuous"):
-        continuous = _continuous_bearing_predictions(src.measurements, predictor, forecast_profile)
+        continuous = _continuous_bearing_predictions(src.measurements, predictor, forecast_profile, should_stop=should_stop)
     for step in range(len(src)):
+        if should_stop and should_stop():
+            raise InterruptedError("Evaluation cancelled")
         prefix = src.prefix(step)
         row = prefix.iloc[-1]
         t = float(row["timestamp_s"])
@@ -183,7 +189,7 @@ def replay_unit(
             "alert_status": snap["status"],
             "step": step,
         }
-        for key in ("raw_rul_s", "lower_rul_s", "upper_rul_s", "forecast_method"):
+        for key in ("raw_rul_s", "lower_rul_s", "upper_rul_s", "forecast_method", "interval_method", "weibull_scale_s", "weibull_shape"):
             if key in pred:
                 rec[key] = pred[key]
         if "differential_pressure" in row.index and pd.notna(row.get("differential_pressure")):

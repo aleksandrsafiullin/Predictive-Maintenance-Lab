@@ -145,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
         choices=["synthetic_fixture", "real_connectome", "random_rewire"],
     )
     p_tr.add_argument("--readout", default=None, choices=["ridge", "gradient"])
+    p_tr.add_argument("--seed", type=int, default=None)
+    p_tr.add_argument("--events-only", action="store_true", help="Filters training ablation; validation remains complete")
     p_tr.add_argument(
         "--source-path",
         default=None,
@@ -205,8 +207,31 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("app")
     sub.add_parser("stop")
+    matrix = sub.add_parser("train-matrix")
+    matrix.add_argument("--resume-batch", default=None)
+    quality = sub.add_parser("quality")
+    quality.add_argument("--dataset", required=True, choices=["bearings", "filters"])
+    compare = sub.add_parser("compare")
+    compare.add_argument("--dataset", required=True, choices=["bearings", "filters"])
+    compare.add_argument("--evaluation", action="append", required=True, metavar="RUN_ID:EVAL_ID")
 
     args = parser.parse_args(argv)
+    if args.cmd == "train-matrix":
+        proc = spawn_worker({"kind": "train_matrix", "batch_id": args.resume_batch})
+        print(json.dumps({"worker_pid": proc.pid, "status": "started"}))
+        return 0
+    if args.cmd == "quality":
+        from pdm.data.prepare import load_processed
+
+        print(json.dumps(load_processed(args.dataset)["report"].get("quality", {}), indent=2))
+        return 0
+    if args.cmd == "compare":
+        from pdm.benchmark import compare_evaluations, load_evaluation, save_comparison
+
+        result = compare_evaluations([load_evaluation(args.dataset, *pair.split(":", 1)) for pair in args.evaluation])
+        print(result["table"].to_string(index=False))
+        print(save_comparison(result))
+        return 0
     if args.cmd == "doctor":
         doctor()
         return 0
@@ -246,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
             graph_mode=args.graph_mode,
             readout=args.readout,
             source_path=args.source_path,
+            seed=args.seed,
+            events_only=args.events_only,
         )
         print(json.dumps(rec, indent=2, default=str))
         return 0

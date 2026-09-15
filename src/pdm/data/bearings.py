@@ -190,18 +190,10 @@ def _read_vibration_csv(data: bytes, expected_samples: int) -> tuple[np.ndarray,
     except ValueError:
         skip = 1
         bio.seek(0)
-    try:
-        body = data.split(b"\n", 1)[1] if skip else data
-        body = body.replace(b"\r", b"")
-        flat = np.fromstring(body.replace(b",", b" "), dtype=np.float64, sep=" ")
-        if flat.size % 2 != 0:
-            raise ValueError(f"odd number of values: {flat.size}")
-        arr = flat.reshape(-1, 2)
-    except Exception:
-        bio.seek(0)
-        arr = np.loadtxt(bio, delimiter=",", skiprows=skip, dtype=np.float64)
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
+    bio.seek(0)
+    arr = np.loadtxt(bio, delimiter=",", skiprows=skip, dtype=np.float64, ndmin=2)
+    if arr.shape[1] != 2:
+        raise ValueError(f"Expected exactly 2 vibration channels, found {arr.shape}")
     quality: dict[str, Any] = {
         "n_samples": int(arr.shape[0]),
         "n_channels": int(arr.shape[1]),
@@ -235,8 +227,19 @@ def extract_bearings_features(
         meta = parse_bearing_path(relpath)
         if meta is None or meta.get("regime") is None:
             return
-        arr, quality = _read_vibration_csv(data, expected)
+        error = ""
+        try:
+            arr, quality = _read_vibration_csv(data, expected)
+            if not np.isfinite(arr).all():
+                error = "nonfinite_raw_signal"
+            elif not quality["sample_count_ok"]:
+                error = "invalid_fragment_length"
+        except (ValueError, OSError) as exc:
+            arr = None
+            quality = {"n_samples": 0, "sample_count_ok": False, "n_nan": 0}
+            error = "unreadable_fragment:" + type(exc).__name__
         rec: dict[str, Any] = {
+            "_quality_errors": error,
             "dataset_id": "bearings",
             "unit_id": meta["unit_id"],
             "regime_id": meta["regime"]["regime_id"],
@@ -253,6 +256,8 @@ def extract_bearings_features(
             "relpath": relpath,
         }
         for ch_i, ch_name in enumerate(("horizontal", "vertical")):
+            if error:
+                continue
             td = time_domain_features(arr[:, ch_i], prefix=ch_name)
             rec.update(td)
             bands = spectral_band_energy(arr[:, ch_i], fs=fs, edges_hz=band_edges, prefix=ch_name)

@@ -56,9 +56,20 @@ def processed_ready(dataset_id: str) -> bool:
     return _core_ready(d)
 
 
-def resolve_processed_dir(dataset_id: str) -> Path:
+def resolve_processed_dir(dataset_id: str, dataset_version: str | None = None) -> Path:
     """Versioned snapshot from manifest, or legacy root when no manifest exists."""
     root = dataset_processed(dataset_id)
+    if dataset_version and dataset_version != "unversioned":
+        if Path(dataset_version).name != dataset_version:
+            raise ValueError("Invalid dataset version")
+        snapshot = root / "versions" / dataset_version
+        if not _version_ready(snapshot):
+            raise FileNotFoundError(f"Saved dataset version is missing or incomplete: {snapshot}")
+        return snapshot
+    if dataset_version == "unversioned":
+        if not _core_ready(root):
+            raise FileNotFoundError(f"Legacy dataset snapshot missing: {root}")
+        return root
     man_path = root / "manifest.json"
     if not man_path.exists():
         return root
@@ -78,8 +89,8 @@ def resolve_processed_dir(dataset_id: str) -> Path:
     return d
 
 
-def load_processed(dataset_id: str) -> dict[str, Any]:
-    d = resolve_processed_dir(dataset_id)
+def load_processed(dataset_id: str, dataset_version: str | None = None) -> dict[str, Any]:
+    d = resolve_processed_dir(dataset_id, dataset_version) if dataset_version else resolve_processed_dir(dataset_id)
     features = pd.read_parquet(d / "features.parquet")
     units = pd.read_parquet(d / "units.parquet")
     split = read_json(d / "split.json")
@@ -146,6 +157,7 @@ def dataset_fingerprint_for_run(
     fp = dict(processed.get("fingerprint") or {})
     if not fp and processed.get("dir") is not None:
         fp = load_processed_fingerprint(Path(processed["dir"]), split, dataset_id)
+    fp["source_split_hash"] = fp.get("source_split_hash", fp.get("split_hash"))
     fp["split_hash"] = split_hash(split)
     fp.setdefault("feature_pipeline_version", FEATURE_PIPELINE_VERSION)
     fp.setdefault("split_protocol", split.get("protocol"))
@@ -161,7 +173,10 @@ def prepare_dataset(dataset_id: str, progress: ProgressFn | None = None) -> dict
     cfg = load_dataset_config(dataset_id)
     if progress:
         progress("inspect", {"dataset_id": dataset_id})
-    inspection = inspect_dataset(dataset_id)
+    try:
+        inspection = inspect_dataset(dataset_id)
+    except (ValueError, OSError) as exc:
+        inspection = {"issues": [f"Inspection: {exc}"]}
 
     if dataset_id == "bearings":
         if progress:
@@ -229,6 +244,13 @@ def write_processed_version(
     inspection = inspection or {}
     units = attach_origin_unit_id(units)
     assert_split_coverage(units, split)
+    from pdm.data.quality import QUALITY_POLICY_HASH, QUALITY_VERSION, admit_dataset
+    from pdm.windows import raw_numeric_columns
+
+    quality = audit = None
+    if set(raw_numeric_columns(dataset_id)).issubset(features.columns):
+        features, units, split, audit, quality = admit_dataset(dataset_id, features, units, split, cfg)
+        assert_split_coverage(units, split)
     root = processed_root if processed_root is not None else dataset_processed(dataset_id)
     root.mkdir(parents=True, exist_ok=True)
     versions = root / "versions"
@@ -259,6 +281,9 @@ def write_processed_version(
         atomic_write_json(staging / "split.json", split)
         atomic_write_json(staging / "feature_schema.json", schema)
         atomic_write_json(staging / "inspection.json", inspection)
+        if quality is not None:
+            audit.to_parquet(staging / "quality_records.parquet", index=False)
+            atomic_write_json(staging / "quality_report.json", quality)
 
         hashes = {name: sha256_file(staging / name) for name in HASHED_PROCESSED_FILES}
         now = time.gmtime()
@@ -283,7 +308,12 @@ def write_processed_version(
             created_at=created_at,
             gap_rule_version=GAP_RULE_VERSION,
         )
+        if quality is not None:
+            fingerprint.update(quality_policy_version=QUALITY_VERSION, quality_policy_hash=QUALITY_POLICY_HASH,
+                               quality_records_hash=sha256_file(staging / "quality_records.parquet"))
         report = _data_report(dataset_id, features, units, split, cfg, sensor_note, inspection)
+        if quality is not None:
+            report["quality"] = quality
         report.update(
             {
                 "dataset_version": dataset_version,

@@ -109,7 +109,17 @@ def _enrich_run_identity(row: dict[str, Any], run_path: Path) -> dict[str, Any]:
     for key in ("graph_mode", "graph_hash", "parent_graph_hash", "n_nodes", "is_synthetic"):
         _copy_if_missing(row, key, prov.get(key))
 
+    # Dataset defaults contain reservoir settings even for recurrent models.
+    # They describe no part of a GRU/LSTM and must not classify it as synthetic.
+    if row.get("architecture") in {"gru", "lstm"}:
+        size = int(model["hidden_size"]) * int(model.get("recurrent_layers", 1)) if model.get("hidden_size") else None
+        row.update(n_nodes=size,
+                   state_mode="window_reset", is_synthetic=False, graph_mode=None,
+                   graph_hash=None, parent_graph_hash=None)
+
     fp = _optional_json(run_path / "dataset_fingerprint.json") or {}
+    for key in ("dataset_version", "quality_policy_hash", "quality_policy_version"):
+        _copy_if_missing(row, key, fp.get(key))
     split_id = resolve_split_hash(fp) or resolve_split_hash(row) or resolve_split_hash(snap)
     if split_id is None:
         split_doc = _optional_json(run_path / "split.json")

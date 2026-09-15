@@ -5,7 +5,7 @@ Local lab for **remaining useful life (RUL)** and filter degradation forecasting
 | Dataset | Task | Split (units) |
 |---|---|---|
 | **Bearings / XJTU-SY** | RUL from vibration features | 9 train / 3 validation / 3 test |
-| **Filters / HSE** | Time to 600 Pa (censored survival) | 40 train / 10 validation / 50 author test held out |
+| **Filters / HSE** | Time to 600 Pa (censored survival) | Original 40 / 10 / 50; admission retains 39 / 10 / 50 |
 
 **Models:** `gru`, `lstm`, plus experimental `fly_connectome_reservoir` and `random_reservoir` (leaky Echo State Networks).
 
@@ -157,7 +157,7 @@ Equivalent with explicit graph mode:
   --graph-mode synthetic_fixture --n-nodes 8 --smoke
 ```
 
-Primary Neural Activity Explorer: train the complete classified MaleCNS from scratch
+Full MaleCNS model report: train the complete classified MaleCNS from scratch
 (166,700 neurons; 25,582,938 directed pairs; no sampling):
 
 ```bash
@@ -166,7 +166,7 @@ Primary Neural Activity Explorer: train the complete classified MaleCNS from scr
 
 See [Full CNS data, morphology, training and limitations](docs/full_cns.md).
 
-Legacy subgraph experiments for comparisons (`n_nodes` in 500–2000; not the primary Explorer):
+Real subgraph experiments for comparisons (the full study uses 1,000 nodes):
 
 ```bash
 .venv/bin/python -m pdm train --dataset bearings --arch fly_connectome_reservoir \
@@ -193,7 +193,7 @@ Research validation (H/K flags — does **not** write `alert_policy.json`):
   --horizon-s 2220 --k 3 --min-action-lead-s 1110
 ```
 
-Freeze alert policy from the UI (**Test & Replay → Validation → Freeze alert policy**), then frozen test:
+Freeze alert policy from the UI (**Model Report → Evaluation settings → Validation → Freeze alert policy**), then frozen test:
 
 ```bash
 .venv/bin/python -m pdm evaluate --dataset bearings --run-id <run_id> --split test
@@ -219,10 +219,29 @@ Open **http://127.0.0.1:8501** (localhost only).
 
 Pages:
 
-1. **Data** — units, splits, prepare status  
-2. **Train** — architecture, Smoke/Full, start/resume jobs  
-3. **Test & Replay** — evaluate, freeze H/K on validation, replay  
-4. **Neural Activity Explorer** — connectome reservoir state visualization (reservoir runs only)
+1. **Data Quality** — admission audit, reasons, retained censoring, signal and split counts.
+2. **Training** — full matrix, individual training, progress, stop and resume.
+3. **Model Report** — synchronized replay, actual architecture states, saved evaluations and training history. Evaluation settings remain available here.
+4. **Compare Models** — explicit validation/test artifacts, common time points, unit-balanced ranking, saved selections, CSV and JSON.
+
+### Full quality study
+
+```bash
+.venv/bin/python -m pdm quality --dataset bearings
+.venv/bin/python -m pdm quality --dataset filters
+.venv/bin/python -m pdm train-matrix
+# After interruption: completed experiments are retained.
+.venv/bin/python -m pdm train-matrix --resume-batch <batch_id>
+```
+
+The sequential worker runs nine main models and five additional GRU censoring-study configurations (seeds 42/43/44). The main filter GRU at seed 42 is also the sixth paired-study member. All runs use history 20, all admitted windows, and at most 30 gradient epochs with early stopping. Full CNS retains its train-only grouped readout selection.
+
+```bash
+.venv/bin/python -m pdm compare --dataset bearings \
+  --evaluation <run_id>:<eval_id> --evaluation <another_run_id>:<eval_id>
+```
+
+See [the quality and comparison protocol](docs/quality_and_comparison.md) for definitions and artifact contracts. Old snapshots and runs remain accessible; new training requires `admission_v1` and verified file hashes. No ensemble is fitted.
 
 ### Automated checks
 
@@ -270,6 +289,8 @@ scripts/          setup.sh / run.sh (and Windows .ps1)
 
 ## More documentation
 
+- [Completed quality study · 15 September 2026](reports/quality_study_20260915.md) — 14 real runs, four comparisons, censoring experiment and acceptance evidence
+- [Quality and comparison protocol](docs/quality_and_comparison.md) — admission, immutable snapshots, shared forecasts and ranking rules
 - [docs/fly_connectome.md](docs/fly_connectome.md) — MaleCNS import, graph orientation, sampling  
 - [docs/fly_connectome_demo.md](docs/fly_connectome_demo.md) — short connectome demo commands  
 - [docs/neural_activity_explorer.md](docs/neural_activity_explorer.md) — Explorer meaning and limits  

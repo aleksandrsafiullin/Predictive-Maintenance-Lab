@@ -19,7 +19,7 @@ def _screen_radio(at):
     """Find the Screen radio by its options containing known screen names."""
     for radio in at.sidebar.radio:
         opts = list(radio.options)
-        if "Data" in opts and "Train" in opts and "Test & Replay" in opts:
+        if "Data Quality" in opts and "Training" in opts and "Model Report" in opts:
             return radio
     raise AssertionError("Screen radio not found")
 
@@ -187,6 +187,8 @@ def test_app_data_screen_reads_cached_counts_not_build_windows(monkeypatch, tiny
 
 
 def _fake_processed_bundle(dataset_id, features, units, split):
+    from pdm.data.quality import QUALITY_POLICY_HASH
+
     return {
         "features": features,
         "units": units,
@@ -196,7 +198,7 @@ def _fake_processed_bundle(dataset_id, features, units, split):
             "dataset_version": "testver",
         },
         "dir": None,
-        "fingerprint": {"dataset_version": "testver"},
+        "fingerprint": {"dataset_version": "testver", "quality_policy_hash": QUALITY_POLICY_HASH},
         "dataset_version": "testver",
     }
 
@@ -287,10 +289,14 @@ def test_app_train_screen_smoke_off_clears_window_cap(monkeypatch, tmp_path, tin
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    _screen_radio(at).set_value("Train")
+    _screen_radio(at).set_value("Training")
     at.run()
     assert not at.exception
 
+    mode = next(r for r in at.radio if "Smoke" in list(r.options) and "Full" in list(r.options))
+    assert mode.value == "Full"
+    mode.set_value("Smoke")
+    at.run()
     markdown = "\n".join(str(w.value) for w in at.markdown)
     captions = "\n".join(str(w.value) for w in at.caption)
     assert "Training mode: **Smoke**" in markdown
@@ -353,13 +359,13 @@ def test_app_train_screen_filters_shows_val_nll(monkeypatch, tiny_filter_tables)
     assert not at.exception
     _dataset_radio(at).set_value("Filters")
     at.run()
-    _screen_radio(at).set_value("Train")
+    _screen_radio(at).set_value("Training")
     at.run()
     assert not at.exception
     captions = "\n".join(str(w.value) for w in at.caption)
     assert "val NLL" in captions
     markdown = "\n".join(str(w.value) for w in at.markdown)
-    assert "Training mode: **Smoke**" in markdown
+    assert "Training mode: **Full**" in markdown
 
 
 def test_app_train_resume_keeps_full_not_form_smoke(monkeypatch, tmp_path, tiny_bearing_tables):
@@ -402,9 +408,11 @@ def test_app_train_resume_keeps_full_not_form_smoke(monkeypatch, tmp_path, tiny_
 
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
-    _screen_radio(at).set_value("Train")
+    _screen_radio(at).set_value("Training")
     at.run()
     assert not at.exception
+    next(r for r in at.radio if r.label == "Training mode").set_value("Smoke")
+    at.run()
     markdown = "\n".join(str(w.value) for w in at.markdown)
     assert "Training mode: **Smoke**" in markdown
     max_w = next(n for n in at.number_input if "Max windows" in n.label)
@@ -536,7 +544,8 @@ def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    _screen_radio(at).set_value("Test & Replay")
+    at.session_state["report_view"] = "Evaluation settings"
+    _screen_radio(at).set_value("Model Report")
     at.run()
     assert not at.exception
     mode = next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options))
@@ -758,7 +767,8 @@ def test_app_filters_evaluation_shows_prefix_end_official_rul(
     assert not at.exception
     _dataset_radio(at).set_value("Filters")
     at.run()
-    _screen_radio(at).set_value("Test & Replay")
+    at.session_state["report_view"] = "Evaluation settings"
+    _screen_radio(at).set_value("Model Report")
     at.run()
     assert not at.exception
     next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options)).set_value(
@@ -822,7 +832,8 @@ def test_app_replay_screen_loads_without_eval(monkeypatch, tmp_path, tiny_bearin
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    _screen_radio(at).set_value("Test & Replay")
+    at.session_state["report_view"] = "Evaluation settings"
+    _screen_radio(at).set_value("Model Report")
     at.run()
     assert not at.exception
     errors = "\n".join(str(w.value) for w in at.error)
@@ -914,7 +925,8 @@ def test_app_replay_legacy_predictions_unlock_play(monkeypatch, tmp_path, tiny_b
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    _screen_radio(at).set_value("Test & Replay")
+    at.session_state["report_view"] = "Evaluation settings"
+    _screen_radio(at).set_value("Model Report")
     at.run()
     assert not at.exception
     next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options)).set_value(
@@ -946,7 +958,8 @@ def test_replay_play_advances_without_clicks(monkeypatch, tmp_path, tiny_bearing
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    _screen_radio(at).set_value("Test & Replay")
+    at.session_state["report_view"] = "Evaluation settings"
+    _screen_radio(at).set_value("Model Report")
     at.run()
     assert not at.exception
     next(r for r in at.radio if "Validation" in list(r.options) and "Research" in list(r.options)).set_value(
@@ -1001,7 +1014,8 @@ def _set_replay_mode(at, mode: str):
 
 
 def _open_replay_screen(at, *, mode: str | None = None):
-    _screen_radio(at).set_value("Test & Replay")
+    at.session_state["report_view"] = "Evaluation settings"
+    _screen_radio(at).set_value("Model Report")
     at.run()
     assert not at.exception
     if mode and mode != "Validation":
@@ -1553,11 +1567,11 @@ def test_app_operational_explorer_by_label_no_exception(tmp_path, monkeypatch):
     assert not at.exception
     radio = _screen_radio(at)
     opts = list(radio.options)
-    assert "Data" in opts
-    assert "Train" in opts
-    assert "Test & Replay" in opts
-    assert "Neural Activity Explorer" in opts
-    radio.set_value("Neural Activity Explorer")
+    assert "Data Quality" in opts
+    assert "Training" in opts
+    assert "Model Report" in opts
+    assert "Compare Models" in opts
+    radio.set_value("Model Report")
     at.run()
     assert not at.exception
     parts = []
@@ -1569,6 +1583,7 @@ def test_app_operational_explorer_by_label_no_exception(tmp_path, monkeypatch):
     assert "Architecture comparison" not in text
     assert not any(widget.label == "Mode" for widget in at.radio)
     assert not any(widget.label == "Build trace" for widget in at.button)
-    radio.set_value("Test & Replay")
+    at.session_state["report_view"] = "Evaluation settings"
+    radio.set_value("Model Report")
     at.run()
     assert not at.exception

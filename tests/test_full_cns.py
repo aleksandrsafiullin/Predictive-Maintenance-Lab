@@ -60,6 +60,16 @@ def test_sparse_dense_equation_pooling_and_expanded_readout_agree(full_model):
         np.testing.assert_allclose(model.forward_raw(actual, u).numpy().ravel(), expected, atol=2e-7)
 
 
+def test_pooled_computation_cancellation_is_explicit(full_model, monkeypatch, tmp_path):
+    stop = tmp_path / "stop"
+    stop.touch()
+    monkeypatch.setattr("pdm.worker.stop_path", lambda: stop)
+    inputs = np.ones((40, 1), dtype=np.float32)
+    assert full_model.pooled_trajectory(inputs).shape == (40, 2)
+    with pytest.raises(InterruptedError, match="cancelled"):
+        full_model.pooled_trajectory(inputs, should_stop=lambda: True)
+
+
 def test_full_replay_is_bounded_causal_and_inspection_uses_real_sources(full_model):
     model = full_model
     u = np.linspace(.1, 2, 150, dtype=np.float32).reshape(-1, 1)

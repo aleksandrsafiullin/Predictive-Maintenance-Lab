@@ -1,4 +1,4 @@
-/* Scoped to this page; other laboratory screens retain their own theme. */
+/* Shared laboratory theme, mounted by the four-page Streamlit shell. */
 body:has(.brain-lab-shell) {
   --lab-bg: #080d15; --lab-panel: #101925; --lab-line: #263447;
   --lab-text: #edf4fa; --lab-muted: #8fa3b7; --lab-cyan: #61d8ee; --lab-amber: #f2be68;
@@ -19,7 +19,8 @@ body:has(.brain-lab-shell) [data-testid="stCaptionContainer"] {color: var(--lab-
 body:has(.brain-lab-shell) [data-baseweb="select"] > div,
 body:has(.brain-lab-shell) [data-baseweb="input"] > div {background: #121e2c; border-color: var(--lab-line); color: var(--lab-text);}
 body:has(.brain-lab-shell) [data-testid="stButton"] button {background: #162232; border: 1px solid #2b3c50; color: #dce9f7; border-radius: 8px; font-weight: 550; min-height: 2.6rem; transition: border-color .2s, background .2s;}
-body:has(.brain-lab-shell) [data-testid="stButton"] button:hover {background: #1c2d40; border-color: #61d8ee; color: white;}
+body:has(.brain-lab-shell) [data-testid="stButton"] button:not(:disabled):hover {background: #1c2d40; border-color: #61d8ee; color: white;}
+body:has(.brain-lab-shell) [data-testid="stButton"] button:disabled {opacity:.42; cursor:not-allowed;}
 body:has(.brain-lab-shell) [data-testid="stButton"] button[kind="primary"] {background: #61d8ee; border-color: #61d8ee; color: #08141b;}
 body:has(.brain-lab-shell) [data-testid="stButton"] button:focus-visible {outline: 2px solid #f2be68; outline-offset: 3px;}
 body:has(.brain-lab-shell) [data-testid="stExpander"] {border-color: #263447; background: #0e1723; border-radius: 10px;}
@@ -80,8 +81,8 @@ body:has(.brain-lab-shell) [data-testid="stRadioOption"][data-selected="true"] >
 @media(max-width:1000px) {.lab-metrics {grid-template-columns:repeat(2,minmax(0,1fr));}.lab-metric-value {font-size:28px;}}
 @media(max-width:640px) {
  body:has(.brain-lab-shell) [data-testid="stMainBlockContainer"] {padding:1.25rem 1rem 2rem;}
- .lab-hero {align-items:flex-start; gap:12px;padding-bottom:12px;}.lab-hero h1 {font-size:28px;letter-spacing:-1px;}.lab-eyebrow {font-size:8px;letter-spacing:1.2px;}
- .lab-hero p {font-size:11px;}.lab-specimen {display:none;}.lab-metrics {gap:8px;}.lab-metric {padding:13px 12px 10px;}
+ .lab-hero {flex-direction:column;align-items:flex-start; gap:12px;padding-bottom:12px;}.lab-hero h1 {font-size:28px;letter-spacing:-1px;}.lab-eyebrow {font-size:8px;letter-spacing:1.2px;}
+ .lab-hero p {font-size:11px;}.lab-specimen {display:flex;flex-direction:row;flex-wrap:wrap;align-items:baseline;text-align:left;gap:6px 10px;}.lab-specimen > span:last-child {flex-basis:100%;}.lab-metrics {gap:8px;}.lab-metric {padding:13px 12px 10px;}
  .lab-metric-label {font-size:8px;letter-spacing:.6px;}.lab-metric-value {font-size:23px;}.lab-metric-value small {display:block;font-size:9px;margin:4px 0 0;letter-spacing:.2px;}.lab-metric-detail {font-size:9px;}
  .lab-value-warmup {font-size:15px;}.lab-panel-subtitle {display:none;}.lab-explanation {display:block;}.st-key-lab_controls {padding:10px 12px 0;}
  .lab-explanation > * {display:block;}.lab-explanation > * + * {margin-top:8px;}

@@ -129,8 +129,8 @@ def _dataset() -> str:
 
 
 def _device_box() -> None:
-    if st.session_state.get("screen_selection") == "Neural Activity Explorer":
-        st.sidebar.caption("Compute device: **CPU · sparse connectome**")
+    if st.session_state.get("screen_selection") in {"Neural Activity Explorer", "Model Report"}:
+        st.sidebar.caption("Replay device: **CPU**")
         return
     info = resolve_device("auto")
     st.sidebar.caption(f"Compute device: **{info.name}**")
@@ -164,31 +164,36 @@ def _status_chip(*, compact: bool = False) -> dict:
 
 
 def main() -> None:
+    from pdm.lab_ui import matrix_controls, screen_comparison
+    from pdm.visualization.presentation import apply_explorer_style
+
+    aliases = {"Data": "Data Quality", "Train": "Training", "Neural Activity Explorer": "Model Report", "Test & Replay": "Model Report"}
+    old = st.session_state.get("screen_selection")
+    if old in aliases:
+        st.session_state["screen_selection"] = aliases[old]
+        if old == "Test & Replay":
+            st.session_state["report_view"] = "Evaluation settings"
     if "screen_selection" not in st.session_state and st.query_params.get("view") == "brain":
-        st.session_state["screen_selection"] = "Neural Activity Explorer"
+        st.session_state["screen_selection"] = "Model Report"
     dataset_id = _dataset()
     _device_box()
-    page = st.sidebar.radio(
-        "Screen",
-        options=["Data", "Train", "Test & Replay", "Neural Activity Explorer"],
-        index=0,
-        key="screen_selection",
-        on_change=_pause_neural_runs,
-    )
-    if page != "Neural Activity Explorer":
-        st.title("Predictive Maintenance Lab")
-        st.info("Historical replay — not a live equipment connection")
-    _status_chip(compact=page == "Neural Activity Explorer")
-    if page == "Data":
+    page = st.sidebar.radio("Screen", ["Data Quality", "Training", "Model Report", "Compare Models"],
+                            key="screen_selection", on_change=_pause_neural_runs)
+    apply_explorer_style()
+    _status_chip(compact=True)
+    if page == "Data Quality":
         screen_data(dataset_id)
-    elif page == "Train":
+    elif page == "Training":
+        matrix_controls()
         screen_train(dataset_id)
-    elif page == "Test & Replay":
-        screen_replay(dataset_id)
-    elif page == "Neural Activity Explorer":
-        screen_explorer(dataset_id)
-    else:
-        st.error(f"Unknown screen: {page}")
+    elif page == "Model Report":
+        view = st.radio("Report view", ["Model replay", "Evaluation settings"], horizontal=True, key="report_view", on_change=_pause_neural_runs)
+        if view == "Evaluation settings":
+            screen_replay(dataset_id)
+        else:
+            screen_explorer(dataset_id)
+    elif page == "Compare Models":
+        screen_comparison(dataset_id)
 
 
 def _filters_time_warning(report: dict | None = None) -> str:
@@ -196,6 +201,12 @@ def _filters_time_warning(report: dict | None = None) -> str:
     if note:
         return str(note)
     return str(filter_time_scale_meta(load_dataset_config("filters"))["time_unit_note"])
+
+
+def _render_filters_time_warning():
+    st.caption("Filter time scale is unverified. Time × 60 is an internal comparison unit, not confirmed wall-clock seconds.")
+    with st.expander("Time-scale assumption and source details"):
+        st.warning(_filters_time_warning())
 
 
 def _filters_scale_unverified(report: dict | None = None) -> bool:
@@ -297,23 +308,24 @@ def _regimes_frame(report: dict) -> pd.DataFrame | None:
 
 
 def screen_data(dataset_id: str) -> None:
-    st.header(f"Data — {LABELS[dataset_id]}")
+    st.header(f"Data Quality — {LABELS[dataset_id]}")
     if dataset_id == "filters" and _filters_scale_unverified():
-        st.warning(_filters_time_warning())
+        _render_filters_time_warning()
     state = _data_state(dataset_id)
     st.write("Data state:", state)
     raw = dataset_raw(dataset_id)
-    st.caption(f"Raw directory: `{raw}`")
-    local = st.text_input("Local archive or folder path (optional, for multi-GB data)")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Download / locate data", disabled=worker_alive()):
-            spawn_worker({"kind": "download", "dataset_id": dataset_id, "local_path": local or None})
-            st.rerun()
-    with c2:
-        if st.button("Inspect & prepare", disabled=worker_alive()):
-            spawn_worker({"kind": "prepare", "dataset_id": dataset_id})
-            st.rerun()
+    with st.expander("Prepare source data", expanded=state != "ready"):
+        st.caption(f"Raw directory: `{raw}`")
+        local = st.text_input("Local archive or folder path (optional, for multi-GB data)")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Download / locate data", disabled=worker_alive()):
+                spawn_worker({"kind": "download", "dataset_id": dataset_id, "local_path": local or None})
+                st.rerun()
+        with c2:
+            if st.button("Inspect & prepare", disabled=worker_alive()):
+                spawn_worker({"kind": "prepare", "dataset_id": dataset_id})
+                st.rerun()
     if worker_alive():
         st.info("A background job is running. This page refreshes while it works.")
         _auto_refresh()
@@ -330,6 +342,9 @@ def screen_data(dataset_id: str) -> None:
     features = bundle["features"]
     split = bundle["split"]
     report = bundle["report"] or {}
+    from pdm.lab_ui import quality_overview
+
+    quality_overview(bundle)
     fingerprint = bundle.get("fingerprint") or {}
     st.subheader("Prepared snapshot")
     ver = report.get("dataset_version") or bundle.get("dataset_version") or fingerprint.get("dataset_version") or "—"
@@ -472,14 +487,21 @@ def _windows_used_caption(rec: dict) -> str:
 
 
 def screen_train(dataset_id: str) -> None:
-    st.header(f"Train — {LABELS[dataset_id]}")
+    st.header(f"Training — {LABELS[dataset_id]}")
     if not processed_ready(dataset_id):
         st.warning("Prepare data on the Data screen first. There is no dummy training path.")
+        return
+    from pdm.lab_ui import training_overview
+
+    if not training_overview(load_processed(dataset_id), load_dataset_config(dataset_id)):
         return
     arch = st.selectbox(
         "Architecture", ["gru", "lstm", "fly_connectome_reservoir", "random_reservoir"], index=0,
     )
+    scope = "1,000-node subgraph"
     if dataset_id == "bearings" and arch == "fly_connectome_reservoir":
+        scope = st.radio("Connectome scope", ["Full MaleCNS", "1,000-node subgraph"], horizontal=True)
+    if dataset_id == "bearings" and arch == "fly_connectome_reservoir" and scope == "Full MaleCNS":
         st.subheader("Train the complete MaleCNS")
         st.write("All classified neurons and their directed connections participate in every measurement. "
                  "A new forecast readout is fitted from scratch using whole-bearing cross-validation, "
@@ -498,12 +520,15 @@ def screen_train(dataset_id: str) -> None:
             st.info(ws.get("message") or "Training the full connectome. This can take several minutes.")
             _auto_refresh()
         elif ws.get("status") == "failed":
-            st.error(ws.get("error"))
+            st.error(ws.get("error") or ws.get("message") or "Job failed")
         elif ws.get("status") == "completed":
-            st.success("Training completed. Open Neural Activity Explorer to run the saved model.")
+            st.success("Training completed. Open Model Report to run the saved model.")
         elif ws.get("status") == "cancelled":
             st.info("Training cancelled.")
         return
+    graph_mode = None
+    if is_reservoir(arch):
+        graph_mode = st.selectbox("Graph source", ["real_connectome", "synthetic_fixture"])
     cfg = load_dataset_config(dataset_id)
     mcfg = model_defaults(cfg)
     bundle = load_processed(dataset_id)
@@ -515,9 +540,9 @@ def screen_train(dataset_id: str) -> None:
     cap_key = f"max_windows_widget_{dataset_id}"
     prev_key = f"_prev_train_smoke_{dataset_id}"
     if mode_key not in st.session_state:
-        st.session_state[mode_key] = "Smoke"
+        st.session_state[mode_key] = "Full"
     if cap_key not in st.session_state:
-        st.session_state[cap_key] = smoke_cap
+        st.session_state[cap_key] = 0
     mode = st.radio("Training mode", ["Smoke", "Full"], horizontal=True, key=mode_key)
     smoke = mode == "Smoke"
     _mode_badge(smoke)
@@ -548,6 +573,10 @@ def screen_train(dataset_id: str) -> None:
     )
     st.caption(phys.get("note") or f"{hist} measurements of history")
     max_w = st.number_input("Max windows / unit (0 = all)", min_value=0, key=cap_key)
+    history_ready = True
+    if int(hist) != int(mcfg["history_length"]):
+        st.caption("Admission counts for the selected history length")
+        history_ready = training_overview(bundle, cfg, int(hist))
     with st.expander("Advanced"):
         st.number_input("Learning rate", value=float(mcfg["learning_rate"]), format="%.5f", disabled=True)
         st.number_input("Hidden size", value=int(mcfg["hidden_size"]), disabled=True)
@@ -566,11 +595,14 @@ def screen_train(dataset_id: str) -> None:
         )
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Start training", disabled=worker_alive()):
+        if st.button("Start training", disabled=worker_alive() or not history_ready):
             job = {
                 "kind": "train",
                 "dataset_id": dataset_id,
                 "architecture": arch,
+                "graph_mode": graph_mode,
+                "n_nodes": 1000 if is_reservoir(arch) else None,
+                "readout": ("ridge" if dataset_id == "bearings" else "gradient") if is_reservoir(arch) else None,
                 "max_epochs": int(epochs),
                 "history_length": int(hist),
                 "smoke": bool(smoke),
@@ -605,7 +637,7 @@ def screen_train(dataset_id: str) -> None:
         _render_train_live_activity(dataset_id, ws)
         _auto_refresh()
     if ws.get("status") == "failed":
-        st.error(ws.get("error"))
+        st.error(ws.get("error") or ws.get("message") or "Job failed")
     if ws.get("status") in {"cancelled", "stopped"}:
         st.info(f"Job interrupted ({ws.get('status')})")
     st.subheader("Experiments")
@@ -980,14 +1012,13 @@ def screen_explorer(dataset_id: str) -> None:
     from pdm.visualization.presentation import apply_explorer_style
 
     apply_explorer_style()
-    with st.sidebar.expander("About this model"):
-        st.caption(EXPLORER_DISCLAIMER)
-        _render_explorer_intro()
+    with st.sidebar.expander("About model reports"):
+        st.caption("Real model states and causal forecasts from recorded measurements. Future outcomes are evaluation overlays only.")
 
     table = [r for r in list_runs(dataset_id) if r.get("has_best") or r.get("has_last")]
-    reservoir_rows = [r for r in table if is_reservoir(str(r.get("architecture") or ""))]
+    reservoir_rows = table
     if not reservoir_rows:
-        st.warning("No saved reservoir model. Train a connectome reservoir first.")
+        st.warning("No saved model. Open Training to create a full experiment.")
         if table:
             st.info(RESERVOIR_REQUIRED_MESSAGE)
         return
@@ -999,17 +1030,25 @@ def screen_explorer(dataset_id: str) -> None:
                  and not r.get("is_synthetic")]
     preferred_rows = ready_rows or real_rows or reservoir_rows
     view = st.session_state.get(_REPLAY_VIEW_KEY) or {}
-    preferred_run = str(view.get("run_id") or "")
+    explicit_run = st.session_state.pop("_report_open_run", None)
+    preferred_run = str(explicit_run or view.get("run_id") or "")
     preferred_ids = [str(r["run_id"]) for r in preferred_rows]
-    if preferred_run not in preferred_ids:
+    if preferred_run not in ([str(r["run_id"]) for r in table] if explicit_run else preferred_ids):
         preferred_run = preferred_ids[0]
     run_ids = [str(r["run_id"]) for r in reservoir_rows]
     st.sidebar.markdown("#### Experiment setup")
-    run_id = st.sidebar.selectbox("Run", run_ids, index=run_ids.index(preferred_run),
-                                 format_func=_explorer_run_label, on_change=_pause_neural_runs)
+    selection_key = "report_run:" + dataset_id
+    if explicit_run in run_ids or st.session_state.get(selection_key) not in run_ids:
+        st.session_state[selection_key] = preferred_run
+    run_id = st.sidebar.selectbox("Run", run_ids, key=selection_key,
+                                 format_func=lambda rid: f"{next(r for r in table if r['run_id'] == rid).get('architecture')} · {_explorer_run_label(rid)}", on_change=_pause_neural_runs)
     rec = next(r for r in reservoir_rows if str(r["run_id"]) == str(run_id))
     rdir = run_dir(dataset_id, run_id)
-    scene = load_scene_from_run(rdir)
+    if is_reservoir(rec.get("architecture")):
+        with st.sidebar.expander("Connectome interpretation"):
+            st.caption(EXPLORER_DISCLAIMER)
+            _render_explorer_intro()
+    scene = load_scene_from_run(rdir) if is_reservoir(rec.get("architecture")) else {}
     if synthetic_banner_required(rec, scene):
         st.warning(SYNTHETIC_DISCLAIMER)
 
@@ -1020,20 +1059,26 @@ def screen_explorer(dataset_id: str) -> None:
         if _active_train_live(ws) is not None:
             _render_train_live_activity(dataset_id, ws, component_key="explorer_train_live")
         _auto_refresh()
+        from pdm.lab_ui import report_evaluations
+
+        report_evaluations(dataset_id, run_id)
         return
 
-    if not processed_ready(dataset_id):
-        st.warning("Prepare data first.")
-        return
     try:
         bound = bind_replay_to_run(dataset_id, run_id)
     except IncompatibleDataError as exc:
         _pause_neural_runs()
         st.error(str(exc))
+        from pdm.lab_ui import report_evaluations
+
+        report_evaluations(dataset_id, run_id)
         return
     except (OSError, ValueError) as exc:
         _pause_neural_runs()
         st.error(f"Incompatible data: run snapshot is incomplete ({exc})")
+        from pdm.lab_ui import report_evaluations
+
+        report_evaluations(dataset_id, run_id)
         return
     bundle = {
         **bound,
@@ -1051,6 +1096,9 @@ def screen_explorer(dataset_id: str) -> None:
     uid = st.sidebar.selectbox("Unit", unit_ids, index=unit_ids.index(preferred_unit), on_change=_pause_neural_runs)
 
     render_equipment_simulation(dataset_id, rdir, str(uid), bundle)
+    from pdm.lab_ui import report_evaluations
+
+    report_evaluations(dataset_id, run_id)
 
 
 def _replay_pressure_limit_pa(rdir, cfg: dict) -> float:
@@ -1127,15 +1175,16 @@ def _evaluate_job(
 
 
 def _open_neural_test_run() -> None:
-    st.session_state["screen_selection"] = "Neural Activity Explorer"
+    st.session_state["screen_selection"] = "Model Report"
+    st.session_state["report_view"] = "Model replay"
 
 
 def screen_replay(dataset_id: str) -> None:
-    st.button("Open neural test run", on_click=_open_neural_test_run)
+    st.button("Open model replay", on_click=_open_neural_test_run)
     st.header(f"Test & Replay — {LABELS[dataset_id]}")
     st.info("Historical replay — not a live equipment connection")
     if dataset_id == "filters" and _filters_scale_unverified():
-        st.warning(_filters_time_warning())
+        _render_filters_time_warning()
     if not processed_ready(dataset_id):
         st.warning("Prepare data first.")
         return

@@ -31,6 +31,7 @@ def save_trace(
     status: str = "predicted",
     time_scale_s: float | None = None,
     head: str | None = None,
+    cell_states: np.ndarray | None = None,
 ) -> None:
     """Write meta.json, states.npz, contributions.npz, frame_map.json atomically."""
     dest = Path(trace_dir)
@@ -63,13 +64,11 @@ def save_trace(
         dest / "states.npz",
         states=np.asarray(states, dtype=np.float32),
         inputs=np.asarray(inputs, dtype=np.float32),
+        **({"cell_states": np.asarray(cell_states, dtype=np.float32)} if cell_states is not None else {}),
     )
     _atomic_npz(
         dest / "contributions.npz",
-        intercept=np.asarray(contributions["intercept"], dtype=np.float32),
-        input=np.asarray(contributions["input"], dtype=np.float32),
-        neuron=np.asarray(contributions["neuron"], dtype=np.float32),
-        raw=np.asarray(contributions["raw"], dtype=np.float32),
+        **{key: np.asarray(value, dtype=np.float32) for key, value in contributions.items()},
     )
     atomic_write_json(dest / "frame_map.json", list(frame_map))
 
@@ -81,16 +80,12 @@ def load_trace(trace_dir: Path) -> dict[str, Any]:
     with np.load(dest / "states.npz", allow_pickle=False) as packed:
         states = np.array(packed["states"], copy=True)
         inputs = np.array(packed["inputs"], copy=True)
+        cells = np.array(packed["cell_states"], copy=True) if "cell_states" in packed else None
     with np.load(dest / "contributions.npz", allow_pickle=False) as packed:
-        contributions = {
-            "intercept": np.array(packed["intercept"], copy=True),
-            "input": np.array(packed["input"], copy=True),
-            "neuron": np.array(packed["neuron"], copy=True),
-            "raw": np.array(packed["raw"], copy=True),
-        }
+        contributions = {key: np.array(packed[key], copy=True) for key in packed.files}
     frame_map = read_json(dest / "frame_map.json")
     raw_pred = meta.get("raw_prediction")
-    if raw_pred is None and len(contributions["raw"]):
+    if raw_pred is None and len(contributions.get("raw", [])):
         raw_prediction = np.asarray(contributions["raw"][-1], dtype=np.float32)
     else:
         raw_prediction = np.asarray(raw_pred if raw_pred is not None else [], dtype=np.float32)
@@ -99,6 +94,7 @@ def load_trace(trace_dir: Path) -> dict[str, Any]:
         "predicted_rul_s": None if pred is None else float(pred),
         "raw_prediction": raw_prediction,
         "states": states,
+        **({"cell_states": cells} if cells is not None else {}),
         "inputs": inputs,
         "contributions": contributions,
         "frame_map": frame_map,

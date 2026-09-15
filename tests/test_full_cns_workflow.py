@@ -7,6 +7,7 @@ from streamlit.testing.v1 import AppTest
 def test_fly_training_screen_dispatches_complete_population_without_old_controls(monkeypatch):
     import pdm.app as app
 
+    monkeypatch.setattr("pdm.lab_ui.training_overview", lambda *_: True)
     jobs = []
     monkeypatch.setattr(app, "processed_ready", lambda _: True)
     monkeypatch.setattr(app, "load_processed", lambda _: {"report": {}})

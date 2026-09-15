@@ -8,3 +8,10 @@ port = 8501
 
 [client]
 toolbarMode = "minimal"
+
+[theme]
+base = "dark"
+primaryColor = "#61d8ee"
+backgroundColor = "#080f17"
+secondaryBackgroundColor = "#101925"
+textColor = "#edf4fa"
