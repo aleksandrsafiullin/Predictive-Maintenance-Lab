@@ -96,18 +96,20 @@ Warning thresholds are 1,800 seconds for bearings and 420 internal seconds for f
 - Browser QA covers all nine main reports at 1440×1000 and 390×844: actual architecture states, displayed RUL versus saved CSV, Start/Pause/Next/Reset, seek/replay, ground-truth toggling, model switching and mobile controls. No horizontal page overflow or JavaScript errors. Existing Streamlit iframe and bundled Three.js warnings remain.
 - A legacy GRU report also opens on desktop/mobile with its original forecast. The point-only chart legend says **Forecast**; ranges retain their empirical/Weibull provenance.
 
-Evidence: [model and export verification](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/output/training-study-verification.json>) · [pytest log](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/output/training-v2-pytest.log>).
+**Local evidence:** the paths below are relative to the project root and are not distributed in Git.
 
-[Browser verification](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/output/playwright/training-v2-browser-qa.json>) · [GRU report](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/output/playwright/v2-report-filters-gru-desktop.png>) · [Full CNS report](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/output/playwright/v2-report-bearings-full_cns-desktop.png>) · [Mobile report](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/output/playwright/v2-report-filters-random_reservoir-mobile.png>) · [Training controls](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/output/playwright/training-v2-controls-desktop.png>).
+Model and export verification: `output/training-study-verification.json` · pytest log: `output/training-v2-pytest.log`.
+
+Browser verification: `output/playwright/training-v2-browser-qa.json` · GRU report: `output/playwright/v2-report-filters-gru-desktop.png` · Full CNS report: `output/playwright/v2-report-bearings-full_cns-desktop.png` · Mobile report: `output/playwright/v2-report-filters-random_reservoir-mobile.png` · Training controls: `output/playwright/training-v2-controls-desktop.png`.
 
 ## Artifacts
 
-- [Full generated study report](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/training_studies/20260915T184221Z/report.md>)
-- [All results CSV](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/training_studies/20260915T184221Z/results.csv>) · [JSON](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/training_studies/20260915T184221Z/results.json>)
-- [Screening and parent deltas](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/training_studies/20260915T184221Z/screening.csv>) · [Grouped folds](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/training_studies/20260915T184221Z/grouped_validation.csv>)
-- [Manifest with exact run/evaluation IDs](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/training_studies/20260915T184221Z/manifest.json>)
-- [Protocol documentation](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/docs/training_protocol.md>)
-- [bearings / validation comparison](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/a60eb894e58f/comparison.json>) · [Table CSV](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/a60eb894e58f/table.csv>) · [Forecast CSV](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/a60eb894e58f/predictions.csv>)
-- [bearings / test comparison](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/6982042a86e8/comparison.json>) · [Table CSV](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/6982042a86e8/table.csv>) · [Forecast CSV](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/6982042a86e8/predictions.csv>)
-- [filters / validation comparison](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/e0b2737f926f/comparison.json>) · [Table CSV](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/e0b2737f926f/table.csv>) · [Forecast CSV](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/e0b2737f926f/predictions.csv>)
-- [filters / test comparison](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/4672524600d5/comparison.json>) · [Table CSV](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/4672524600d5/table.csv>) · [Forecast CSV](</Users/aks/01 Development/Apps/Predictive Maintenance Lab/runs/comparisons/4672524600d5/predictions.csv>)
+- Full generated study report: `runs/training_studies/20260915T184221Z/report.md`
+- All results CSV: `runs/training_studies/20260915T184221Z/results.csv` · JSON: `runs/training_studies/20260915T184221Z/results.json`
+- Screening and parent deltas: `runs/training_studies/20260915T184221Z/screening.csv` · Grouped folds: `runs/training_studies/20260915T184221Z/grouped_validation.csv`
+- Manifest with exact run/evaluation IDs: `runs/training_studies/20260915T184221Z/manifest.json`
+- [Protocol documentation](../docs/training_protocol.md)
+- bearings / validation comparison: `runs/comparisons/a60eb894e58f/comparison.json` · Table CSV: `runs/comparisons/a60eb894e58f/table.csv` · Forecast CSV: `runs/comparisons/a60eb894e58f/predictions.csv`
+- bearings / test comparison: `runs/comparisons/6982042a86e8/comparison.json` · Table CSV: `runs/comparisons/6982042a86e8/table.csv` · Forecast CSV: `runs/comparisons/6982042a86e8/predictions.csv`
+- filters / validation comparison: `runs/comparisons/e0b2737f926f/comparison.json` · Table CSV: `runs/comparisons/e0b2737f926f/table.csv` · Forecast CSV: `runs/comparisons/e0b2737f926f/predictions.csv`
+- filters / test comparison: `runs/comparisons/4672524600d5/comparison.json` · Table CSV: `runs/comparisons/4672524600d5/table.csv` · Forecast CSV: `runs/comparisons/4672524600d5/predictions.csv`

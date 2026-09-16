@@ -7,9 +7,36 @@ Local lab for **remaining useful life (RUL)** and filter degradation forecasting
 | **Bearings / XJTU-SY** | RUL from vibration features | 9 train / 3 validation / 3 test |
 | **Filters / HSE** | Time to 600 Pa (censored survival) | Original 40 / 10 / 50; admission retains 39 / 10 / 50 |
 
-**Models:** `gru`, `lstm`, plus experimental `fly_connectome_reservoir` and `random_reservoir` (leaky Echo State Networks).
+**Models:** GRU, LSTM, Fly and matched Random reservoirs (1,000 nodes), plus Full MaleCNS for bearings (166,700 neurons; 25,582,938 directed connections). Reservoir activity comes from actual model computation.
 
 English UI (Streamlit). Heavy jobs run in a background worker. Repo: https://github.com/aleksandrsafiullin/Predictive-Maintenance-Lab
+
+---
+
+## Current results · 16 September 2026
+
+The completed training improvement study contains **42 real training runs**, 52 saved validation/test evaluations and four model comparisons. All nine main models cover the shared eligible prediction clock after warmup. Model selection uses validation; test is a **previously explored holdout**, reported separately.
+
+| Model | Bearings validation MAE, min | Bearings test MAE, min | Filters validation NLL | Filters test MAE, internal s |
+|---|---:|---:|---:|---:|
+| GRU | **62.71** | 51.09 | **0.6493** | 3911.88 |
+| LSTM | 127.00 | 55.54 | 0.7038 | 5868.61 |
+| Fly reservoir, 1,000 | 151.91 | 14.99 | 0.7987 | 1591.36 |
+| Random reservoir, 1,000 | 152.32 | 14.90 | 0.7979 | 1597.18 |
+| Full MaleCNS | 133.82 | 20.17 | — | — |
+
+Seed 42; lower is better within each column. Bearing MAE covers the final 30 minutes, with equal weight per bearing. Filter validation is equal-equipment survival negative log-likelihood (NLL), including censored series; filter test uses official RUL at each prefix endpoint. Filter time uses the unverified conversion `Time × 60`.
+
+**Progress is real, but reliable maintenance timing is not established.** No bearing model meets the ≤10-minute MAE target or the warning targets (≥90% timely recall and ≥80% useful-episode precision). GRU leads validation on both datasets, but its bearing test error worsened from 30.79 to 51.09 minutes. Filter GRU improves validation NLL and test error; its successful validation warning is based on only **one independent failure**. Validation contains three bearing failures; extra seeds do not increase that count.
+
+What the experiments established:
+
+- Aligning bearing checkpoint selection with the final-30-minute metric accounts for most GRU improvement. Continuing the same trajectory to 100 epochs adds 7.56% improvement; the best checkpoint is epoch 50.
+- Extra epochs alone do not help filter GRU. Its selected recipe uses adaptive learning rate, a complete pass over windows and causal degradation features.
+- New features and additional near-failure loss weight did not help the tested bearing GRU. Negative results are retained.
+- Bearing GRU varies substantially across seeds. Lower validation error alone does not establish useful warnings or generalization.
+
+See the [full results, controls, seed variation and acceptance evidence](reports/training_study_20260916.md) and [training protocol](docs/training_protocol.md). The completed check suite has **369 passing tests**, clean Ruff, and desktop/mobile browser verification of all nine main reports. Data, checkpoints and generated run artifacts remain local and are not included in a Git clone.
 
 ---
 
@@ -90,7 +117,7 @@ Raw files land under `data/raw/{filters,bearings}/`.
 
 ### Optional: MaleCNS connectome (~1 GB)
 
-Only for `fly_connectome_reservoir` / `random_reservoir` with `real_connectome`. GRU/LSTM do **not** need this.
+Required for the full reference matrix and training improvement study, including Full CNS and real Fly/Random comparisons. Individual GRU/LSTM runs do not need it.
 
 ```bash
 mkdir -p data/raw/connectome
@@ -131,16 +158,23 @@ Optional inspect:
 .venv/bin/python -m pdm train --dataset bearings --arch gru --epochs 3 --smoke --max-windows-per-unit 32
 ```
 
-### Full GRU (recommended baseline)
+### GRU with the selected v2 recipes
 
 ```bash
-.venv/bin/python -m pdm train --dataset filters --arch gru --epochs 30 --max-windows-per-unit 0
-.venv/bin/python -m pdm train --dataset bearings --arch gru --epochs 30 --max-windows-per-unit 0
+# Bearings: 100 epochs, fixed learning rate, original features and sampler.
+.venv/bin/python -m pdm train --dataset bearings --arch gru \
+  --protocol diagnostic --learning-rate 0.001 --feature-recipe base_v1 \
+  --sampling unit_replacement --device cpu
+
+# Filters: adaptive schedule, complete window passes and degradation features.
+.venv/bin/python -m pdm train --dataset filters --arch gru \
+  --protocol adaptive --learning-rate 0.0003 --feature-recipe degradation_v1 \
+  --sampling full_pass --device cpu
 ```
 
-`--max-windows-per-unit 0` = use all windows. Early stopping uses validation. Omit `--smoke`.
+Both recipes use all admitted windows, history 20 and seed 42 by default. Diagnostic training completes 100 epochs and retains the best validation checkpoint. Adaptive training runs 20–100 epochs, halves the learning rate after five non-improving epochs, and stops after 20 epochs without substantial improvement. CPU execution supports reproducible continuation and float64 survival calculations.
 
-LSTM: same flags with `--arch lstm`.
+LSTM uses the same flags with `--arch lstm`. The default CLI protocol remains `legacy`; specify `--protocol` to use v2. Legacy `--epochs 30 --max-windows-per-unit 0` makes all windows eligible but does not imply a full pass without replacement. `--smoke` is incompatible with v2.
 
 ### Fly connectome reservoir (experimental)
 
@@ -190,7 +224,7 @@ Research validation (H/K flags — does **not** write `alert_policy.json`):
 
 ```bash
 .venv/bin/python -m pdm evaluate --dataset bearings --run-id <run_id> --split validation \
-  --horizon-s 2220 --k 3 --min-action-lead-s 1110
+  --horizon-s 1800 --k 3 --min-action-lead-s 900
 ```
 
 Freeze alert policy from the UI (**Model Report → Evaluation settings → Validation → Freeze alert policy**), then frozen test:
@@ -224,7 +258,7 @@ Pages:
 3. **Model Report** — synchronized replay, actual architecture states, saved evaluations and training history. Evaluation settings remain available here.
 4. **Compare Models** — explicit validation/test artifacts, common time points, unit-balanced ranking, saved selections, CSV and JSON.
 
-### Full quality study
+### Reference quality study (legacy training control)
 
 ```bash
 .venv/bin/python -m pdm quality --dataset bearings
@@ -245,24 +279,28 @@ See [the quality and comparison protocol](docs/quality_and_comparison.md) for de
 
 ### Training improvement study (v2)
 
+Prerequisites: prepare both real datasets, download the real connectome, and complete `train-matrix` above. A new study requires a **completed reference matrix**; standalone GRU runs are insufficient. Heavy jobs run sequentially through the worker. Wait for the reference matrix to finish in **Training** before starting the study.
+
 ```bash
 .venv/bin/python -m pdm training-study
 .venv/bin/python -m pdm stop
 .venv/bin/python -m pdm training-study --resume-study <study_id>
 ```
 
-The bounded worker compares 100-epoch diagnostics, adaptive stopping, window weighting and causal degradation features, then checks equipment folds and all nine architectures. Test runs only after candidates and warning rules are frozen. Use **Training → Training improvement study** for progress and CSV/JSON exports; **Model Report** shows the selected checkpoint and actual model states.
+The bounded worker compares 100-epoch diagnostics, adaptive stopping, window weighting and causal degradation features, checks the two best recipes on train-only equipment folds, trains all nine main architectures, and repeats the two best validation architectures per dataset with seeds 43/44. Test runs only after candidates and warning rules are frozen. Use **Training → Training improvement study** for progress and CSV/JSON exports; **Model Report** shows the selected checkpoint and actual model states.
+
+The completed study is `20260915T184221Z`. Local artifacts under `runs/training_studies/<study_id>/` include `manifest.json`, `results.csv/json`, `screening.csv`, `grouped_validation.csv`, `epoch_diagnostics.csv`, `seed_dispersion.csv` and `report.md`. The manifest pins data versions, protocols, seeds and exact evaluation IDs. A Git clone includes the [published summary](reports/training_study_20260916.md), not these local artifacts.
 
 ### Automated checks
 
 ```bash
 .venv/bin/python -m pytest tests -q
-.venv/bin/python -m ruff check src tests
+.venv/bin/python -m ruff check src tests scripts
 ```
 
 ---
 
-## Quick path (copy-paste)
+## Quick path: individual GRU training
 
 ```bash
 git clone https://github.com/aleksandrsafiullin/Predictive-Maintenance-Lab.git
@@ -273,10 +311,11 @@ cd Predictive-Maintenance-Lab
 .venv/bin/python -m pdm prepare --dataset filters
 .venv/bin/python -m pdm prepare --dataset bearings
 
-.venv/bin/python -m pdm train --dataset bearings --arch gru --epochs 30 --max-windows-per-unit 0
-.venv/bin/python -m pdm train --dataset filters --arch gru --epochs 30 --max-windows-per-unit 0
+.venv/bin/python -m pdm train --dataset bearings --arch gru --protocol diagnostic --device cpu
+.venv/bin/python -m pdm train --dataset filters --arch gru --protocol adaptive \
+  --learning-rate 0.0003 --sampling full_pass --feature-recipe degradation_v1 --device cpu
 
-.venv/bin/python -m pdm evaluate --dataset bearings --run-id <run_id> --split test
+# Inspect validation in Model Report; freeze candidates and warning rules before test.
 .venv/bin/python -m pdm app
 ```
 
@@ -290,7 +329,8 @@ src/pdm/          CLI, train, evaluate, Streamlit app, models, connectome, visua
 data/raw/         downloaded datasets (gitignored)
 data/processed/   prepared features + splits (gitignored)
 runs/             checkpoints, metrics, evaluations, traces (gitignored)
-docs/             fly connectome + Neural Activity Explorer guides
+docs/             training, quality, comparison and connectome protocols
+reports/          published study summaries
 tests/            pytest suite
 scripts/          setup.sh / run.sh (and Windows .ps1)
 ```
