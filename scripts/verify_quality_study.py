@@ -32,6 +32,10 @@ def verify_task(task):
     bound = bind_replay_to_run(ds, rid)
     split = "test" if task["role"] == "main" else "validation"
     ev = load_evaluation(ds, rid, task[split + "_eval_id"])
+    summary = compare_evaluations([ev])["table"].iloc[0]
+    if "primary_score" in ev["metrics"]:
+        np.testing.assert_allclose(ev["metrics"]["primary_score"], summary.primary_score,
+                                   rtol=1e-10, atol=1e-8, err_msg=rid)
     uid = ev["config"]["evaluate_mask"]["unit_ids"][0]
     source = bound["features"].loc[bound["features"].unit_id == uid].sort_values("timestamp_s").reset_index(drop=True)
     model, prep, meta = load_trained_model(rdir, device="cpu", which="best")
@@ -72,7 +76,8 @@ def verify_task(task):
               "cell_states_shape": list(traced["cell_states"].shape) if "cell_states" in traced else None,
               "raw_rul_s": plain["predicted_rul_s"], "displayed_rul_s": float(final),
               "saved_rul_s": float(saved.predicted_rul_s), "absolute_difference_s": abs(float(final) - float(saved.predicted_rul_s)),
-              "trace_matches_plain": True, "seek_deterministic": True, "future_and_truth_independent": True}
+              "trace_matches_plain": True, "seek_deterministic": True, "future_and_truth_independent": True,
+              "evaluation_and_comparison_primary_match": "primary_score" in ev["metrics"]}
     del predictor, model, trace, traced, repeated, unchanged, rewind
     gc.collect()
     return result
@@ -81,14 +86,37 @@ def verify_task(task):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("batch_id")
+    parser.add_argument("--training-study", action="store_true", help="Verify a v2 improvement-study manifest")
     parser.add_argument("--scope", choices=["main", "all"], default="all")
     parser.add_argument("--output", type=Path, default=Path("output/quality-study-verification.json"))
     args = parser.parse_args()
     if worker_alive():
         raise SystemExit("Wait for the heavy worker to stop before loading verification models.")
     torch.set_num_threads(1)
-    manifest = read_json(runs_root() / "batches" / args.batch_id / "manifest.json")
-    tasks = [t for t in manifest["tasks"] if args.scope == "all" or t["role"] == "main"]
+    manifest = read_json(runs_root() / ("training_studies" if args.training_study else "batches") / args.batch_id / "manifest.json")
+    if args.training_study:
+        audited = 0
+        for stage, task in manifest["tasks"].items():
+            root = run_dir(task["dataset_id"], task["run_id"])
+            history = pd.read_csv(root / "training_history.csv")
+            metrics = read_json(root / "validation_metrics.json")
+            if task["architecture"] in ("gru", "lstm") or task["dataset_id"] == "filters":
+                selected = history.loc[history.val_metric.idxmin()]
+                assert metrics["best_epoch"] == selected.epoch, stage
+                np.testing.assert_allclose(metrics["best_metric"], selected.val_metric, rtol=1e-10, atol=1e-8)
+                if task["recipe"]["mode"] == "diagnostic":
+                    assert len(history) == 100, stage
+                else:
+                    assert 20 <= len(history) <= 100, stage
+                if task["recipe"]["sampling"] == "full_pass":
+                    assert history.n_unique_sampled_windows.eq(history.n_eligible_windows).all(), stage
+            audited += 1
+        print(json.dumps({"audited_training_histories": audited}), flush=True)
+        tasks = [{**t, "role": "main", "test_eval_id": t.get("test_evaluation"),
+                  "validation_eval_id": t.get("validation_evaluation")}
+                 for key, t in manifest["tasks"].items() if ":main:" in key or (args.scope == "all" and ":confirmation:" in key)]
+    else:
+        tasks = [t for t in manifest["tasks"] if args.scope == "all" or t["role"] == "main"]
     if not all(t.get("status") == "completed" for t in tasks):
         raise SystemExit("Selected study tasks are not complete")
     rows = []

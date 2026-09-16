@@ -320,7 +320,9 @@ def test_app_train_screen_smoke_off_clears_window_cap(monkeypatch, tmp_path, tin
     assert captured["kind"] == "train"
     assert captured["smoke"] is False
     assert captured["max_windows_per_unit"] == 0
-    assert captured["max_epochs"] == 30
+    assert captured["max_epochs"] == 100
+    assert captured["training_protocol"]["version"] == "training_v2"
+    assert captured["training_protocol"]["selection_metric"] == "near_30m_mae_s"
     assert captured["dataset_id"] == "bearings"
 
     metric_by_label = {m.label: m.value for m in at.metric}
@@ -363,7 +365,7 @@ def test_app_train_screen_filters_shows_val_nll(monkeypatch, tiny_filter_tables)
     at.run()
     assert not at.exception
     captions = "\n".join(str(w.value) for w in at.caption)
-    assert "val NLL" in captions
+    assert "survival_nll (internal seconds)" in captions
     markdown = "\n".join(str(w.value) for w in at.markdown)
     assert "Training mode: **Full**" in markdown
 
@@ -1558,7 +1560,7 @@ def test_app_operational_explorer_by_label_no_exception(tmp_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
 
     from pdm.paths import project_root
-    from pdm.visualization.explorer import EXPLORER_DISCLAIMER, clear_soma_table_cache
+    from pdm.visualization.explorer import clear_soma_table_cache
 
     monkeypatch.setattr("pdm.connectome.anatomy.default_soma_dir", lambda: tmp_path)
     clear_soma_table_cache()
@@ -1579,7 +1581,7 @@ def test_app_operational_explorer_by_label_no_exception(tmp_path, monkeypatch):
         for widget in getattr(at, attr, []):
             parts.append(str(getattr(widget, "value", widget)))
     text = "\n".join(parts)
-    assert EXPLORER_DISCLAIMER in text
+    assert "Real model states and causal forecasts from recorded measurements" in text
     assert "Architecture comparison" not in text
     assert not any(widget.label == "Mode" for widget in at.radio)
     assert not any(widget.label == "Build trace" for widget in at.button)

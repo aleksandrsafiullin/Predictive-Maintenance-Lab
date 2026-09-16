@@ -101,10 +101,10 @@ def weighted_quantile(values, quantile, weights):
     return float(values[order][min(np.searchsorted(cumulative, quantile * cumulative[-1]), len(values) - 1)])
 
 
-def weighted_ridge(z, target, ids, alpha):
+def weighted_ridge(z, target, ids, alpha, window_weights=None):
     """Equal-bearing mean squared error; intercept remains unpenalized."""
     z, y = np.asarray(z, float), np.asarray(target, float)
-    weights = unit_weights(ids)
+    weights = unit_weights(ids) if window_weights is None else np.asarray(window_weights, float).copy()
     weights /= weights.sum()
     gram = (z.T * weights) @ z
     penalty = np.eye(z.shape[1]) * float(alpha)
@@ -112,12 +112,24 @@ def weighted_ridge(z, target, ids, alpha):
     return np.linalg.solve(gram + penalty, z.T @ (weights * y))
 
 
-def trajectory_design(model, prep, features, units, ids, warmup=20):
+def trajectory_design(model, prep, features, units, ids, warmup=20, *, cache_root=None, cache_binding=None):
     """Full chronological state features, with row metadata for unitwise scoring."""
     selected = features[features.unit_id.astype(str).isin([str(x) for x in ids])]
     encoded = apply_preprocessor(prep, selected, "bearings")
     endpoints = units.set_index("unit_id")["event_time_s"]
     blocks, rows = [], []
+    computation_hash = None
+    if cache_root is not None:
+        import hashlib
+
+        digest = hashlib.sha256()
+        operator = model.W_res
+        tensors = [model.W_in, model.b_res, operator.crow_indices(), operator.col_indices(), operator.values()]
+        for tensor in tensors:
+            digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+        digest.update(np.asarray(model.pool_index).tobytes())
+        digest.update(str(model.alpha).encode())
+        computation_hash = digest.hexdigest()
     for uid, group in encoded.groupby("unit_id", sort=True):
         if hasattr(model, "pooled_trajectory"):
             from pdm.worker import stop_path
@@ -128,8 +140,33 @@ def trajectory_design(model, prep, features, units, ids, warmup=20):
         group = group.sort_values("timestamp_s")
         u = group[prep.feature_names].to_numpy(np.float32)
         gaps = group.get("gap_before", pd.Series(False, index=group.index)).fillna(False).to_numpy(bool)
-        states = (model.pooled_trajectory(u, gaps, should_stop=lambda: stop_path().exists()) if hasattr(model, "pooled_trajectory")
-                  else continuous_states(model, u, gaps))
+        states = None
+        cache_path = None
+        if cache_root is not None:
+            import hashlib
+
+            from pdm.io_util import atomic_write_json, read_json, sha256_file
+            from pdm.training_protocol import fingerprint
+
+            identity = {"version": 2, "data": cache_binding, "unit": str(uid), "preprocessing": prep.to_dict(),
+                        "graph": model.provenance, "state_mode": "continuous", "warmup": warmup,
+                        "computation_hash": computation_hash,
+                        "inputs": hashlib.sha256(u.tobytes() + gaps.tobytes()).hexdigest()}
+            cache_root.mkdir(parents=True, exist_ok=True)
+            cache_path = cache_root / (fingerprint(identity) + ".npy")
+            meta_path = cache_path.with_suffix(".json")
+            if cache_path.exists() and meta_path.exists() and read_json(meta_path).get("sha256") == sha256_file(cache_path):
+                candidate = np.load(cache_path)
+                if candidate.shape == (len(u), model.n_readout_features) and np.isfinite(candidate).all():
+                    states = candidate
+        if states is None:
+            states = (model.pooled_trajectory(u, gaps, should_stop=lambda: stop_path().exists()) if hasattr(model, "pooled_trajectory")
+                      else continuous_states(model, u, gaps))
+            if cache_path is not None:
+                if not np.isfinite(states).all():
+                    raise FloatingPointError(f"Nonfinite continuous states: {uid}")
+                np.save(cache_path, states)
+                atomic_write_json(meta_path, {"identity": identity, "sha256": sha256_file(cache_path)})
         age = np.arange(len(group))
         start = 0
         eligible = np.zeros(len(group), bool)
@@ -180,6 +217,7 @@ def score_readout(z, rows, weights, time_scale_s, profile):
         coeff = torch.as_tensor(np.asarray(weights, dtype=np.float32))
         raw = functional.linear(values[:, :n], coeff[:n].unsqueeze(0)) + functional.linear(
             values[:, n:-1], coeff[n:-1].unsqueeze(0), coeff[-1:])
+        scored["raw_output"] = raw.numpy().reshape(-1)
         if profile.get("rul_transform", "linear") == "log1p":
             prediction = torch.expm1(torch.clamp(raw, min=0.0, max=20.0)) * float(profile.get("rul_reference_s", 60.0)) / time_scale_s
             prediction = prediction * time_scale_s
@@ -187,9 +225,14 @@ def score_readout(z, rows, weights, time_scale_s, profile):
             prediction = functional.relu(raw) * time_scale_s
         scored["raw_rul_s"] = prediction.numpy().reshape(-1)
     else:
+        scored["raw_output"] = z @ weights
         scored["raw_rul_s"] = decode_rul_outputs(z @ weights, time_scale_s,
                                                 profile.get("rul_transform", "linear"),
                                                 profile.get("rul_reference_s", 60.0))
+    invalid = ~np.isfinite(scored[["raw_output", "raw_rul_s"]]).all(axis=1)
+    if invalid.any():
+        row = scored.loc[invalid].iloc[0]
+        raise FloatingPointError(f"Nonfinite readout: {row.unit_id}, window ending at {row.timestamp_s}")
     pieces = []
     # Design already removed the warmup rows, so first scored row is ready.
     ready_profile = {**profile, "warmup_measurements": 1}

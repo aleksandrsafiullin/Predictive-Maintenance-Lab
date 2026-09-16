@@ -31,11 +31,12 @@ def add_survival_scores(predictions, units):
     shape = result.weibull_shape.to_numpy(float)
     valid = (duration > 0) & np.isfinite(scale) & (scale > 0) & np.isfinite(shape) & (shape > 0)
     nll = np.full(len(result), np.nan)
-    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        log_ratio = np.log(duration[valid] / scale[valid])
-        survival = np.exp(np.minimum(shape[valid] * log_ratio, 50))
-        # Density in fixed internal seconds, comparable across train time scales.
-        nll[valid] = survival - observed[valid] * (np.log(shape[valid]) - np.log(scale[valid]) + (shape[valid] - 1) * log_ratio)
+    import torch
+
+    from pdm.losses import weibull_nll_seconds
+
+    nll[valid] = weibull_nll_seconds(*(torch.as_tensor(x[valid], dtype=torch.float64)
+                                     for x in (duration, observed, scale, shape))).numpy()
     result["survival_nll"] = nll
     result["outcome_observed"] = observed
     result["outcome_duration_s"] = duration
@@ -150,7 +151,8 @@ def compare_evaluations(evaluations):
         mae = _equal_unit(good, error.abs())
         near_mae = _equal_unit(near, near.absolute_error_s)
         score_survival = dataset_id == "filters" and split_name == "validation"
-        nll = _equal_unit(good, good.survival_nll) if score_survival and "survival_nll" in good else None
+        nll_complete = "survival_nll" in part and np.isfinite(part.survival_nll).all()
+        nll = _equal_unit(part, part.survival_nll) if score_survival and nll_complete else None
         ends = good.sort_values("timestamp_s").groupby("unit_id").tail(1)
         # Last eligible point must be the actual final recorded prefix point.
         end_ok = all(uid in set(ends.unit_id) and float(ends.loc[ends.unit_id == uid, "timestamp_s"].iloc[0]) == float(expected_ends[uid]) for uid in units)
@@ -194,6 +196,9 @@ def compare_evaluations(evaluations):
                "interval_width_s": _equal_unit(interval, interval.upper_rul_s - interval.lower_rul_s) if len(interval) else None,
                "alerts": json.dumps(alert, sort_keys=True)}
         row.update({"alerts_" + k: alert.get(k) for k in ("timely", "late", "miss", "too_early", "mean_lead_time_s", "fraction_time_in_warning")})
+        useful = ev["metrics"].get("alerts", {}).get("useful", {})
+        row.update({key: useful.get(key) for key in ("useful_precision", "timely_recall", "warning_goal_met", "evidence_status")})
+        row["feature_recipe"] = run.get("feature_recipe", "base_v1")
         row["timely_warning_units"] = alert.get("n_units_timely")
         row["scored_warning_units"] = alert.get("n_units_scored")
         rows.append(row)

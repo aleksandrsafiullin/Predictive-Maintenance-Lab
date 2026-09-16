@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -63,7 +64,15 @@ def list_runs(dataset_id: str | None = None) -> list[dict[str, Any]]:
             row["has_legacy_predictions"] = (run_dir / LEGACY_PREDICTIONS_NAME).exists()
             _enrich_run_identity(row, run_dir)
             rows.append(row)
-    rows.sort(key=lambda r: r.get("updated_at") or r.get("run_id") or "", reverse=True)
+    def recency(row):
+        try:
+            return datetime.fromisoformat(row["updated_at"]).timestamp()
+        except (KeyError, ValueError, TypeError):
+            root = Path(row["path"])
+            stamp = root / "best.pt" if (root / "best.pt").exists() else root
+            return stamp.stat().st_mtime
+
+    rows.sort(key=recency, reverse=True)
     return rows
 
 
@@ -88,6 +97,10 @@ def _copy_if_missing(row: dict[str, Any], key: str, value: Any) -> None:
 def _enrich_run_identity(row: dict[str, Any], run_path: Path) -> dict[str, Any]:
     """Fill architecture / graph identity from snapshot + provenance when status omits them."""
     snap = _optional_json(run_path / "experiment_snapshot.json") or {}
+    preprocessing = _optional_json(run_path / "preprocessing.json") or {}
+    row["feature_recipe"] = preprocessing.get("feature_recipe", "base_v1")
+    row["feature_count"] = len(preprocessing.get("feature_names", []))
+    row["feature_recipe_hash"] = preprocessing.get("feature_recipe_hash")
     model = snap.get("model") if isinstance(snap.get("model"), dict) else {}
     reservoir = model.get("reservoir") if isinstance(model.get("reservoir"), dict) else {}
     _copy_if_missing(row, "architecture", model.get("architecture"))

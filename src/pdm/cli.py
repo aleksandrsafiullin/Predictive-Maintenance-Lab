@@ -133,6 +133,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=["gru", "lstm", "fly_connectome_reservoir", "random_reservoir"],
     )
     p_tr.add_argument("--epochs", type=int, default=None)
+    p_tr.add_argument("--protocol", choices=["legacy", "adaptive", "diagnostic"], default="legacy")
+    p_tr.add_argument("--feature-recipe", choices=["base_v1", "degradation_v1"], default="base_v1")
+    p_tr.add_argument("--sampling", choices=["unit_replacement", "full_pass"], default="unit_replacement")
+    p_tr.add_argument("--learning-rate", type=float, default=.001)
+    p_tr.add_argument("--near-weight", type=float, default=0.)
     p_tr.add_argument("--history", type=int, default=None)
     p_tr.add_argument("--smoke", action="store_true")
     p_tr.add_argument("--resume", default=None)
@@ -209,6 +214,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("stop")
     matrix = sub.add_parser("train-matrix")
     matrix.add_argument("--resume-batch", default=None)
+    study = sub.add_parser("training-study")
+    study.add_argument("--resume-study", default=None)
     quality = sub.add_parser("quality")
     quality.add_argument("--dataset", required=True, choices=["bearings", "filters"])
     compare = sub.add_parser("compare")
@@ -216,6 +223,10 @@ def main(argv: list[str] | None = None) -> int:
     compare.add_argument("--evaluation", action="append", required=True, metavar="RUN_ID:EVAL_ID")
 
     args = parser.parse_args(argv)
+    if args.cmd == "training-study":
+        proc = spawn_worker({"kind": "training_study", "study_id": args.resume_study})
+        print(json.dumps({"worker_pid": proc.pid, "status": "started"}))
+        return 0
     if args.cmd == "train-matrix":
         proc = spawn_worker({"kind": "train_matrix", "batch_id": args.resume_batch})
         print(json.dumps({"worker_pid": proc.pid, "status": "started"}))
@@ -257,6 +268,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "train":
         from pdm.train import run_training
 
+        training_protocol = None
+        if args.protocol != "legacy":
+            from pdm.training_protocol import protocol
+
+            if args.smoke or args.events_only or args.epochs not in (None, 100) or args.history not in (None, 20) or args.max_windows_per_unit not in (None, 0):
+                parser.error("v2 uses full valid cohorts, 20-measurement history and a 100-epoch limit")
+            training_protocol = protocol(args.dataset, mode=args.protocol, learning_rate=args.learning_rate,
+                                         sampling=args.sampling, near_weight=args.near_weight, feature_recipe=args.feature_recipe)
         rec = run_training(
             args.dataset,
             architecture=args.arch,
@@ -273,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
             source_path=args.source_path,
             seed=args.seed,
             events_only=args.events_only,
+            training_protocol=training_protocol,
         )
         print(json.dumps(rec, indent=2, default=str))
         return 0

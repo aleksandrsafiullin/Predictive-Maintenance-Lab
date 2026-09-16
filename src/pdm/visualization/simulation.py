@@ -221,11 +221,14 @@ def window_forecast_history(measurements, model, prep, history_length, *, cached
                           sampling_interval_s=getattr(prep, "sampling_interval_s", None))
     saved = cached or {}
     predictor = Predictor(model, prep, history_length, device="cpu")
+    encoded = apply_preprocessor(prep, source.measurements) if prep.feature_recipe != "base_v1" else None
     rows = []
     for index in range(len(source)):
         stamp = float(source.measurements.iloc[index].timestamp_s)
         result = saved.get(stamp)
         if result is None:
-            result = {"timestamp_s": stamp, **predictor.predict_from_history(source.prefix(index))}
+            point = (predictor.predict_encoded_prefix(source.prefix(index), encoded.iloc[:index + 1]) if encoded is not None
+                     else predictor.predict_from_history(source.prefix(index)))
+            result = {"timestamp_s": stamp, **point}
         rows.append(result)
     return pd.DataFrame(rows)

@@ -109,6 +109,32 @@ def test_full_artifact_roundtrip_and_tampering_fail_closed(full_model, tmp_path)
         load_full_cns(tmp_path, meta)
 
 
+def test_continuous_state_cache_matches_and_invalidates_changed_inputs(full_model, tmp_path, monkeypatch):
+    from pdm import forecasting
+
+    model = full_model
+    prep = type("Prep", (), {"feature_names": ["sensor"], "to_dict": lambda _: {"features": ["sensor"]}})()
+    frame = pd.DataFrame({"unit_id": "a", "timestamp_s": np.arange(40) * 60.,
+                          "sensor": np.linspace(0, 1, 40), "gap_before": False})
+    units = pd.DataFrame({"unit_id": ["a"], "event_time_s": [2400.]})
+    monkeypatch.setattr(forecasting, "apply_preprocessor", lambda prep, frame, ds: frame)
+    monkeypatch.setattr("pdm.worker.stop_path", lambda: tmp_path / "stop")
+    kwargs = {"cache_root": tmp_path / "cache", "cache_binding": "fixture"}
+    expected, rows = forecasting.trajectory_design(model, prep, frame, units, ["a"])
+    cached, cached_rows = forecasting.trajectory_design(model, prep, frame, units, ["a"], **kwargs)
+    np.testing.assert_array_equal(expected, cached)
+    pd.testing.assert_frame_equal(rows, cached_rows)
+    original = model.pooled_trajectory
+    monkeypatch.setattr(model, "pooled_trajectory", lambda *args, **kwargs: pytest.fail("Cache hit recomputed states"))
+    hit, _ = forecasting.trajectory_design(model, prep, frame, units, ["a"], **kwargs)
+    np.testing.assert_array_equal(expected, hit)
+    monkeypatch.setattr(model, "pooled_trajectory", original)
+    model.W_in.mul_(.5)
+    changed, _ = forecasting.trajectory_design(model, prep, frame, units, ["a"], **kwargs)
+    assert not np.array_equal(expected, changed)
+    assert len(list((tmp_path / "cache").glob("*.npy"))) == 2
+
+
 def test_swc_simplification_preserves_bifurcations_and_source_coordinates():
     text = "1 1 0 0 0 1 -1\n2 3 0 1 0 1 1\n3 3 0 2 0 1 2\n4 3 1 3 0 1 3\n5 3 -1 3 0 1 3\n"
     segments = simplify_swc(text, spacing=100)

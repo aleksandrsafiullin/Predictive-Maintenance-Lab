@@ -180,6 +180,7 @@ def main() -> None:
     page = st.sidebar.radio("Screen", ["Data Quality", "Training", "Model Report", "Compare Models"],
                             key="screen_selection", on_change=_pause_neural_runs)
     apply_explorer_style()
+    _watch_worker_lifecycle()
     _status_chip(compact=True)
     if page == "Data Quality":
         screen_data(dataset_id)
@@ -510,7 +511,9 @@ def screen_train(dataset_id: str) -> None:
                    "The population is determined by the source annotations; it is not a neuron-count setting.")
         start, stop = st.columns(2)
         if start.button("Train full MaleCNS from scratch", disabled=worker_alive(), type="primary"):
-            spawn_worker({"kind": "train_full_cns", "dataset_id": "bearings"})
+            from pdm.training_protocol import protocol
+
+            spawn_worker({"kind": "train_full_cns", "dataset_id": "bearings", "training_protocol": protocol("bearings")})
             st.rerun()
         if stop.button("Stop", disabled=not worker_alive()):
             request_stop()
@@ -545,6 +548,18 @@ def screen_train(dataset_id: str) -> None:
         st.session_state[cap_key] = 0
     mode = st.radio("Training mode", ["Smoke", "Full"], horizontal=True, key=mode_key)
     smoke = mode == "Smoke"
+    optimization = st.selectbox("Optimization protocol", ["Adaptive v2", "Diagnostic 100 epochs", "Legacy"], disabled=smoke)
+    use_v2 = not smoke and optimization != "Legacy"
+    feature_recipe = "base_v1"
+    sampling = "unit_replacement"
+    near_weight = 0.0
+    if use_v2:
+        st.caption("Training v2 uses CPU for reproducible continuation and float64 survival calculations.")
+        feature_recipe = st.selectbox("Feature recipe", ["base_v1", "degradation_v1"])
+        sampling = st.selectbox("Window sampling", ["unit_replacement", "full_pass"])
+        if dataset_id == "bearings" and sampling == "full_pass":
+            near_weight = .5 if st.checkbox("Give half the training weight to the final 30 minutes") else 0.0
+        sel_spec = {"label": "near_30m_mae_s" if dataset_id == "bearings" else "survival_nll (internal seconds)"}
     _mode_badge(smoke)
     if smoke:
         st.warning("Smoke test — not a quality benchmark")
@@ -553,7 +568,9 @@ def screen_train(dataset_id: str) -> None:
             "unless you set max windows/unit to 0 (all)."
         )
     else:
-        st.caption("Full uses all windows when max windows/unit is 0. Early stopping still uses validation.")
+        st.caption("All eligible windows enter the sampling pool when max windows/unit is 0; the selected sampler determines which windows are visited.")
+        st.caption("Diagnostic mode runs exactly 100 epochs without early stopping; the best checkpoint still uses validation."
+                   if use_v2 and optimization == "Diagnostic 100 epochs" else "Early stopping uses the validation metric.")
     st.caption(
         f"Epoch selection metric: **{sel_spec['label']}** "
         "(unit-equal on a fixed window mask). Do not compare NLL and MAE as one accuracy."
@@ -567,18 +584,18 @@ def screen_train(dataset_id: str) -> None:
     if int(st.session_state.get(cap_key) or 0) != next_cap:
         st.session_state[cap_key] = next_cap
     st.session_state[prev_key] = smoke
-    epochs = st.number_input("Epochs", min_value=1, max_value=200, value=int(mcfg["max_epochs"]))
+    epochs = st.number_input("Epochs", min_value=1, max_value=200, value=100 if use_v2 else int(mcfg["max_epochs"]), disabled=use_v2)
     hist = st.number_input(
-        "History length (measurements)", min_value=2, max_value=128, value=int(mcfg["history_length"])
+        "History length (measurements)", min_value=2, max_value=128, value=int(mcfg["history_length"]), disabled=use_v2
     )
     st.caption(phys.get("note") or f"{hist} measurements of history")
-    max_w = st.number_input("Max windows / unit (0 = all)", min_value=0, key=cap_key)
+    max_w = st.number_input("Max windows / unit (0 = all)", min_value=0, key=cap_key, disabled=use_v2)
     history_ready = True
     if int(hist) != int(mcfg["history_length"]):
         st.caption("Admission counts for the selected history length")
         history_ready = training_overview(bundle, cfg, int(hist))
     with st.expander("Advanced"):
-        st.number_input("Learning rate", value=float(mcfg["learning_rate"]), format="%.5f", disabled=True)
+        learning_rate = st.number_input("Learning rate", min_value=0.00001, value=float(mcfg["learning_rate"]), format="%.5f", disabled=not use_v2 or optimization == "Diagnostic 100 epochs")
         st.number_input("Hidden size", value=int(mcfg["hidden_size"]), disabled=True)
         st.number_input("Batch size", value=int(mcfg["batch_size"]), disabled=True)
     runs = [r for r in list_runs(dataset_id) if r.get("has_last")]
@@ -609,6 +626,11 @@ def screen_train(dataset_id: str) -> None:
                 "resume_run_id": resume_id,
                 "max_windows_per_unit": int(max_w),
             }
+            if use_v2 and not resume_id:
+                from pdm.training_protocol import protocol
+
+                job["training_protocol"] = protocol(dataset_id, mode="diagnostic" if optimization == "Diagnostic 100 epochs" else "adaptive",
+                            learning_rate=float(learning_rate), sampling=sampling, near_weight=near_weight, feature_recipe=feature_recipe)
             if resume_saved is not None:
                 job["smoke"] = bool(resume_saved.get("smoke", False))
                 mw_saved = resume_saved.get("max_windows_per_unit")
@@ -625,14 +647,17 @@ def screen_train(dataset_id: str) -> None:
     if ws.get("status") in {"training", "preparing"} or worker_alive():
         live_mode = ws.get("mode") or training_mode_label(ws.get("smoke"), ws.get("run_id") or "")
         st.markdown(f"Live run: **{live_mode}**")
-        st.write(f"Epoch {ws.get('epoch', '—')} / {ws.get('max_epochs', '—')}")
-        st.write(
-            f"train loss {ws.get('train_loss')}  val loss {ws.get('val_loss')}  "
-            f"train metric {ws.get('train_metric')}  "
-            f"{ws.get('selection_metric_label') or 'val metric'} {ws.get('val_metric')}  "
-            f"best epoch {ws.get('best_epoch')}"
-        )
-        st.caption(_windows_used_caption(ws))
+        if ws.get("epoch") is not None:
+            st.write(f"Epoch {ws['epoch']} / {ws.get('max_epochs', '—')}")
+            st.write(
+                f"train loss {ws.get('train_loss', '—')}  val loss {ws.get('val_loss', '—')}  "
+                f"train metric {ws.get('train_metric', '—')}  "
+                f"{ws.get('selection_metric_label') or 'val metric'} {ws.get('val_metric', '—')}  "
+                f"best epoch {ws.get('best_epoch', '—')}"
+            )
+            st.caption(_windows_used_caption(ws))
+        else:
+            st.caption(f"{ws.get('status', 'running').title()} · {ws.get('stage') or ws.get('kind', '')}")
         st.caption(ws.get("message") or "")
         _render_train_live_activity(dataset_id, ws)
         _auto_refresh()
@@ -708,7 +733,7 @@ def screen_train(dataset_id: str) -> None:
         )
         d1, d2 = st.columns(2)
         d1.write(
-            f"Train mask {sel_spec['name']}: "
+            f"Train mask {vm.get('selection_metric_name') or sel_spec.get('name', sel_label)}: "
             f"{last_train.get('selection_metric', run_status.get('train_metric', '—'))}"
         )
         d2.write(
@@ -723,11 +748,14 @@ def screen_train(dataset_id: str) -> None:
             fig.add_trace(go.Scatter(x=hdf["epoch"], y=hdf["train_loss"], name="train loss"))
         if "val_loss" in hdf.columns:
             fig.add_trace(go.Scatter(x=hdf["epoch"], y=hdf["val_loss"], name="val loss"))
-        if _finite_number(best_epoch):
-            fig.add_vline(x=int(best_epoch), line_dash="dash", annotation_text=f"best epoch {int(best_epoch)}")
-        fig.update_xaxes(title="Epoch")
-        fig.update_yaxes(title="Loss (not comparable across loss types)")
-        st.plotly_chart(fig, width="stretch")
+        if fig.data:
+            if _finite_number(best_epoch):
+                fig.add_vline(x=int(best_epoch), line_dash="dash", annotation_text=f"best epoch {int(best_epoch)}")
+            fig.update_xaxes(title="Epoch")
+            fig.update_yaxes(title="Loss (not comparable across loss types)")
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.caption("Closed-form readout fitting has no gradient loss curve.")
         if "val_metric" in hdf.columns or "train_metric" in hdf.columns:
             fig_m = go.Figure()
             if "train_metric" in hdf.columns:
@@ -1023,12 +1051,26 @@ def screen_explorer(dataset_id: str) -> None:
             st.info(RESERVOIR_REQUIRED_MESSAGE)
         return
 
-    # list_runs is newest first. A completed anatomy/interval run takes priority
-    # over a stale selection handed over from the legacy replay screen.
+    # Prefer the completed study's validation leader, while preserving an
+    # explicit report link or the user's current selection.
     ready_rows = [r for r in reservoir_rows if _neural_test_run_ready(dataset_id, r)]
     real_rows = [r for r in reservoir_rows if str(r.get("graph_mode") or "") == "real_connectome"
                  and not r.get("is_synthetic")]
     preferred_rows = ready_rows or real_rows or reservoir_rows
+    from pdm.io_util import read_json
+    from pdm.lab_ui import model_label
+    from pdm.paths import runs_root
+
+    for path in sorted((runs_root() / "training_studies").glob("*/manifest.json"), reverse=True):
+        study = read_json(path)
+        if study.get("status") != "completed":
+            continue
+        scores = {task["run_id"]: task["primary_score"] for key, task in study.get("tasks", {}).items()
+                  if ":main:" in key and task.get("dataset_id") == dataset_id and task.get("primary_score") is not None}
+        candidates = [row for row in reservoir_rows if row["run_id"] in scores]
+        if candidates:
+            preferred_rows = sorted(candidates, key=lambda row: scores[row["run_id"]])
+            break
     view = st.session_state.get(_REPLAY_VIEW_KEY) or {}
     explicit_run = st.session_state.pop("_report_open_run", None)
     preferred_run = str(explicit_run or view.get("run_id") or "")
@@ -1041,7 +1083,7 @@ def screen_explorer(dataset_id: str) -> None:
     if explicit_run in run_ids or st.session_state.get(selection_key) not in run_ids:
         st.session_state[selection_key] = preferred_run
     run_id = st.sidebar.selectbox("Run", run_ids, key=selection_key,
-                                 format_func=lambda rid: f"{next(r for r in table if r['run_id'] == rid).get('architecture')} · {_explorer_run_label(rid)}", on_change=_pause_neural_runs)
+                                 format_func=lambda rid: model_label(next(r for r in table if r["run_id"] == rid)), on_change=_pause_neural_runs)
     rec = next(r for r in reservoir_rows if str(r["run_id"]) == str(run_id))
     rdir = run_dir(dataset_id, run_id)
     if is_reservoir(rec.get("architecture")):
@@ -1439,11 +1481,16 @@ def screen_replay(dataset_id: str) -> None:
     if hist_csv.exists():
         hdf = pd.read_csv(hist_csv)
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=hdf["epoch"], y=hdf["train_loss"], name="train loss"))
-        fig.add_trace(go.Scatter(x=hdf["epoch"], y=hdf["val_loss"], name="val loss"))
-        fig.update_xaxes(title="Epoch")
-        fig.update_yaxes(title="Loss")
-        st.plotly_chart(fig, width="stretch")
+        for column in ("train_loss", "val_loss"):
+            if column in hdf and hdf[column].notna().any():
+                fig.add_trace(go.Scatter(x=hdf["epoch"], y=hdf[column], name=column.replace("_", " ")))
+        if fig.data:
+            fig.update_xaxes(title="Epoch")
+            fig.update_yaxes(title="Loss")
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.caption("Closed-form readout fitting has no gradient loss curve.")
+            st.dataframe(hdf, hide_index=True, width="stretch")
     else:
         st.write("No training history file.")
 
@@ -2169,9 +2216,24 @@ def _split_map(split: dict) -> dict:
     return m
 
 
+@st.fragment(run_every=3.0)
+def _watch_worker_lifecycle() -> None:
+    """Detect CLI starts as well as completion, even from an idle screen."""
+    alive = worker_alive()
+    previous = st.session_state.get("_worker_watch_alive", alive)
+    st.session_state["_worker_watch_alive"] = alive
+    if previous != alive:
+        st.rerun(scope="app")
+
+
 @st.fragment(run_every=2.0)
 def _worker_poll_fragment() -> None:
     ws = read_status()
+    alive = worker_alive()
+    previous = st.session_state.get("_worker_poll_alive", alive)
+    st.session_state["_worker_poll_alive"] = alive
+    if previous != alive:
+        st.rerun(scope="app")
     st.caption(f"Worker status {ws.get('status', '—')} @ {time.strftime('%H:%M:%S')}")
 
 

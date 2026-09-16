@@ -358,11 +358,11 @@ def test_component_payload_has_states(tiny_bearing_tables):
     assert payload["predicted_rul_s"] == float(trace["predicted_rul_s"])
 
 
-def test_screen_switch_by_label(monkeypatch, tmp_path):
-    """AppTest screen switch uses label not index."""
+def test_screen_switch_by_label(monkeypatch, tmp_path, tiny_bearing_tables):
+    """Screen navigation is independent of the user's latest trained model."""
     from streamlit.testing.v1 import AppTest
 
-    _patch_soma_dir(monkeypatch, tmp_path)
+    _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception

@@ -261,7 +261,7 @@ def build_work_overlay_figure(
                        showarrow=False, font=dict(size=10, color=muted))
     if second_row:
         fig.add_annotation(x=1, y=fig.layout.yaxis3.domain[1], xref="paper", yref="paper", xanchor="right", yshift=22,
-                           text=f'<span style="color:{amber}">━ Range</span>' +
+                           text=f'<span style="color:{amber}">━ {"Range" if prediction_interval_s is not None else "Forecast"}</span>' +
                            (f'  <span style="color:{coral}">┄ Actual</span>' if show_gt else ""),
                            showarrow=False, font=dict(size=10, color=muted))
 

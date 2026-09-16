@@ -24,7 +24,9 @@ def test_fly_training_screen_dispatches_complete_population_without_old_controls
     next(b for b in at.button if b.label == "Train full MaleCNS from scratch").click()
     at.run()
     assert not at.exception
-    assert jobs == [{"kind": "train_full_cns", "dataset_id": "bearings"}]
+    from pdm.training_protocol import protocol
+
+    assert jobs == [{"kind": "train_full_cns", "dataset_id": "bearings", "training_protocol": protocol("bearings")}]
 
 
 @pytest.mark.parametrize("cancel", [False, True])

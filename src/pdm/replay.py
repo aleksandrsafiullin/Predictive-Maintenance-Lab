@@ -138,6 +138,13 @@ def replay_unit(
     preds: ReplayLog = []
     alerts: ReplayLog = []
     continuous = None
+    encoded = None
+    if (isinstance(predictor, Predictor) and predictor.prep.feature_recipe != "base_v1"
+            and getattr(predictor.model, "state_mode", None) == "window_reset"):
+        from pdm.preprocessing import apply_preprocessor
+
+        # The recipe is prefix-invariant; transform once, then expose only <= t.
+        encoded = apply_preprocessor(predictor.prep, src.measurements)
     if (len(src) and dataset_id == "bearings"
             and getattr(getattr(predictor, "model", None), "state_mode", None) == "continuous"):
         continuous = _continuous_bearing_predictions(src.measurements, predictor, forecast_profile, should_stop=should_stop)
@@ -147,8 +154,12 @@ def replay_unit(
         prefix = src.prefix(step)
         row = prefix.iloc[-1]
         t = float(row["timestamp_s"])
-        pred = (continuous.iloc[step].to_dict() if continuous is not None
-                else predictor.predict_from_history(prefix))
+        if continuous is not None:
+            pred = continuous.iloc[step].to_dict()
+        elif encoded is not None:
+            pred = predictor.predict_encoded_prefix(prefix, encoded.iloc[:step + 1])
+        else:
+            pred = predictor.predict_from_history(prefix)
         # Includes short prefix and gap/quality warmup from valid_history_window.
         collecting = pred.get("status") == "Collecting history"
         observed_limit = False

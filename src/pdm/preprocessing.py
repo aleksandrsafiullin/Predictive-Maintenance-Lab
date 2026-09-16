@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
+from pdm.feature_recipes import enrich_features, recipe_hash, recipe_metadata, recipe_names
 from pdm.features import apply_log1p_columns
 from pdm.windows import FORBIDDEN_FEATURE_NAMES, filter_gap_params
 
@@ -83,6 +84,7 @@ class Preprocessor:
     dataset_id: str | None = None
     gap_multiplier: float | None = None
     sampling_interval_s: float | None = None
+    feature_recipe: str = "base_v1"
 
     def transform_frame(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.attrs.get("scaled") is True:
@@ -125,10 +127,18 @@ class Preprocessor:
             "dataset_id": self.dataset_id,
             "gap_multiplier": self.gap_multiplier,
             "sampling_interval_s": self.sampling_interval_s,
+            "feature_recipe": self.feature_recipe,
+            "feature_recipe_parameters": recipe_metadata(self.feature_recipe),
+            "feature_recipe_hash": recipe_hash(self.feature_recipe),
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Preprocessor":
+        recipe = d.get("feature_recipe", "base_v1")
+        if d.get("feature_recipe_hash") and d["feature_recipe_hash"] != recipe_hash(recipe):
+            raise ValueError("Feature recipe changed since this checkpoint was trained")
+        if d.get("feature_recipe_parameters") and d["feature_recipe_parameters"] != recipe_metadata(recipe):
+            raise ValueError("Saved feature recipe parameters do not match their version")
         return cls(
             feature_names=list(d["feature_names"]),
             log1p_features=list(d.get("log1p_features") or []),
@@ -141,6 +151,7 @@ class Preprocessor:
             dataset_id=d.get("dataset_id"),
             gap_multiplier=_optional_positive_float(d.get("gap_multiplier")),
             sampling_interval_s=_optional_positive_float(d.get("sampling_interval_s")),
+            feature_recipe=recipe,
         )
 
 
@@ -159,6 +170,7 @@ def apply_preprocessor(
         prep.categorical_maps,
         prep.log1p_features,
         raw_features=True,
+        feature_recipe=prep.feature_recipe,
     )
     return prep.transform_frame(feat_df)
 
@@ -166,6 +178,8 @@ def apply_preprocessor(
 def preprocessor_resume_mismatches(saved: Preprocessor, live: Preprocessor) -> list[str]:
     """Scaler / maps / time_scale_s / feature_pipeline_version vs a live fit. Not eval-method drift."""
     differing: list[str] = []
+    if saved.feature_recipe != live.feature_recipe:
+        differing.append("feature_recipe")
     if saved.feature_pipeline_version != live.feature_pipeline_version:
         differing.append("feature_pipeline_version")
     if saved.categorical_maps != live.categorical_maps:
@@ -287,6 +301,7 @@ def raw_to_feature_frame(
     log1p_features: list[str] | None = None,
     *,
     raw_features: bool | None = None,
+    feature_recipe: str = "base_v1",
 ) -> pd.DataFrame:
     """Raw measurement rows → encoded, log1p'd model feature columns (pre-scaling).
 
@@ -298,6 +313,7 @@ def raw_to_feature_frame(
     frames cannot be double-transformed silently.
     """
     _assert_raw_measurement_input(df, raw_features)
+    df = enrich_features(df, dataset_id, feature_recipe)
     if dataset_id == "bearings":
         log1p_cols = list(log1p_features or [])
         feat_df, names, log1p_cols = bearings_feature_frame(df, log1p_cols)
@@ -309,6 +325,7 @@ def raw_to_feature_frame(
         raise ValueError(f"Unknown dataset_id for feature pipeline: {dataset_id}")
 
     apply_log1p_columns(feat_df, log1p_cols)
+    names = names + recipe_names(dataset_id, feature_recipe)
     out = feat_df.copy()
     missing = [c for c in names if c not in out.columns]
     if missing:
@@ -327,6 +344,7 @@ def fit_preprocessor(
     windows_train=None,
 ) -> tuple[Preprocessor, Any]:
     train_ids = set(split["train"])
+    feature_recipe = cfg.get("feature_recipe", "base_v1")
     train_feat = features[features["unit_id"].isin(train_ids)].copy()
     if train_feat.empty:
         raise ValueError("No training features to fit preprocessor")
@@ -348,7 +366,9 @@ def fit_preprocessor(
         cats,
         log1p_cols,
         raw_features=True,
+        feature_recipe=feature_recipe,
     )
+    names = names + recipe_names(dataset_id, feature_recipe)
     train_view = feat_df[feat_df["unit_id"].isin(train_ids)].copy()
     arr = train_view[names].to_numpy(dtype=np.float64)
     arr = np.where(np.isfinite(arr), arr, np.nan)
@@ -398,6 +418,7 @@ def fit_preprocessor(
         dataset_id=dataset_id,
         gap_multiplier=gap_k,
         sampling_interval_s=gap_samp,
+        feature_recipe=feature_recipe,
     )
     transformed = prep.transform_frame(feat_df)
     return prep, transformed

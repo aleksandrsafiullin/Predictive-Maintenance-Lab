@@ -72,11 +72,76 @@ def training_overview(bundle, cfg, history_length=None):
 
 
 def matrix_controls():
+    st.fragment(run_every=3 if worker_alive() else None)(_training_study_controls)()
     st.fragment(run_every=3 if worker_alive() else None)(_matrix_controls)()
 
 
+def _training_study_controls():
+    with st.expander("Training improvement study", expanded=True):
+        st.write("Test 100 epochs, adaptive learning rates, complete window coverage and degradation features. "
+                 "Screen GRU recipes, validate by equipment groups, then train all architectures and confirm finalists.")
+        a, b = st.columns(2)
+        if a.button("Start improvement study", disabled=worker_alive(), type="primary"):
+            spawn_worker({"kind": "training_study"})
+            st.rerun()
+        paths = sorted((runs_root() / "training_studies").glob("*/manifest.json"), reverse=True)
+        if not paths:
+            return
+        manifest = read_json(paths[0])
+        if b.button("Resume improvement study", disabled=worker_alive() or manifest.get("status") == "completed"):
+            spawn_worker({"kind": "training_study", "study_id": manifest["study_id"]})
+            st.rerun()
+        status = read_status()
+        tasks = list(manifest.get("tasks", {}).values())
+        st.caption(f"Study {manifest['study_id']} · {manifest.get('status')} · "
+                   f"{sum(t.get('status') == 'completed' for t in tasks)} completed runs. Later stages are selected from validation.")
+        if status.get("study_id") == manifest["study_id"]:
+            if status.get("unit_total"):
+                st.progress(status["unit_index"] / status["unit_total"],
+                            text=f"Evaluating {status['unit_id']} · {status['unit_index']} / {status['unit_total']} objects")
+                st.caption(f"{status.get('stage', '')} · {status.get('run_id', '')}")
+            elif status.get("stage"):
+                st.write(status.get("message") or status["stage"])
+            if status.get("epoch"):
+                st.progress(min(status["epoch"] / status.get("max_epochs", 100), 1.0),
+                            text=f"Epoch {status['epoch']} / {status.get('max_epochs', 100)} · best {status.get('best_epoch', '—')}")
+                st.caption(f"Learning rate: {status.get('learning_rate', '—')} · stop reason: {status.get('stop_reason', 'running')}")
+                st.caption(f"Features: {status.get('feature_recipe', '—')} · unique windows this epoch: "
+                           f"{status.get('n_unique_sampled_windows', '—')} / {status.get('n_eligible_windows', '—')}")
+            if status.get("run_id") and status.get("dataset_id"):
+                history = run_dir(status["dataset_id"], status["run_id"]) / "training_history.csv"
+                if history.exists():
+                    curve = pd.read_csv(history)
+                    if {"epoch", "train_metric", "val_metric"}.issubset(curve) and len(curve) > 1:
+                        st.plotly_chart(style_figure(px.line(curve, x="epoch", y=["train_metric", "val_metric"],
+                                                            title=status.get("selection_metric_name", "Selection metric")), 260),
+                                        width="stretch", theme=None, key="study_live_metric")
+        if manifest.get("error") and manifest.get("status") == "failed":
+            st.error(manifest["error"])
+        if worker_alive() and status.get("study_id") == manifest["study_id"]:
+            log = paths[0].parent / "study.log"
+            if log.exists():
+                with st.expander("Current computation log"):
+                    st.code("\n".join(log.read_text()[-4000:].splitlines()[-10:]), language="text")
+        if tasks:
+            table = pd.DataFrame([{"stage": key, **task} for key, task in manifest["tasks"].items()])
+            st.dataframe(table[[c for c in ("stage", "dataset_id", "architecture", "seed", "status", "primary_score", "best_epoch", "run_id") if c in table]], hide_index=True, width="stretch")
+        if worker_alive() and st.button("Stop improvement study"):
+            request_stop()
+            st.rerun()
+        active_study = worker_alive() and status.get("study_id") == manifest["study_id"]
+        if active_study:
+            st.caption("Study exports become available when the worker finishes or pauses.")
+        else:
+            for name in ("results.csv", "results.json", "baselines.csv", "screening.csv", "grouped_validation.csv",
+                         "epoch_diagnostics.csv", "seed_dispersion.csv", "report.md", "manifest.json"):
+                path = paths[0].parent / name
+                if path.exists():
+                    st.download_button("Download " + name, path.read_bytes(), name, key="study:" + name, on_click="ignore")
+
+
 def _matrix_controls():
-    with st.expander("Full comparison study", expanded=read_status().get("kind") == "train_matrix"):
+    with st.expander("Historical training protocol · comparison study", expanded=read_status().get("kind") == "train_matrix"):
         st.write("Train and evaluate 9 full models across bearings and filters, plus the paired filter censoring study (14 experiments total). Jobs run sequentially.")
         a, b = st.columns(2)
         if a.button("Run full training matrix", disabled=worker_alive(), type="primary"):
@@ -128,7 +193,9 @@ def report_evaluations(dataset_id, run_id):
     if not evaluations:
         legacy = [p for p in (root / "test_metrics.json", root / "validation_metrics.json") if p.exists()]
         if legacy:
-            st.caption("Historical metrics · original protocol; excluded from the new quality ranking.")
+            current = any(read_json(path).get("training_protocol", {}).get("version") == "training_v2" for path in legacy)
+            st.caption("Checkpoint selection diagnostics · full replay evaluation has not been saved yet." if current
+                       else "Historical metrics · original protocol; excluded from the new quality ranking.")
             for path in legacy:
                 st.json(read_json(path), expanded=False)
                 st.download_button("Download " + path.name, path.read_bytes(), run_id + "-" + path.name, "application/json")
@@ -154,6 +221,15 @@ def report_evaluations(dataset_id, run_id):
                 st.caption(row.reason)
             interval_label = "unavailable" if row.interval_origin == "unavailable" else f"{row.interval_origin} · {row.interval_evaluation}"
             st.caption(f"Interval: {interval_label}. Observed failures: {row.observed_events}.")
+            if pd.notna(row.get("warning_goal_met")):
+                warning_cols = st.columns(2)
+                warning_cols[0].metric("Useful warning episodes", "—" if pd.isna(row.useful_precision) else f"{row.useful_precision:.0%}")
+                warning_cols[1].metric("Timely failure warnings", "—" if pd.isna(row.timely_recall) else f"{row.timely_recall:.0%}")
+                if not row.warning_goal_met:
+                    st.warning("Warning usefulness target not met. A low RUL error alone does not qualify this model for use.")
+                st.caption(str(row.get("evidence_status", "")))
+                with st.expander("Warning outcomes across the full recorded history"):
+                    st.json(ev["metrics"].get("alerts", {}).get("useful", {}))
             if dataset_id == "filters" and result["split"] == "test":
                 st.caption(f"Official prefix-end RUL labels: {int(row.units)}. These are evaluation references; the observed prefixes do not contain those failures.")
             st.dataframe(result["table"][["all_history_mae_s", "overestimation_s", "interval_coverage", "interval_width_s", "alerts_timely", "alerts_late", "alerts_miss"]], hide_index=True, width="stretch")
@@ -170,9 +246,21 @@ def report_evaluations(dataset_id, run_id):
     if history.exists():
         with st.expander("Training history and experiment details"):
             frame = pd.read_csv(history)
-            cols = [c for c in ("train_metric", "val_metric", "train_loss", "val_loss") if c in frame and frame[c].notna().any()]
+            status = read_json(root / "status.json") if (root / "status.json").exists() else {}
+            prep = read_json(root / "preprocessing.json") if (root / "preprocessing.json").exists() else {}
+            st.caption(f"Completed epoch: {status.get('epoch', len(frame))} · best epoch: {status.get('best_epoch', '—')} · "
+                       f"stop reason: {status.get('stop_reason', 'legacy protocol')} · "
+                       f"features: {prep.get('feature_recipe', 'base_v1')} ({len(prep.get('feature_names', []))})")
+            if prep.get("feature_recipe") == "degradation_v1":
+                st.caption("Model window: 20 measurements. Features use 5/20-point slopes and causal segment history for initial levels or accumulated dust. Gaps reset that history.")
+            if "learning_rate" in frame:
+                st.plotly_chart(style_figure(px.line(frame, x="epoch", y="learning_rate"), 220), width="stretch", theme=None)
+            cols = [c for c in ("train_metric", "val_metric") if c in frame and frame[c].notna().any()]
             if len(frame) > 1 and cols:
                 st.plotly_chart(style_figure(px.line(frame, x="epoch", y=cols, color_discrete_sequence=COLORS), 300), width="stretch", theme=None)
+            loss_cols = [c for c in ("train_loss", "val_loss") if c in frame and frame[c].notna().any()]
+            if len(frame) > 1 and loss_cols:
+                st.plotly_chart(style_figure(px.line(frame, x="epoch", y=loss_cols, title="Optimization loss", color_discrete_sequence=COLORS), 240), width="stretch", theme=None)
             st.dataframe(frame, hide_index=True, width="stretch")
             if not cols:
                 st.caption("Closed-form readout fitting has no gradient loss curve.")
@@ -221,7 +309,18 @@ def screen_comparison(dataset_id):
     ordered = list(reversed(runs))
     # Prefer a completed matrix over mixing recent ablation and main runs.
     defaults, default_evaluations = [], {}
+    for path in sorted((runs_root() / "training_studies").glob("*/manifest.json"), reverse=True):
+        study = read_json(path)
+        if study.get("status") != "completed":
+            continue
+        tasks = [t for key, t in study.get("tasks", {}).items() if ":main:" in key and t.get("dataset_id") == dataset_id]
+        defaults = [t["run_id"] for t in tasks if t["run_id"] in runs and t.get(split + "_evaluation")]
+        default_evaluations = {t["run_id"]: t.get(split + "_evaluation") for t in tasks if t["run_id"] in defaults}
+        if defaults:
+            break
     for manifest in sorted((runs_root() / "batches").glob("*/manifest.json"), reverse=True):
+        if defaults:
+            break
         tasks = read_json(manifest).get("tasks", [])
         defaults = [t["run_id"] for t in tasks if t.get("role") == "main" and t.get("dataset_id") == dataset_id and t.get("run_id") in runs]
         if defaults:
@@ -251,7 +350,7 @@ def screen_comparison(dataset_id):
     metric = "MAE in the final 30 minutes" if dataset_id == "bearings" else "Survival NLL on all validation units" if split == "validation" else "MAE at official prefix endpoints"
     st.markdown(f"**Primary metric: {metric} · lower is better**")
     st.caption("Every equipment unit has equal weight. Missing forecasts reduce coverage and prevent ranking. All MAE columns use internal seconds.")
-    leading_columns = ["rank", "model", "nodes", "state_mode", "primary_score", "prediction_coverage", "units", "observed_events", "reason"]
+    leading_columns = ["rank", "model", "nodes", "state_mode", "feature_recipe", "primary_score", "prediction_coverage", "units", "observed_events", "warning_goal_met", "reason"]
     display = table[leading_columns].copy()
     display["model"] = table.run_id.map(lambda rid: model_label(runs[rid]))
     st.dataframe(display, hide_index=True, width="stretch", column_config={
@@ -269,6 +368,8 @@ def screen_comparison(dataset_id):
     if len(eligible) >= 2:
         best = eligible[eligible["rank"] == eligible["rank"].min()]
         st.success(("Leading validation model: " if split == "validation" else "Lowest error on this reused test cohort: ") + ", ".join(model_label(runs[rid]) for rid in best.run_id))
+        if best.warning_goal_met.notna().any() and not best.warning_goal_met.fillna(False).all():
+            st.warning("The RUL leader does not meet the warning usefulness target. Ranking is not a readiness decision.")
     if not result["alert_policies_match"]:
         st.warning("Alert thresholds differ; alert outcomes are not ranked together.")
     st.caption("Alert columns describe each saved evaluation's complete history. Interval results on calibration units are marked separately; Weibull ranges describe the fitted distribution and have no empirical calibration guarantee.")

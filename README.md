@@ -243,6 +243,16 @@ The sequential worker runs nine main models and five additional GRU censoring-st
 
 See [the quality and comparison protocol](docs/quality_and_comparison.md) for definitions and artifact contracts. Old snapshots and runs remain accessible; new training requires `admission_v1` and verified file hashes. No ensemble is fitted.
 
+### Training improvement study (v2)
+
+```bash
+.venv/bin/python -m pdm training-study
+.venv/bin/python -m pdm stop
+.venv/bin/python -m pdm training-study --resume-study <study_id>
+```
+
+The bounded worker compares 100-epoch diagnostics, adaptive stopping, window weighting and causal degradation features, then checks equipment folds and all nine architectures. Test runs only after candidates and warning rules are frozen. Use **Training → Training improvement study** for progress and CSV/JSON exports; **Model Report** shows the selected checkpoint and actual model states.
+
 ### Automated checks
 
 ```bash
@@ -289,6 +299,8 @@ scripts/          setup.sh / run.sh (and Windows .ps1)
 
 ## More documentation
 
+- [Training protocol v2](docs/training_protocol.md) — 100-epoch diagnostics, adaptive stopping, causal degradation features and the bounded study worker
+- [Training improvement results · 16 September 2026](reports/training_study_20260916.md) — actual experiments, epoch attribution, seed stability and laboratory targets
 - [Completed quality study · 15 September 2026](reports/quality_study_20260915.md) — 14 real runs, four comparisons, censoring experiment and acceptance evidence
 - [Quality and comparison protocol](docs/quality_and_comparison.md) — admission, immutable snapshots, shared forecasts and ranking rules
 - [docs/fly_connectome.md](docs/fly_connectome.md) — MaleCNS import, graph orientation, sampling  

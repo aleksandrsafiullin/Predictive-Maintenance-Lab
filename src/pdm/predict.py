@@ -72,7 +72,8 @@ def prepare_history_window(
             "window": None,
             "inputs": None,
         }
-    window = history.sort_values("timestamp_s").iloc[-int(history_length) :].copy()
+    ordered = history.sort_values("timestamp_s").copy()
+    window = ordered.iloc[-int(history_length) :].copy()
     if prep.feature_pipeline_version != FEATURE_PIPELINE_VERSION:
         raise ValueError(
             "Preprocessor feature_pipeline_version is missing or not v2_raw_first; "
@@ -83,11 +84,13 @@ def prepare_history_window(
         raise ValueError("Preprocessor missing dataset_id for raw feature pipeline")
     encoded = raw_to_feature_frame(
         prep.dataset_id,
-        window,
+        ordered if prep.feature_recipe != "base_v1" else window,
         prep.categorical_maps,
         prep.log1p_features,
         raw_features=True,
+        feature_recipe=prep.feature_recipe,
     )
+    encoded = encoded.iloc[-int(history_length):].copy()
     transformed = prep.transform_frame(encoded)
     arr = transformed[prep.feature_names].to_numpy(dtype=np.float32)
     return {
@@ -170,6 +173,21 @@ class Predictor:
         result["state_mode"] = getattr(self.model, "state_mode", "window_reset")
         return result
 
+    @torch.no_grad()
+    def predict_encoded_prefix(self, history_rows, encoded):
+        """Internal replay fast path: only an already encoded causal prefix."""
+        if len(history_rows) != len(encoded) or not np.array_equal(history_rows.timestamp_s, encoded.timestamp_s):
+            raise ValueError("Encoded prefix does not match observed timestamps")
+        ok, reason = valid_history_window(history_rows, self.history_length, dataset_id=self.prep.dataset_id,
+                         gap_multiplier=self.gap_multiplier, sampling_interval_s=self.sampling_interval_s)
+        if not ok:
+            return {"predicted_rul_s": None, "status": "Collecting history", "valid_history_reason": reason}
+        arr = encoded.iloc[-self.history_length:][self.prep.feature_names].to_numpy(np.float32, copy=True)
+        output = model_forecast(self.model, torch.from_numpy(arr).unsqueeze(0).to(self.device))
+        if not np.isfinite(output["predicted_rul_s"]):
+            return {"predicted_rul_s": None, "status": "No valid prediction", "valid_history_reason": ""}
+        return {**output, "status": "ok", "valid_history_reason": ""}
+
     def _predict_from_prepared(self, history_rows) -> dict[str, Any]:
         if getattr(self.model, "state_mode", None) == "continuous":
             from pdm.visualization.simulation import continuous_trace
@@ -222,14 +240,12 @@ def model_forecast(model, x):
     """Point forecast and optional distribution from the same saved model head."""
     import math
 
-    from pdm.losses import weibull_median_rul
-
+    tensors = forecast_tensors(model, x)
     result = {"forecast_method": "window_point", "interval_method": None}
     if getattr(model, "head_type", None) == "weibull":
-        lam, k = model(x)
-        value = float(weibull_median_rul(lam, k, model.time_scale_s).reshape(-1)[0].cpu())
-        scale = float(lam.reshape(-1)[0].cpu()) * model.time_scale_s
-        shape = float(k.reshape(-1)[0].cpu())
+        value = float(tensors["point"].reshape(-1)[0].cpu())
+        scale = float(tensors["scale_s"].reshape(-1)[0].cpu())
+        shape = float(tensors["shape"].reshape(-1)[0].cpu())
         result.update(weibull_scale_s=scale, weibull_shape=shape,
                       interval_method="Weibull distribution (5–95%; not empirically calibrated)",
                       forecast_method="window_weibull")
@@ -241,6 +257,24 @@ def model_forecast(model, x):
         if np.isfinite([lo, hi]).all() and 0 <= lo <= hi:
             result.update(lower_rul_s=lo, upper_rul_s=hi)
     else:
-        value = float(model.predicted_rul_s(x).reshape(-1)[0].cpu())
+        value = float(tensors["point"].reshape(-1)[0].cpu())
     result.update(predicted_rul_s=value, raw_rul_s=value)
     return result
+
+
+def forecast_tensors(model, x, states=None):
+    """Shared differentiable head for replay, epoch scoring and cached reservoirs."""
+    from pdm.losses import weibull_median_rul
+
+    raw = None
+    if states is not None:
+        raw = model.forward_raw(states, x[:, -1, :])
+        output = model._postprocess(raw)
+    else:
+        output = model(x)
+    if getattr(model, "head_type", None) == "weibull":
+        lam, shape = output
+        return {"point": weibull_median_rul(lam, shape, model.time_scale_s),
+                "scale_s": lam.to(device="cpu" if lam.device.type == "mps" else lam.device, dtype=torch.float64) * model.time_scale_s,
+                "shape": shape, "raw": raw}
+    return {"point": output * model.time_scale_s, "raw": raw}

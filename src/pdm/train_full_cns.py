@@ -11,6 +11,8 @@ import argparse
 import copy
 import json
 import os
+import time
+from pathlib import Path
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -31,7 +33,7 @@ from pdm.forecasting import (  # noqa: E402
     weighted_ridge,
 )
 from pdm.io_util import atomic_write_json, checkpoint_hash, dump_yaml, sha256_file  # noqa: E402
-from pdm.paths import dataset_runs  # noqa: E402
+from pdm.paths import dataset_runs, runs_root  # noqa: E402
 from pdm.preprocessing import fit_preprocessor  # noqa: E402
 from pdm.train import (  # noqa: E402
     _build_reservoir_model,
@@ -48,14 +50,26 @@ def _check_stop():
         raise InterruptedError("Brain forecast training cancelled")
 
 
-def main(argv=None):
+def main(argv=None, *, status_cb=None):
+    started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-path")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--training-protocol")
+    parser.add_argument("--defer-test", action="store_true")
     args = parser.parse_args(argv)
     torch.set_num_threads(1)
-    torch.manual_seed(42)
+    torch.manual_seed(args.seed)
     cfg = load_dataset_config("bearings")
     mcfg = model_defaults(cfg)
+    mcfg["seed"] = args.seed
+    training_protocol = None
+    if args.training_protocol:
+        from pdm.io_util import read_json
+        from pdm.training_protocol import validate_protocol
+
+        training_protocol = validate_protocol(read_json(Path(args.training_protocol)), "bearings")
+        cfg.update(training_protocol=training_protocol, feature_recipe=training_protocol["feature_recipe"])
     mcfg["architecture"] = "fly_connectome_reservoir"
     mcfg["history_length"] = 20
     mcfg["reservoir"].update(graph_scope="whole_classified_cns", graph_mode="real_connectome", state_mode="continuous", readout="ridge")
@@ -81,43 +95,69 @@ def main(argv=None):
     relative_scores = {candidate: [] for candidate in candidates}
     oof = {candidate: [] for candidate in candidates}
     train_ids = split["train"]
+    cache_kwargs = ({"cache_root": runs_root() / "full_cns_state_cache",
+                     "cache_binding": dataset_fingerprint_for_run(processed, split)} if training_protocol else {})
+
+    def solve(z, rows, scale, transform, alpha):
+        weights = None
+        if training_protocol:
+            from pdm.training_protocol import window_weights
+
+            weights = window_weights([(r.unit_id, 0, 0, r.target_rul_s, 0, 1) for r in rows.itertuples()],
+                                     training_protocol["near_weight"])
+        return weighted_ridge(z, encode_rul_targets(rows.target_rul_s, scale, transform), rows.unit_id, alpha, weights)
+
     train_units = units[units.unit_id.isin(train_ids)]
     folds = []
     for instance in sorted(train_units.instance.unique()):
         _check_stop()
+        if status_cb:
+            status_cb(f"Full CNS grouped training fold {instance} / {train_units.instance.nunique()}")
         hold = sorted(train_units.loc[train_units.instance == instance, "unit_id"].tolist())
         fit_ids = sorted(set(train_ids)-set(hold))
         folds.append({"fit_ids": fit_ids, "held_out_ids": hold})
         fold_split = {**split, "train": fit_ids}
         fold_prep, _ = fit_preprocessor("bearings", features, units, fold_split, cfg)
-        z_fit, rows_fit = trajectory_design(model, fold_prep, features, units, fit_ids)
-        z_hold, rows_hold = trajectory_design(model, fold_prep, features, units, hold)
+        z_fit, rows_fit = trajectory_design(model, fold_prep, features, units, fit_ids, **cache_kwargs)
+        z_hold, rows_hold = trajectory_design(model, fold_prep, features, units, hold, **cache_kwargs)
         for transform, alpha in candidates:
-            targets = encode_rul_targets(rows_fit.target_rul_s, fold_prep.time_scale_s, transform)
-            weights = weighted_ridge(z_fit, targets, rows_fit.unit_id, alpha)
+            weights = solve(z_fit, rows_fit, fold_prep.time_scale_s, transform, alpha)
             predictions = score_readout(z_hold, rows_hold, weights, fold_prep.time_scale_s, {**base, "rul_transform": transform})
             metrics = forecast_metrics(predictions)
-            scores[(transform, alpha)].append(metrics["bearing_balanced"]["mae_s"])
+            if training_protocol:
+                near = predictions[predictions.target_rul_s.between(0, 1800, inclusive="right")].copy()
+                near["error"] = abs(near.target_rul_s - near.predicted_rul_s)
+                if set(near.unit_id) != set(hold):
+                    raise ValueError("Incomplete near-event Full CNS validation cohort")
+                scores[(transform, alpha)].append(float(near.groupby("unit_id").error.mean().mean()))
+            else:
+                scores[(transform, alpha)].append(metrics["bearing_balanced"]["mae_s"])
             relative_scores[(transform, alpha)].append(float(np.mean([
                 np.mean(np.abs(group.target_rul_s-group.predicted_rul_s)) / max(float((group.timestamp_s+group.target_rul_s).iloc[0]), 60.0)
                 for _, group in predictions.groupby("unit_id")
             ])))
             oof[(transform, alpha)].append(predictions)
         print(f"CV fold {instance}: held out {hold}", flush=True)
-    candidate = min(candidates, key=lambda candidate: (np.mean(relative_scores[candidate]), -candidate[1]))
+    candidate = min(candidates, key=lambda candidate: (np.mean((scores if training_protocol else relative_scores)[candidate]), -candidate[1]))
     transform, alpha = candidate
     print(f"Selected transform={transform}, alpha={alpha}; grouped CV MAE={np.mean(scores[candidate]):.1f}s", flush=True)
     print(json.dumps({f"{t}:{a}": float(np.mean(scores[(t, a)])) for t, a in candidates}), flush=True)
     base.update(rul_transform=transform, rul_reference_s=60.0)
     model.rul_transform = transform
     model.rul_reference_s = 60.0
-    z_train, rows_train = trajectory_design(model, prep, features, units, train_ids)
-    weights = weighted_ridge(z_train, encode_rul_targets(rows_train.target_rul_s, prep.time_scale_s, transform), rows_train.unit_id, alpha)
+    if status_cb:
+        status_cb("Full CNS final train trajectories and readout fit")
+    z_train, rows_train = trajectory_design(model, prep, features, units, train_ids, **cache_kwargs)
+    weights = solve(z_train, rows_train, prep.time_scale_s, transform, alpha)
     model.load_pooled_readout(weights)
     # Evaluate and calibrate using the actual float32 serialized readout values.
     weights = weights.astype(np.float32)
     _check_stop()
-    z_cal, rows_cal = trajectory_design(model, prep, features, units, split["validation"])
+    if status_cb:
+        status_cb("Full CNS validation trajectories and interval calibration")
+    z_cal, rows_cal = trajectory_design(model, prep, features, units, split["validation"], **cache_kwargs)
+    if training_protocol and set(rows_cal.unit_id) != set(split["validation"]):
+        raise ValueError("Incomplete Full CNS validation cohort")
     cal = score_readout(z_cal, rows_cal, weights, prep.time_scale_s, base)
     fingerprint = dataset_fingerprint_for_run(processed, split)
     source_hashes = {key: fingerprint.get(key) for key in ("dataset_version", "features_hash", "units_hash", "split_hash")}
@@ -129,16 +169,18 @@ def main(argv=None):
     profile["model_selection"] = {"protocol": "three grouped folds by train instance; preprocessing fitted within fold", "folds": folds,
                                   "alpha_candidates": list(alphas), "selected_alpha": float(alpha),
                                   "selected_transform": transform, "target_candidates": ["linear", "log1p"],
-                                  "selection_metric": "bearing_balanced_MAE_divided_by_observed_lifetime; train_CV_only",
+                                  "selection_metric": "near_30m_mae_s; train_CV_only" if training_protocol else "bearing_balanced_MAE_divided_by_observed_lifetime; train_CV_only",
                                   "cv_relative_mae": {f"{t}:{a}": float(np.mean(relative_scores[(t, a)])) for t, a in candidates},
                                   "cv_mae_s": {f"{t}:{a}": float(np.mean(scores[(t, a)])) for t, a in candidates}}
     scoring_profile = {**profile, "n_nodes": model.n_readout_features}
     cal = score_readout(z_cal, rows_cal, weights, prep.time_scale_s, scoring_profile)
     train = score_readout(z_train, rows_train, weights, prep.time_scale_s, scoring_profile)
     # This holdout was inspected in earlier iterations; report as exploratory.
-    z_test, rows_test = trajectory_design(model, prep, features, units, split["test"])
-    test = score_readout(z_test, rows_test, weights, prep.time_scale_s, scoring_profile)
-    report = {"training": forecast_metrics(train), "calibration": forecast_metrics(cal), "test": forecast_metrics(test),
+    test = None
+    if not args.defer_test:
+        z_test, rows_test = trajectory_design(model, prep, features, units, split["test"])
+        test = score_readout(z_test, rows_test, weights, prep.time_scale_s, scoring_profile)
+    report = {"training": forecast_metrics(train), "calibration": forecast_metrics(cal), "test": forecast_metrics(test) if test is not None else None,
               "endpoint_definition": "last_recorded_sample", "test_used_for_selection": False,
               "evaluation_status": "exploratory_reused_holdout",
               "limitation": "Test outcomes were viewed in earlier iterations; this is not a fresh blind evaluation."}
@@ -153,6 +195,12 @@ def main(argv=None):
     atomic_write_json(rdir / "feature_schema.json", {"feature_names": prep.feature_names})
     _write_connectome_artifacts(rdir, model)
     metric = report["calibration"]["bearing_balanced"]["mae_s"]
+    if training_protocol:
+        close = cal[cal.target_rul_s.between(0, 1800, inclusive="right")].copy()
+        if set(close.unit_id) != set(split["validation"]):
+            raise ValueError("Incomplete near-event Full CNS validation cohort")
+        close["error"] = abs(close.target_rul_s - close.predicted_rul_s)
+        metric = float(close.groupby("unit_id").error.mean().mean())
     rmeta["ridge_alpha"] = float(alpha)
     for name in ("best.pt", "last.pt"):
         _save_ckpt(rdir / name, model, None, 1, 1, metric, mcfg, prep, split, "bearings", "rul", False, fingerprint, rmeta)
@@ -168,19 +216,31 @@ def main(argv=None):
     atomic_write_json(rdir / "interval_profile.json", profile)
     atomic_write_json(rdir / "forecast_evaluation.json", report)
     for name, frame in (("calibration", cal), ("test", test)):
-        frame.to_parquet(rdir / f"{name}_forecast.parquet", index=False)
+        if frame is not None:
+            frame.to_parquet(rdir / f"{name}_forecast.parquet", index=False)
     full_cfg = copy.deepcopy(cfg)
     full_cfg.update(model=mcfg, smoke=False, mode="Full", head="rul", max_windows_per_unit=None,
                     n_train_windows=len(train), n_val_windows=len(cal))
     dump_yaml(rdir / "config.yaml", full_cfg)
+    if training_protocol:
+        from pdm.training_protocol import protocol_artifact
+
+        atomic_write_json(rdir / "training_protocol.json", protocol_artifact(training_protocol, "bearings", "full_cns", args.seed))
     atomic_write_json(rdir / "experiment_snapshot.json", _experiment_snapshot(cfg, mcfg, prep, rdir, "bearings"))
     metrics = {"best_epoch": 1, "best_metric": metric, "selection_metric_name": "val MAE", "selection_metric_unit": "seconds",
                "selection_metric_label": "val MAE (seconds)", "last": {"selection_metric": metric},
                "last_train": {"selection_metric": report["training"]["bearing_balanced"]["mae_s"]},
                "n_train_windows": len(train), "n_val_windows": len(cal), "smoke": False, "mode": "Full"}
+    if training_protocol:
+        metrics.update(selection_metric_name="near_30m_mae_s", selection_metric_label="near_30m_mae_s", training_protocol=training_protocol)
+        near_train = train[train.target_rul_s.between(0, 1800, inclusive="right")]
+        metrics["last_train"]["selection_metric"] = float(abs(near_train.target_rul_s - near_train.predicted_rul_s).groupby(near_train.unit_id).mean().mean())
     atomic_write_json(rdir / "validation_metrics.json", metrics)
     # Ridge has no per-epoch gradient loss trace. Do not invent zero losses.
-    pd.DataFrame([{"epoch": 1, "train_loss": None, "val_loss": None, "train_metric": metrics["last_train"]["selection_metric"], "val_metric": metric}]).to_csv(rdir / "training_history.csv", index=False)
+    pd.DataFrame([{"epoch": 1, "train_loss": None, "val_loss": None, "train_metric": metrics["last_train"]["selection_metric"], "val_metric": metric,
+                   "elapsed_s": time.monotonic() - started, "stop_reason": "closed_form_train_cv",
+                   "negative_raw_fraction": float((cal.raw_output < 0).mean()),
+                   "zero_fraction": float(cal.predicted_rul_s.eq(0).mean())}]).to_csv(rdir / "training_history.csv", index=False)
     if stop_path().exists():
         atomic_write_json(rdir / "status.json", {"status": "cancelled", "run_id": run_id})
         raise InterruptedError("Full CNS training cancelled before publication")

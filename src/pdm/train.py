@@ -26,7 +26,8 @@ from pdm.io_util import (
     read_json,
     sha256_file,
 )
-from pdm.losses import smooth_l1, weibull_nll
+from pdm.losses import legacy_weibull_nll as weibull_nll
+from pdm.losses import smooth_l1
 from pdm.models import build_model
 from pdm.paths import dataset_runs, project_root
 from pdm.preprocessing import (
@@ -535,7 +536,21 @@ def run_training(
     readout: str | None = None,
     source_path: str | None = None,
     events_only: bool = False,
+    training_protocol: dict | None = None,
+    split_override: dict | None = None,
+    run_id_override: str | None = None,
 ) -> dict[str, Any]:
+    if resume_run_id and training_protocol is None:
+        saved = _load_saved_run_task_config(dataset_runs(dataset_id) / resume_run_id) or {}
+        training_protocol = saved.get("training_protocol")
+    if training_protocol is not None:
+        from pdm.training_engine import train_v2
+
+        return train_v2(dataset_id, architecture=architecture, training_protocol=training_protocol,
+                        seed=seed, n_nodes=n_nodes, graph_mode=graph_mode, readout=readout,
+                        source_path=source_path, split_override=split_override,
+                        resume_run_id=resume_run_id, run_id_override=run_id_override,
+                        device_pref=device_pref, log=log, should_stop=should_stop, status_cb=status_cb)
     def _log(msg: str) -> None:
         if log:
             log(msg)
@@ -1199,6 +1214,7 @@ def _save_ckpt(
     smoke,
     fingerprint=None,
     reservoir_meta=None,
+    training_state=None,
 ):
     meta = {
         "epoch": epoch,
@@ -1248,6 +1264,7 @@ def _save_ckpt(
                 mcfg, prep, split, dataset_id, head, fingerprint=fingerprint, reservoir_meta=rmeta
             ),
             "meta": meta,
+            **({"training_state": training_state} if training_state is not None else {}),
         },
         path,
     )

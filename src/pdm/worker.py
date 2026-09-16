@@ -88,7 +88,11 @@ def run_job(job: dict) -> None:
         return stop_path().exists()
 
     try:
-        if kind == "train_matrix":
+        if kind == "training_study":
+            from pdm.training_study import run_training_study
+
+            run_training_study(job)
+        elif kind == "train_matrix":
             from pdm.batch import run_batch
 
             run_batch(job)
@@ -113,7 +117,12 @@ def run_job(job: dict) -> None:
             if not (morphology_directory() / "manifest.json").is_file():
                 prepare_morphology()
             try:
-                train_full_cns([])
+                arguments = []
+                if job.get("training_protocol"):
+                    path = job_path().parent / "full_cns_protocol.json"
+                    atomic_write_json(path, job["training_protocol"])
+                    arguments = ["--training-protocol", str(path), "--defer-test"]
+                train_full_cns(arguments)
             except InterruptedError:
                 write_status({"status": "cancelled", "kind": kind, "dataset_id": "bearings"})
             else:
@@ -149,6 +158,7 @@ def run_job(job: dict) -> None:
                 source_path=job.get("source_path"),
                 seed=job.get("seed"),
                 events_only=bool(job.get("events_only", False)),
+                training_protocol=job.get("training_protocol"),
             )
         elif kind in {"evaluate", "replay_predict"}:
             from pdm.evaluate import evaluate_run

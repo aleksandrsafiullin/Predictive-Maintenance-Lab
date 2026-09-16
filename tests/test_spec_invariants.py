@@ -2169,7 +2169,8 @@ def test_evaluate_run_immutable_dirs_predictions_independent_of_hk(
         assert cfg["alert_policy"]["K"] == cfg["alert_policy"]["confirmation_count"]
         assert cfg["alert_policy"]["metrics_version"] == METRICS_VERSION
         metrics = json.loads((edir / "metrics.json").read_text(encoding="utf-8"))
-        assert metrics["primary_metric"] == "equal_weight_unit_mae"
+        assert metrics["primary_metric"] == "near_30m_mae_s"
+        assert metrics["primary_score"] == metrics["near_30m_mae_s"]
         assert "equal_weight_unit_mae" in metrics
         assert "pooled_mae" in metrics
         assert "pooled_rmse" in metrics

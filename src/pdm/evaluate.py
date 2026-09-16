@@ -866,7 +866,7 @@ _FILTER_TIME_SCALE_REPORT_KEYS = (
     "original_time_unit",
 )
 
-METRICS_VERSION = "v2_quality_forecast"
+METRICS_VERSION = "v3_training_study"
 _ALERT_DEPENDENT_PRED_COLUMNS = ("alert_status",)
 ALERT_UNIT_COLUMNS = (
     "n_alert_episodes",
@@ -1369,6 +1369,20 @@ def evaluate_run(
                            nll_unit_count=len(nll_by_unit), n_observed_events=int(units[units.unit_id.isin(unit_ids)].event_observed.sum()),
                            event_mae=summarize_rul_table(preds).get("equal_weight_unit_mae"))
             by_unit["survival_nll"] = by_unit.unit_id.map(nll_by_unit)
+        # JSON, report and comparison use the same saved-point scoring routine.
+        from pdm.benchmark import compare_evaluations
+
+        primary_name = "near_30m_mae_s" if dataset_id == "bearings" else "survival_nll" if split_name == "validation" else "prefix_end_mae"
+        try:
+            summary = compare_evaluations([{"run": meta, "config": eval_cfg, "metrics": metrics,
+                                            "predictions": pred_export}])["table"].iloc[0]
+            metrics.update(primary_metric=primary_name, primary_score=summary.primary_score,
+                           prediction_coverage=float(summary.prediction_coverage), ranking_exclusion=summary.reason)
+            metrics[primary_name] = summary.primary_score
+        except ValueError as exc:
+            metrics.update(primary_metric=primary_name, primary_score=None, prediction_coverage=0., ranking_exclusion=str(exc))
+            metrics[primary_name] = None
+        metrics = _json_safe(metrics)
         atomic_write_json(staging / "metrics.json", metrics)
         atomic_write_text(staging / "metrics_by_unit.csv", by_unit.to_csv(index=False))
         run_alert_evaluation(
@@ -1380,6 +1394,12 @@ def evaluate_run(
             pressure_limit_pa=pressure_limit_pa,
         )
         metrics = read_json(staging / "metrics.json")
+        from pdm.study_metrics import useful_warning_metrics
+
+        useful, episodes = useful_warning_metrics(pred_export, units, policy)
+        metrics.setdefault("alerts", {})["useful"] = useful
+        atomic_write_json(staging / "metrics.json", metrics)
+        atomic_write_text(staging / "useful_warning_episodes.csv", episodes.to_csv(index=False))
         publish_eval_dir(staging, dest)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
