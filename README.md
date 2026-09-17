@@ -1,19 +1,39 @@
 # Predictive Maintenance Lab
 
-Local lab for **remaining useful life (RUL)** and filter degradation forecasting on two public datasets:
+Local lab for **condition monitoring, sensor forecasting and remaining useful life (RUL)** on two public datasets:
 
 | Dataset | Task | Split (units) |
 |---|---|---|
-| **Bearings / XJTU-SY** | RUL from vibration features | 9 train / 3 validation / 3 test |
-| **Filters / HSE** | Time to 600 Pa (censored survival) | Original 40 / 10 / 50; admission retains 39 / 10 / 50 |
+| **Bearings / XJTU-SY** | Vibration condition, sensor forecast and RUL | 9 train / 3 validation / 3 test |
+| **Filters / HSE** | Differential-pressure forecast and time to laboratory 600 Pa endpoint (censored survival) | Original 40 / 10 / 50; admission retains 39 / 10 / 50 |
 
-**Models:** GRU, LSTM, Fly and matched Random reservoirs (1,000 nodes), plus Full MaleCNS for bearings (166,700 neurons; 25,582,938 directed connections). Reservoir activity comes from actual model computation.
+**Event models:** GRU, LSTM, Fly and matched Random reservoirs (1,000 nodes), plus Full MaleCNS for bearings (166,700 neurons; 25,582,938 directed connections). Reservoir activity comes from actual model computation. Fly / neural activity is an optional experimental view; condition monitoring does not require a connectome. **Sensor forecasts:** persistence, causal local trend and multi-horizon quantile boosting.
 
 English UI (Streamlit). Heavy jobs run in a background worker. Repo: https://github.com/aleksandrsafiullin/Predictive-Maintenance-Lab
 
 ---
 
-## Current results · 16 September 2026
+## Condition monitoring · 17 September 2026
+
+With a frozen monitoring bundle, **Model Report → Condition & Forecast** is the main view: observation quality, regime reference, actual sensor forecasts and deterministic condition zones. RUL and action-timing diagnostics remain available separately. Old models, snapshots and the common inference contract are preserved.
+
+- Observation quality, model applicability and missing healthy reference have separate reasons. Unavailable assessments stay visible rather than becoming normal states.
+- Fixed histories of 20/40/60 and genuinely trained variable history 20–60 use saved policies, contiguous measurements and actual elapsed duration. Full CNS retains continuous memory.
+- Sensor models predict measured future signal targets; forecast lines are not constructed from RUL or forced to cross a limit.
+- State rules include confirmation, recovery, hysteresis, cooldown and a critical latch. Acknowledgement does not resolve an alert. Action timing requires compatible units, endpoint and validated calibration.
+
+The bounded condition study executed **48 fits**, including horizon/quantile submodels, controls and retained failed-recipe experiments. Train equipment folds selected candidates; validation provided stopping/diagnostics. Four final validation/test replays were completed. Test remains an **exploratory reused holdout** and was not used for selection. Verification recorded **441 passing tests**, clean Ruff, runtime/export parity and desktop/mobile browser checks.
+
+| Selected sensor model | Test horizons | Unit-balanced test MAE | Test condition assessment available |
+|---|---|---|---:|
+| Bearings: causal local trend | 300 / 900 physical seconds | 0.5533 / 1.6200 g | 88.71% |
+| Filters: quantile boosting | 30 / 90 dataset-internal units | 3.1417 / 4.5153 Pa | 2.92% |
+
+**Laboratory only; useful maintenance timing is not established.** Filter condition is unavailable for **97.08%** of test measurements, mainly because the provisional regime reference is missing. Sensor forecast availability is a different measure: approximately 94% of eligible filter targets. Broad pointwise bands are uncalibrated; independent probability/timing calibration and verified HSE Time/RUL physical units are unavailable. Additional corrected filter feature ablations were blocked by the exhausted 48-fit budget. Faulty multiscale v1 experiments remain quarantined; new experiments use corrected v2 recipes.
+
+See the [implementation report with results, commands and limitations](reports/condition_monitoring_implementation_report.md) and [monitoring guide](docs/condition_monitoring.md). Data, checkpoints, bundles, screenshots and other generated artifacts remain local; report links into `data/`, `runs/` and `output/` require that local workspace and are not included in a Git clone.
+
+## Previous training-v2 results · 16 September 2026
 
 The completed training improvement study contains **42 real training runs**, 52 saved validation/test evaluations and four model comparisons. All nine main models cover the shared eligible prediction clock after warmup. Model selection uses validation; test is a **previously explored holdout**, reported separately.
 
@@ -36,7 +56,7 @@ What the experiments established:
 - New features and additional near-failure loss weight did not help the tested bearing GRU. Negative results are retained.
 - Bearing GRU varies substantially across seeds. Lower validation error alone does not establish useful warnings or generalization.
 
-See the [full results, controls, seed variation and acceptance evidence](reports/training_study_20260916.md) and [training protocol](docs/training_protocol.md). The completed check suite has **369 passing tests**, clean Ruff, and desktop/mobile browser verification of all nine main reports. Data, checkpoints and generated run artifacts remain local and are not included in a Git clone.
+See the [full results, controls, seed variation and acceptance evidence](reports/training_study_20260916.md) and [training protocol](docs/training_protocol.md). That study recorded **369 passing tests**, clean Ruff, and desktop/mobile browser verification of all nine main reports. Its 42 training runs and metrics describe the earlier study, separately from the condition-monitoring results above.
 
 ---
 
@@ -199,6 +219,8 @@ Optional inspect:
 
 Both recipes use all admitted windows, history 20 and seed 42 by default. Diagnostic training completes 100 epochs and retains the best validation checkpoint. Adaptive training runs 20–100 epochs, halves the learning rate after five non-improving epochs, and stops after 20 epochs without substantial improvement. CPU execution supports reproducible continuation and float64 survival calculations.
 
+These commands reproduce the earlier training-v2 recipes. For new history experiments, add `--history-mode fixed_20`, `fixed_40`, `fixed_60` or `variable_20_60`. Variable history is trained with different valid lengths, not enabled only at inference. See the [history 20–60 protocol](docs/history_20_60_protocol.md) and the condition-study workflow below for comparisons on matching clocks.
+
 LSTM uses the same flags with `--arch lstm`. The default CLI protocol remains `legacy`; specify `--protocol` to use v2. Legacy `--epochs 30 --max-windows-per-unit 0` makes all windows eligible but does not imply a full pass without replacement. `--smoke` is incompatible with v2.
 
 ### Fly connectome reservoir (experimental)
@@ -285,10 +307,43 @@ Open **http://127.0.0.1:8501** (localhost only).
 
 Pages:
 
-1. **Data Quality** — admission audit, reasons, retained censoring, signal and split counts.
-2. **Training** — full matrix, individual training, progress, stop and resume.
-3. **Model Report** — synchronized replay, actual architecture states, saved evaluations and training history. Evaluation settings remain available here.
-4. **Compare Models** — explicit validation/test artifacts, common time points, unit-balanced ranking, saved selections, CSV and JSON.
+1. **Data Quality** — admission audit, reasons, retained censoring, signal and split counts, monitoring units/endpoints and reference status.
+2. **Training** — full matrix, individual training, condition/sensor studies, progress, stop and resume.
+3. **Model Report** — Condition & Forecast for frozen bundles, with Start/Pause/Next/Reset, quality reasons, sensor forecasts and alert episodes. Event/action diagnostics, legacy model replay and evaluation settings remain available. Fly/neural details live in **Experimental / Model activity**. Without a monitoring bundle, the legacy entry point is retained.
+4. **Compare Models** — separate event, sensor and monitoring results, explicit validation/test artifacts, common time points, unit-balanced ranking, saved selections, CSV and JSON.
+
+### Condition and sensor forecast study
+
+Use admitted prepared data. These profiles run through the existing training-v2 engine and worker; the default GRU condition studies do not require a connectome or the earlier reference matrix. First inspect the plan without fitting:
+
+```bash
+.venv/bin/python -m pdm condition-study --config configs/condition_bearings.yaml --plan
+.venv/bin/python -m pdm condition-study --config configs/condition_filters.yaml --plan
+```
+
+For a **new** experiment budget, start one dataset at a time and wait for completion in Training:
+
+```bash
+.venv/bin/python -m pdm condition-study --config configs/condition_bearings.yaml --run
+# After completion, run the other profile:
+.venv/bin/python -m pdm condition-study --config configs/condition_filters.yaml --run
+# Stop/resume the corresponding study when needed:
+.venv/bin/python -m pdm stop
+.venv/bin/python -m pdm condition-study --resume-study STUDY_ID
+```
+
+Each profile plans 22 fits (44 paired), counting folds, seeds, horizons and quantiles. The recorded implementation study already consumed its 48-fit cap; starting a new study spends additional compute and is not a replay of its saved results.
+
+After a study completes, freeze the selected configuration and evaluate its bundle. Replace placeholders with the IDs printed by the commands/UI. Run evaluations sequentially; keep selection and policy fixed before test.
+
+```bash
+.venv/bin/python -m pdm freeze-monitoring-bundle --study-id STUDY_ID --candidate-id event_final
+.venv/bin/python -m pdm monitor-evaluate --bundle-id BUNDLE_ID --split validation
+# After validation replay completes:
+.venv/bin/python -m pdm monitor-evaluate --bundle-id BUNDLE_ID --split test
+```
+
+Studies live in `runs/condition_studies/<study_id>/`; immutable bundles and evaluations live in `runs/monitoring_bundles/<bundle_id>/`. Bundles bind data/model hashes, history, reference, policies, units and calibration. Replaying a frozen bundle does not refit or adapt its reference. See the [monitoring guide](docs/condition_monitoring.md), [sensor forecasting](docs/sensor_forecasting.md) and [recorded study artifact map](reports/condition_monitoring_implementation_report.md).
 
 ### Reference quality study (legacy training control)
 
@@ -356,12 +411,13 @@ cd Predictive-Maintenance-Lab
 ## Project layout
 
 ```text
-configs/          bearings.yaml, filters.yaml
+configs/          dataset and condition-study profiles
 src/pdm/          CLI, train, evaluate, Streamlit app, models, connectome, visualization
+src/pdm/monitoring/ observation quality, reference, sensor forecast, state, bundles, replay
 data/raw/         downloaded datasets (gitignored)
 data/processed/   prepared features + splits (gitignored)
 runs/             checkpoints, metrics, evaluations, traces (gitignored)
-docs/             training, quality, comparison and connectome protocols
+docs/             monitoring, sensor/history, training, quality and connectome protocols
 reports/          published study summaries
 tests/            pytest suite
 scripts/          setup.sh / run.sh (and Windows .ps1)
@@ -371,6 +427,11 @@ scripts/          setup.sh / run.sh (and Windows .ps1)
 
 ## More documentation
 
+- [Condition monitoring](docs/condition_monitoring.md) — quality, regime reference, deterministic zones, action eligibility, bundles and replay
+- [Condition monitoring implementation report · 17 September 2026](reports/condition_monitoring_implementation_report.md) — 48 fits, actual evaluations, verification and unresolved limitations
+- [Sensor forecasting](docs/sensor_forecasting.md) — real future targets, horizon masks, baselines and quantile bands
+- [History 20–60 protocol](docs/history_20_60_protocol.md) — trained variable lengths, fixed-window comparisons and continuous CNS memory
+- [Data units and endpoints](docs/data_units_and_endpoints.md) — physical vs internal time, event definitions and blocked MATLAB export
 - [Training protocol v2](docs/training_protocol.md) — 100-epoch diagnostics, adaptive stopping, causal degradation features and the bounded study worker
 - [Training improvement results · 16 September 2026](reports/training_study_20260916.md) — actual experiments, epoch attribution, seed stability and laboratory targets
 - [Completed quality study · 15 September 2026](reports/quality_study_20260915.md) — 14 real runs, four comparisons, censoring experiment and acceptance evidence
@@ -386,8 +447,9 @@ scripts/          setup.sh / run.sh (and Windows .ps1)
 ## Important caveats
 
 - `--smoke` is **not** a quality benchmark.  
+- Healthy regime references and statistical thresholds are provisional. Missing reference, uncalibrated bands and unavailable action timing must not be interpreted as safe operation.
 - Filter `Time` units are an assumed conversion (`time_to_seconds=60`); do not treat alert horizons as calibrated wall-clock minutes without verification.  
-- `filters_full_history` is disabled (uncensored MATLAB table not readable by scipy).  
+- `filters_full_history_v1` remains disabled pending verified MATLAB table export, origin matching and endpoint/unit checks; an export helper is not evidence of a completed import.
 - Connectome Explorer shows **computational** reservoir activity, not a biophysical fly-brain recording.  
 - Do not compare models across incompatible dataset versions / gap-rule versions / splits.
 
