@@ -26,6 +26,46 @@ def pid_path() -> Path:
     return worker_dir() / "worker.pid"
 
 
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_ACCESS_DENIED = 5
+
+
+def _nt_pid_exists(pid: int) -> bool:
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if handle:
+        try:
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    # Query denied still means the process exists; do not spawn a second job.
+    return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+
+
+def _pid_exists(pid: int) -> bool:
+    """True if pid is a live process. Never sends SIGKILL or TerminateProcess."""
+    if os.name == "nt":
+        try:
+            return _nt_pid_exists(pid)
+        except (OSError, ValueError, AttributeError, TypeError, OverflowError):
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError, AttributeError, TypeError, OverflowError):
+        return False
+    return True
+
+
 def read_status() -> dict:
     p = status_path()
     if not p.exists():
@@ -50,13 +90,18 @@ def worker_alive() -> bool:
     if not p.exists():
         return False
     try:
-        pid = int(p.read_text().strip())
+        pid = int(p.read_text(encoding="utf-8").strip())
     except Exception:
         return False
+    if pid <= 0:
+        return False
     try:
-        os.kill(pid, 0)
+        return bool(_pid_exists(pid))
+    except ProcessLookupError:
+        return False
+    except PermissionError:
         return True
-    except OSError:
+    except (OSError, ValueError, AttributeError, TypeError, OverflowError):
         return False
 
 
@@ -88,7 +133,17 @@ def run_job(job: dict) -> None:
         return stop_path().exists()
 
     try:
-        if kind == "training_study":
+        if kind == "condition_study":
+            from pdm.monitoring.study import run_condition_study
+
+            run_condition_study(job, should_stop=stopped, log=log)
+        elif kind == "monitor_evaluate":
+            from pdm.monitoring.evaluation import evaluate_monitoring
+
+            write_status({"kind": kind, "status": "training", "bundle_id": job["bundle_id"]})
+            result = evaluate_monitoring(job["bundle_id"], job.get("split_name", "validation"), should_stop=stopped, log=log)
+            write_status({"kind": kind, **result})
+        elif kind == "training_study":
             from pdm.training_study import run_training_study
 
             run_training_study(job)
@@ -145,6 +200,7 @@ def run_job(job: dict) -> None:
                 architecture=job.get("architecture", "gru"),
                 max_epochs=job.get("max_epochs"),
                 history_length=job.get("history_length"),
+                history_mode=job.get("history_mode"),
                 smoke=bool(job.get("smoke", False)),
                 resume_run_id=job.get("resume_run_id"),
                 device_pref=job.get("device", "auto"),

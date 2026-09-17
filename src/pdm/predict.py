@@ -35,6 +35,9 @@ def prepare_history_window(
     Does not pad with future frames. Returns ``ok=False`` with
     ``status='Collecting history'`` when the prefix is not yet a valid window.
     """
+    from pdm.history import resolved_length
+
+    history_length = resolved_length(history_rows, prep, history_length)
     n = len(history_rows)
     history = history_rows
     ds = prep.dataset_id
@@ -178,11 +181,14 @@ class Predictor:
         """Internal replay fast path: only an already encoded causal prefix."""
         if len(history_rows) != len(encoded) or not np.array_equal(history_rows.timestamp_s, encoded.timestamp_s):
             raise ValueError("Encoded prefix does not match observed timestamps")
-        ok, reason = valid_history_window(history_rows, self.history_length, dataset_id=self.prep.dataset_id,
+        from pdm.history import resolved_length
+
+        length = resolved_length(history_rows, self.prep, self.history_length)
+        ok, reason = valid_history_window(history_rows, length, dataset_id=self.prep.dataset_id,
                          gap_multiplier=self.gap_multiplier, sampling_interval_s=self.sampling_interval_s)
         if not ok:
             return {"predicted_rul_s": None, "status": "Collecting history", "valid_history_reason": reason}
-        arr = encoded.iloc[-self.history_length:][self.prep.feature_names].to_numpy(np.float32, copy=True)
+        arr = encoded.iloc[-length:][self.prep.feature_names].to_numpy(np.float32, copy=True)
         output = model_forecast(self.model, torch.from_numpy(arr).unsqueeze(0).to(self.device))
         if not np.isfinite(output["predicted_rul_s"]):
             return {"predicted_rul_s": None, "status": "No valid prediction", "valid_history_reason": ""}
@@ -262,16 +268,23 @@ def model_forecast(model, x):
     return result
 
 
-def forecast_tensors(model, x, states=None):
+def forecast_tensors(model, x, states=None, lengths=None):
     """Shared differentiable head for replay, epoch scoring and cached reservoirs."""
     from pdm.losses import weibull_median_rul
 
     raw = None
     if states is not None:
-        raw = model.forward_raw(states, x[:, -1, :])
+        last = x[:, -1, :] if lengths is None else x[torch.arange(len(x), device=x.device), lengths.to(x.device) - 1]
+        raw = model.forward_raw(states, last)
         output = model._postprocess(raw)
     else:
-        output = model(x)
+        if lengths is not None and not bool((lengths == x.shape[1]).all()) and getattr(model, "architecture", None) in {"gru", "lstm"}:
+            output = model(x, lengths=lengths)
+        elif lengths is not None and not bool((lengths == x.shape[1]).all()):
+            outputs = [model(x[i:i+1, :int(n)]) for i, n in enumerate(lengths)]
+            output = tuple(torch.cat([o[j] for o in outputs]) for j in range(2)) if isinstance(outputs[0], tuple) else torch.cat(outputs)
+        else:
+            output = model(x)
     if getattr(model, "head_type", None) == "weibull":
         lam, shape = output
         return {"point": weibull_median_rul(lam, shape, model.time_scale_s),

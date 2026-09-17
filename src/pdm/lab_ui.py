@@ -38,6 +38,9 @@ def style_figure(fig, height=500):
 
 
 def quality_overview(bundle):
+    from pdm.monitoring.ui import quality_details
+
+    quality_details(bundle["split"]["dataset_id"])
     q = bundle.get("report", {}).get("quality")
     if not q:
         st.warning("This snapshot predates Data Quality admission. Prepare a new version before training.")
@@ -286,7 +289,11 @@ def _restore_comparison(dataset_id):
 
 
 def screen_comparison(dataset_id):
+    from pdm.monitoring.ui import monitoring_comparison
+
     st.header("Compare models")
+    if monitoring_comparison(dataset_id):
+        return
     st.caption("One cohort. One measurement clock. Explicit saved evaluations.")
     saved = {str(p): read_json(p) for p in sorted((runs_root() / "comparisons").glob("*/comparison.json"), reverse=True)}
     saved = {p: d for p, d in saved.items() if d.get("dataset_id") == dataset_id}

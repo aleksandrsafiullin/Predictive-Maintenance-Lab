@@ -51,6 +51,11 @@ def admit_dataset(dataset_id, features, units, split, cfg):
         for i in np.flatnonzero(f.n_nan.fillna(1).to_numpy() > 0):
             reasons[i].add("nonfinite_raw_signal")
 
+    for name in ("horizontal_quality_diagnostics", "vertical_quality_diagnostics"):
+        if name in f:
+            for i, value in enumerate(f[name].fillna("")):
+                warnings[i].update(str(value).split(";") if value else [])
+
     # Compare measurement content, not its filename or quality annotations.
     content = [c for c in f if c not in {"relpath", "_quality_errors", "gap_before", "quality_gap_before", "delta_t_s", "delta_pressure"}]
     for _, g in f[f.duplicated(["unit_id", "timestamp_s"], keep=False)].groupby(["unit_id", "timestamp_s"], dropna=False, sort=False):
@@ -196,3 +201,30 @@ def training_admission(processed, cfg, history_length, *, events_only=False):
         us = units[units.unit_id.isin(split[part])]
         counts.append({"split": part, "units": len(us), "observed_events": int(us.event_observed.sum()), "eligible_windows": len(w)})
     return split, counts
+
+
+def fragment_diagnostics(signal, *, expected_samples=None, sensor_range=None):
+    """Audit only: clipping/stuck suspicion must not delete real fault impulses."""
+    values = np.asarray(signal, dtype=float)
+    finite = values[np.isfinite(values)]
+    reasons = []
+    if expected_samples is not None and len(values) != expected_samples:
+        reasons.append("fragment_length_mismatch")
+    nonfinite = float((~np.isfinite(values)).mean()) if values.size else 1.
+    if nonfinite:
+        reasons.append("nonfinite_raw_signal")
+    constant = bool(finite.size > 1 and np.ptp(finite) == 0)
+    if constant:
+        reasons.append("constant_fragment_check_sensor")
+    saturation = None
+    if sensor_range is not None and finite.size:
+        low, high = sensor_range
+        saturation = float(((finite <= low) | (finite >= high)).mean())
+        if saturation:
+            reasons.append("at_known_sensor_range")
+    repeated = bool(len(values) >= 16 and len(values) % 2 == 0 and np.array_equal(values[:len(values)//2], values[len(values)//2:]))
+    if repeated:
+        reasons.append("repeated_fragment_halves")
+    return {"nonfinite_fraction": nonfinite, "constant_fragment": constant,
+            "saturation_fraction": saturation, "repeated_fragment": repeated,
+            "diagnostic_reasons": ";".join(reasons), "amplitude_only_exclusion": False}

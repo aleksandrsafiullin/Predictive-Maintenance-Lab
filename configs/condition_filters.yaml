@@ -1,0 +1,8 @@
+schema_version: monitoring_config_v1
+dataset_id: filters
+mode: laboratory
+time_basis: dataset_internal
+sensor_horizons: [30, 90]
+fit_job_budget: 24
+full_cns_training_enabled: false
+operator_probabilities: disabled_until_validated

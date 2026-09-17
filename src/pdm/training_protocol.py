@@ -58,7 +58,7 @@ def validate_protocol(value, dataset_id):
         raise ValueError("Unknown sampling policy")
     if not 0 <= result.get("near_weight", 0) <= 1 or (dataset_id != "bearings" and result.get("near_weight", 0)):
         raise ValueError("Invalid near-event training weight")
-    if result.get("feature_recipe") not in {"base_v1", "degradation_v1"}:
+    if result.get("feature_recipe") not in {"base_v1", "degradation_v1", "multiscale_trend_v1", "multiscale_no_age_v1", "multiscale_trend_v2", "multiscale_no_age_v2"}:
         raise ValueError("Unknown feature recipe")
     if not 0 < result["learning_rate"] or not 1 <= result["min_epochs"] <= result["max_epochs"]:
         raise ValueError("Invalid optimization limits")

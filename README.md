@@ -42,10 +42,14 @@ See the [full results, controls, seed variation and acceptance evidence](reports
 
 ## What you need
 
-- macOS or Linux (scripts tested on **macOS arm64**, Python **3.11 or 3.12**, PyTorch with CPU or MPS)
+- macOS, Linux, or Windows 10/11
+- Python **3.11 or 3.12**
+- PyTorch: **CPU** everywhere; **CUDA** on NVIDIA Windows/Linux; **MPS** only on Apple
 - ~**8+ GB** free disk for filters + prepared data; bearings zip alone is ~**5 GB**
 - Optional: Kaggle credentials for filters download (`kagglehub`)
 - Optional: ~**1 GB** MaleCNS feather for real fly connectome (not required for GRU/LSTM)
+
+`setup.sh` / `run.sh` are tested on **macOS arm64**. The `.ps1` scripts are written for Windows PowerShell; they are not executed on the macOS development machine.
 
 Do **not** commit `data/`, `runs/`, or `.venv/`.
 
@@ -58,10 +62,15 @@ git clone https://github.com/aleksandrsafiullin/Predictive-Maintenance-Lab.git
 cd Predictive-Maintenance-Lab
 
 ./scripts/setup.sh
-# Windows (unverified on this machine): .\scripts\setup.ps1
 ```
 
-`setup.sh` creates `.venv`, installs `requirements-lock.txt`, editable package, and runs `pdm doctor`.
+```powershell
+# Windows PowerShell (Win10/11). If scripts are blocked:
+# Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+.\scripts\setup.ps1
+```
+
+`setup.sh` / `setup.ps1` create `.venv`, install `requirements-lock.txt`, the editable package, and run `pdm doctor`.
 
 Manual equivalent:
 
@@ -72,6 +81,16 @@ python3.12 -m venv .venv   # or python3.11
 .venv/bin/python -m pip install -e .
 .venv/bin/python -m pdm doctor
 ```
+
+```powershell
+py -3.12 -m venv .venv   # or py -3.11
+.\.venv\Scripts\python.exe -m pip install --upgrade pip wheel
+.\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m pdm doctor
+```
+
+On Windows, use `.\.venv\Scripts\python.exe` anywhere this README shows `.venv/bin/python`.
 
 ---
 
@@ -123,6 +142,12 @@ Required for the full reference matrix and training improvement study, including
 mkdir -p data/raw/connectome
 curl -L --fail -o data/raw/connectome/connectome-weights-male-cns-v1.0-minconf-0.5.feather \
   "https://storage.googleapis.com/flyem-male-cns/v1.0/connectome-data/flat-connectome/connectome-weights-male-cns-v1.0-minconf-0.5.feather"
+```
+
+```powershell
+New-Item -ItemType Directory -Force -Path data\raw\connectome | Out-Null
+Invoke-WebRequest -Uri "https://storage.googleapis.com/flyem-male-cns/v1.0/connectome-data/flat-connectome/connectome-weights-male-cns-v1.0-minconf-0.5.feather" `
+  -OutFile data\raw\connectome\connectome-weights-male-cns-v1.0-minconf-0.5.feather
 ```
 
 Details: [docs/fly_connectome.md](docs/fly_connectome.md). Without the file, connectome runs use a **synthetic** graph labeled as non-biological.
@@ -245,6 +270,13 @@ Artifacts: `runs/.../evaluations/<eval_id>/{metrics.json,predictions.csv,alerts.
 
 ```bash
 ./scripts/run.sh
+```
+
+```powershell
+.\scripts\run.ps1
+```
+
+```bash
 # or
 .venv/bin/python -m pdm app
 ```

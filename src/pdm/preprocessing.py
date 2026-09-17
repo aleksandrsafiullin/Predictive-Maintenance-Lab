@@ -85,6 +85,7 @@ class Preprocessor:
     gap_multiplier: float | None = None
     sampling_interval_s: float | None = None
     feature_recipe: str = "base_v1"
+    history_policy: dict | None = None
 
     def transform_frame(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.attrs.get("scaled") is True:
@@ -116,6 +117,7 @@ class Preprocessor:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            **({"history_policy": self.history_policy} if self.history_policy else {}),
             "feature_names": self.feature_names,
             "log1p_features": self.log1p_features,
             "scaler_mean": self.scaler_mean,
@@ -152,6 +154,7 @@ class Preprocessor:
             gap_multiplier=_optional_positive_float(d.get("gap_multiplier")),
             sampling_interval_s=_optional_positive_float(d.get("sampling_interval_s")),
             feature_recipe=recipe,
+            history_policy=d.get("history_policy"),
         )
 
 
@@ -324,6 +327,12 @@ def raw_to_feature_frame(
     else:
         raise ValueError(f"Unknown dataset_id for feature pipeline: {dataset_id}")
 
+    if feature_recipe in {"multiscale_trend_v1", "multiscale_no_age_v1", "multiscale_trend_v2", "multiscale_no_age_v2"}:
+        if dataset_id == "filters":
+            feat_df["regime_unknown"] = (~feat_df.dust.astype(str).isin(categorical_maps.get("dust", []))).astype(float)
+        else:
+            known = categorical_maps.get("regime_id", [])
+            feat_df["regime_unknown"] = (~feat_df.regime_id.astype(str).isin(known)).astype(float) if "regime_id" in feat_df else 1.
     apply_log1p_columns(feat_df, log1p_cols)
     names = names + recipe_names(dataset_id, feature_recipe)
     out = feat_df.copy()
@@ -352,6 +361,8 @@ def fit_preprocessor(
     if dataset_id == "bearings":
         log1p_cols = list(cfg.get("features", {}).get("log1p_features") or [])
         cats: dict[str, list[str]] = {}
+        if feature_recipe in {"multiscale_trend_v1", "multiscale_no_age_v1", "multiscale_trend_v2", "multiscale_no_age_v2"}:
+            cats["regime_id"] = sorted(train_feat.regime_id.astype(str).unique().tolist())
         _, names, log1p_cols = bearings_feature_frame(features, log1p_cols)
     else:
         log1p_cols = []
@@ -369,6 +380,8 @@ def fit_preprocessor(
         feature_recipe=feature_recipe,
     )
     names = names + recipe_names(dataset_id, feature_recipe)
+    if feature_recipe in {"multiscale_no_age_v1", "multiscale_no_age_v2"}:
+        names = [n for n in names if n != "operating_age_s"]
     train_view = feat_df[feat_df["unit_id"].isin(train_ids)].copy()
     arr = train_view[names].to_numpy(dtype=np.float64)
     arr = np.where(np.isfinite(arr), arr, np.nan)

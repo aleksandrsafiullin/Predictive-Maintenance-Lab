@@ -1,0 +1,9 @@
+schema_version: monitoring_config_v1
+dataset_id: bearings
+mode: laboratory
+sensor_horizons: [300, 900]
+fit_job_budget: 24
+# 22 fits: 10 event fits + 12 disclosed horizon/quantile fits.
+# Paired filters profile also uses 22; combined planned fitting budget is 44 <= 48.
+full_cns_training_enabled: false
+operator_probabilities: disabled_until_validated

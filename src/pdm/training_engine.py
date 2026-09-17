@@ -30,7 +30,7 @@ from pdm.training_protocol import (
     weighted_batch_loss,
     window_weights,
 )
-from pdm.windows import build_windows, filter_gap_params
+from pdm.windows import filter_gap_params
 
 
 def rng_state():
@@ -81,7 +81,9 @@ def state_cache(model, dataset, prep, binding, root, should_stop=None):
         if should_stop and should_stop():
             raise InterruptedError("Stopped while computing reservoir cache")
         x = batch["x"].to(next(model.parameters()).device)
-        result.append(checked(model.forward_states(x)[:, -1, :], "reservoir state", batch).cpu())
+        states = model.forward_states(x)
+        last = states[torch.arange(len(x), device=x.device), batch["lengths"].to(x.device) - 1]
+        result.append(checked(last, "reservoir state", batch).cpu())
     values = torch.cat(result).contiguous()
     np.save(path, values.numpy())
     atomic_write_json(manifest, {"identity": identity, "sha256": sha256_file(path)})
@@ -91,7 +93,7 @@ def state_cache(model, dataset, prep, binding, root, should_stop=None):
 def batch_forecast(model, batch, cache, device):
     x = batch["x"].to(device)
     states = cache[batch["window_index"]].to(device) if cache is not None else None
-    output = forecast_tensors(model, x, states)
+    output = forecast_tensors(model, x, states, lengths=batch.get("lengths"))
     if output["raw"] is not None:
         checked(output["raw"], "raw readout output", batch)
     checked(output["point"], "forecast", batch)
@@ -151,7 +153,8 @@ def score_model(model, loader, dataset_id, device, cache=None):
 def train_v2(dataset_id, *, architecture, training_protocol, seed=None, n_nodes=None,
              graph_mode=None, readout=None, source_path=None, split_override=None,
              resume_run_id=None, run_id_override=None, device_pref="cpu", log=None,
-             should_stop=None, status_cb=None):
+             should_stop=None, status_cb=None, history_mode=None, history_length=None):
+    from pdm.history import history_policy, history_windows
     from pdm.train import (
         UnitBalancedSampler,
         UnitWindowDataset,
@@ -173,6 +176,9 @@ def train_v2(dataset_id, *, architecture, training_protocol, seed=None, n_nodes=
         saved_root = dataset_runs(dataset_id) / resume_run_id
         saved = load_yaml(saved_root / "config.yaml")
         saved_model = saved["model"]
+        history_mode = history_mode or saved_model.get("history_mode")
+        if saved_model.get("history_mode"):
+            history_length = history_length or saved_model.get("history_length")
         if saved_model.get("reservoir", {}).get("graph_scope") == "whole_classified_cns":
             raise ValueError("Resume Full CNS through its study; window training cannot continue a continuous model")
         if architecture != saved_model["architecture"]:
@@ -187,11 +193,14 @@ def train_v2(dataset_id, *, architecture, training_protocol, seed=None, n_nodes=
             saved_split = read_json(saved_root / "split.json")
             if saved_split.get("protocol") == "training_v2_internal_cv":
                 split_override = {k: saved_split[k] for k in ("train", "validation")}
+    memory = history_policy(history_mode or f"fixed_{history_length or 20}")
     cfg = load_dataset_config(dataset_id)
     mcfg = model_defaults(cfg)
     mcfg.update(architecture=architecture, seed=int(seed if seed is not None else 42),
-                history_length=20, max_epochs=config["max_epochs"], learning_rate=config["learning_rate"],
+                history_length=memory["max"], max_epochs=config["max_epochs"], learning_rate=config["learning_rate"],
                 batch_size=32, dropout=.1, weight_decay=.0001, gradient_clip_norm=1.)
+    if history_mode or history_length:
+        mcfg["history_mode"] = memory["mode"]
     cfg.update(feature_recipe=config["feature_recipe"], training_protocol=config)
     cfg["model"] = mcfg
     res = mcfg.setdefault("reservoir", {})
@@ -201,7 +210,7 @@ def train_v2(dataset_id, *, architecture, training_protocol, seed=None, n_nodes=
         res["source_path"] = source_path
     processed = load_processed(dataset_id)
     features, units = processed["features"], processed["units"]
-    split, counts = training_admission(processed, cfg, 20)
+    split, counts = training_admission(processed, cfg, memory["min"])
     if split_override:
         fit, hold = set(split_override["train"]), set(split_override["validation"])
         if not fit or not hold or fit & hold or not fit | hold <= set(split["train"]):
@@ -214,15 +223,22 @@ def train_v2(dataset_id, *, architecture, training_protocol, seed=None, n_nodes=
     if dataset_id == "filters":
         k, interval = filter_gap_params(cfg)
         gap_kw = {"gap_multiplier": k, "sampling_interval_s": interval}
-    windows = build_windows(features, units, 20, dataset_id, **gap_kw)
-    train_windows = windows[windows.unit_id.isin(split["train"])]
+    windows = history_windows(features, units, dataset_id, memory, **gap_kw)
+    train_windows = history_windows(features, units, dataset_id, memory, training=True, **gap_kw)
+    train_windows = train_windows[train_windows.unit_id.isin(split["train"])]
     val_windows = windows[windows.unit_id.isin(split["validation"])]
+    if config.get("selection_history_min"):
+        common = history_windows(features, units, dataset_id, history_policy("fixed_60"), **gap_kw)
+        keys = set(zip(common.unit_id, common.end_index, strict=True))
+        val_windows = val_windows.loc[[key in keys for key in zip(val_windows.unit_id, val_windows.end_index, strict=True)]]
     if train_windows.empty or val_windows.empty:
         raise ValueError("Empty admitted training or validation windows")
     missing_validation = set(split["validation"]) - set(val_windows.unit_id)
     if missing_validation:
         raise ValueError(f"Validation objects have no eligible windows: {sorted(missing_validation)}")
     prep, encoded = fit_preprocessor(dataset_id, features, units, split, cfg)
+    if history_mode or history_length:
+        prep.history_policy = memory
     head = "rul" if dataset_id == "bearings" else "weibull"
     # This study's reproducibility contract is CPU. MPS cannot evaluate float64
     # likelihoods; moving a resumed run across devices changes its trajectory.

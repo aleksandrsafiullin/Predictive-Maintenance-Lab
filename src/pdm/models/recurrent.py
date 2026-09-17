@@ -29,7 +29,9 @@ class RecurrentEncoder(nn.Module):
             bidirectional=False,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, lengths=None) -> torch.Tensor:
+        if lengths is not None:
+            x = nn.utils.rnn.pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         out, h = self.rnn(x)
         if self.architecture == "lstm":
             h = h[0]
@@ -94,8 +96,8 @@ class PDMNet(nn.Module):
         else:
             raise ValueError("head must be rul or weibull")
 
-    def forward(self, x: torch.Tensor):
-        h = self.encoder(x)
+    def forward(self, x: torch.Tensor, lengths=None):
+        h = self.encoder(x, lengths)
         if self.head_type == "rul":
             return self.head(h)
         return self.head(h)

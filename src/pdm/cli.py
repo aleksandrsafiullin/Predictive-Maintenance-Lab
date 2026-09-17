@@ -134,11 +134,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_tr.add_argument("--epochs", type=int, default=None)
     p_tr.add_argument("--protocol", choices=["legacy", "adaptive", "diagnostic"], default="legacy")
-    p_tr.add_argument("--feature-recipe", choices=["base_v1", "degradation_v1"], default="base_v1")
+    p_tr.add_argument("--feature-recipe", choices=["base_v1", "degradation_v1", "multiscale_trend_v2", "multiscale_no_age_v2"], default="base_v1")
     p_tr.add_argument("--sampling", choices=["unit_replacement", "full_pass"], default="unit_replacement")
     p_tr.add_argument("--learning-rate", type=float, default=.001)
     p_tr.add_argument("--near-weight", type=float, default=0.)
     p_tr.add_argument("--history", type=int, default=None)
+    p_tr.add_argument("--history-mode", choices=["fixed_20", "fixed_40", "fixed_60", "variable_20_60"], default=None)
     p_tr.add_argument("--smoke", action="store_true")
     p_tr.add_argument("--resume", default=None)
     p_tr.add_argument("--device", default="auto")
@@ -222,7 +223,46 @@ def main(argv: list[str] | None = None) -> int:
     compare.add_argument("--dataset", required=True, choices=["bearings", "filters"])
     compare.add_argument("--evaluation", action="append", required=True, metavar="RUN_ID:EVAL_ID")
 
+    condition = sub.add_parser("condition-study")
+    condition.add_argument("--config", default="configs/condition_bearings.yaml")
+    condition.add_argument("--plan", action="store_true")
+    condition.add_argument("--run", action="store_true")
+    condition.add_argument("--resume-study")
+    condition.add_argument("--max-new-fits", type=int, default=24)
+    freeze = sub.add_parser("freeze-monitoring-bundle")
+    freeze.add_argument("--study-id", required=True)
+    freeze.add_argument("--candidate-id", default="event_final")
+    monitor = sub.add_parser("monitor-evaluate")
+    monitor.add_argument("--bundle-id", required=True)
+    monitor.add_argument("--split", choices=["validation", "test"], default="validation")
+    export_check = sub.add_parser("validate-filter-export")
+    export_check.add_argument("directory")
+
     args = parser.parse_args(argv)
+    if args.cmd == "condition-study":
+        from pdm.monitoring.study import plan_study
+
+        if args.plan or not (args.run or args.resume_study):
+            print(json.dumps(plan_study(args.config), indent=2))
+        else:
+            proc = spawn_worker({"kind": "condition_study", "config": args.config,
+                                 "study_id": args.resume_study, "max_new_fits": args.max_new_fits})
+            print(json.dumps({"worker_pid": proc.pid, "status": "started"}))
+        return 0
+    if args.cmd == "freeze-monitoring-bundle":
+        from pdm.monitoring.study import freeze_study
+
+        print(json.dumps(freeze_study(args.study_id, args.candidate_id), indent=2))
+        return 0
+    if args.cmd == "monitor-evaluate":
+        proc = spawn_worker({"kind": "monitor_evaluate", "bundle_id": args.bundle_id, "split_name": args.split})
+        print(json.dumps({"worker_pid": proc.pid, "status": "started"}))
+        return 0
+    if args.cmd == "validate-filter-export":
+        from pdm.monitoring.filter_export import validate_filter_export
+
+        print(json.dumps(validate_filter_export(args.directory), indent=2))
+        return 0
     if args.cmd == "training-study":
         proc = spawn_worker({"kind": "training_study", "study_id": args.resume_study})
         print(json.dumps({"worker_pid": proc.pid, "status": "started"}))
@@ -281,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
             architecture=args.arch,
             max_epochs=args.epochs,
             history_length=args.history,
+            history_mode=args.history_mode,
             smoke=args.smoke,
             resume_run_id=args.resume,
             device_pref=args.device,

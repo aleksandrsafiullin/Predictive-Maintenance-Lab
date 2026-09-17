@@ -6,11 +6,11 @@ import pandas as pd
 from torch.utils.data import DataLoader
 
 from pdm.forecasting import encode_rul_targets
+from pdm.history import history_policy, history_windows
 from pdm.io_util import atomic_write_json, dump_yaml, load_yaml
 from pdm.paths import runs_root
 from pdm.preprocessing import fit_preprocessor
 from pdm.training_protocol import window_weights
-from pdm.windows import build_windows
 
 ALPHAS = (0.0001, 0.001, 0.01, 0.1, 1.0)
 
@@ -61,13 +61,15 @@ def fit_window_readout(*, model, prep, cfg, processed, split, config, train_ds, 
     candidates = [(transform, alpha) for transform in ("linear", "log1p") for alpha in ALPHAS]
     folds = training_folds("bearings", processed["units"], split["train"])
     records = []
-    windows = build_windows(processed["features"], processed["units"], 20, "bearings")
+    memory = prep.history_policy or history_policy("fixed_20")
+    windows = history_windows(processed["features"], processed["units"], "bearings", memory)
+    training_windows = history_windows(processed["features"], processed["units"], "bearings", memory, training=True)
     for number, fold in enumerate(folds):
         if should_stop and should_stop():
             emit("cancelled", stop_reason="user_stop")
             return {"status": "cancelled", "run_id": root.name, "dir": str(root)}
         fold_prep, encoded = fit_preprocessor("bearings", processed["features"], processed["units"], {**split, **fold}, cfg)
-        datasets = [UnitWindowDataset(encoded[encoded.unit_id.isin(fold[part])], windows[windows.unit_id.isin(fold[part])],
+        datasets = [UnitWindowDataset(encoded[encoded.unit_id.isin(fold[part])], (training_windows if part == "train" else windows).loc[lambda w: w.unit_id.isin(fold[part])],
                                      prep.feature_names, "bearings", fold_prep.time_scale_s) for part in ("train", "validation")]
         cached = [state_cache(model, ds, fold_prep, binding, runs_root() / "fixed_reservoir_cache", should_stop) for ds in datasets]
         z = design(datasets[0], cached[0])

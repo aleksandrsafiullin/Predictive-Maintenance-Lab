@@ -188,8 +188,18 @@ def main() -> None:
         matrix_controls()
         screen_train(dataset_id)
     elif page == "Model Report":
-        view = st.radio("Report view", ["Model replay", "Evaluation settings"], horizontal=True, key="report_view", on_change=_pause_neural_runs)
-        if view == "Evaluation settings":
+        from pdm.monitoring.ui import bundles_for
+
+        # Legacy installations without a monitoring bundle keep their original
+        # report entry point; published bundles make condition monitoring primary.
+        available_runs = {r["run_id"] for r in list_runs(dataset_id)}
+        default_view = 0 if any(b["event_model_run_id"] in available_runs for b in bundles_for(dataset_id)) else 1
+        view = st.radio("Report view", ["Condition & Forecast", "Model replay", "Evaluation settings", "Experimental / Model activity"], index=default_view, horizontal=True, key="report_view", on_change=_pause_neural_runs)
+        if view == "Condition & Forecast":
+            from pdm.monitoring.ui import screen_condition_report
+
+            screen_condition_report(dataset_id)
+        elif view == "Evaluation settings":
             screen_replay(dataset_id)
         else:
             screen_explorer(dataset_id)
@@ -489,6 +499,9 @@ def _windows_used_caption(rec: dict) -> str:
 
 def screen_train(dataset_id: str) -> None:
     st.header(f"Training — {LABELS[dataset_id]}")
+    from pdm.monitoring.ui import training_controls
+
+    training_controls(dataset_id)
     if not processed_ready(dataset_id):
         st.warning("Prepare data on the Data screen first. There is no dummy training path.")
         return
@@ -555,7 +568,7 @@ def screen_train(dataset_id: str) -> None:
     near_weight = 0.0
     if use_v2:
         st.caption("Training v2 uses CPU for reproducible continuation and float64 survival calculations.")
-        feature_recipe = st.selectbox("Feature recipe", ["base_v1", "degradation_v1"])
+        feature_recipe = st.selectbox("Feature recipe", ["base_v1", "degradation_v1", "multiscale_trend_v2", "multiscale_no_age_v2"])
         sampling = st.selectbox("Window sampling", ["unit_replacement", "full_pass"])
         if dataset_id == "bearings" and sampling == "full_pass":
             near_weight = .5 if st.checkbox("Give half the training weight to the final 30 minutes") else 0.0
@@ -585,9 +598,13 @@ def screen_train(dataset_id: str) -> None:
         st.session_state[cap_key] = next_cap
     st.session_state[prev_key] = smoke
     epochs = st.number_input("Epochs", min_value=1, max_value=200, value=100 if use_v2 else int(mcfg["max_epochs"]), disabled=use_v2)
-    hist = st.number_input(
-        "History length (measurements)", min_value=2, max_value=128, value=int(mcfg["history_length"]), disabled=use_v2
-    )
+    history_mode = None
+    if use_v2:
+        history_mode = st.selectbox("Model history policy", ["fixed_20", "fixed_40", "fixed_60", "variable_20_60"])
+        hist = 60 if history_mode == "variable_20_60" else int(history_mode.split("_")[1])
+        st.caption("Variable history is trained with actual 20–60 lengths; padding is masked.")
+    else:
+        hist = st.number_input("History length (measurements)", min_value=2, max_value=128, value=int(mcfg["history_length"]))
     st.caption(phys.get("note") or f"{hist} measurements of history")
     max_w = st.number_input("Max windows / unit (0 = all)", min_value=0, key=cap_key, disabled=use_v2)
     history_ready = True
@@ -622,6 +639,7 @@ def screen_train(dataset_id: str) -> None:
                 "readout": ("ridge" if dataset_id == "bearings" else "gradient") if is_reservoir(arch) else None,
                 "max_epochs": int(epochs),
                 "history_length": int(hist),
+                "history_mode": history_mode,
                 "smoke": bool(smoke),
                 "resume_run_id": resume_id,
                 "max_windows_per_unit": int(max_w),

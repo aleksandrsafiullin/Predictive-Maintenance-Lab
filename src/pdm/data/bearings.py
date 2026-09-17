@@ -258,6 +258,11 @@ def extract_bearings_features(
         for ch_i, ch_name in enumerate(("horizontal", "vertical")):
             if error:
                 continue
+            from pdm.data.quality import fragment_diagnostics
+
+            diagnostic = fragment_diagnostics(arr[:, ch_i], expected_samples=expected,
+                sensor_range=cfg.get("sensor_ranges", {}).get(ch_name))
+            rec[ch_name + "_quality_diagnostics"] = diagnostic["diagnostic_reasons"]
             td = time_domain_features(arr[:, ch_i], prefix=ch_name)
             rec.update(td)
             bands = spectral_band_energy(arr[:, ch_i], fs=fs, edges_hz=band_edges, prefix=ch_name)

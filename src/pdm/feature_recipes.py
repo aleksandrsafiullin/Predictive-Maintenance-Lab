@@ -8,6 +8,10 @@ from pdm.training_protocol import fingerprint
 
 
 def recipe_names(dataset_id, recipe):
+    from pdm.multiscale_features import NEW_RECIPES, names
+
+    if recipe in NEW_RECIPES:
+        return names(dataset_id)
     if recipe == "base_v1":
         return []
     if recipe != "degradation_v1":
@@ -21,6 +25,10 @@ def recipe_names(dataset_id, recipe):
 
 
 def recipe_metadata(recipe):
+    if recipe in {"multiscale_trend_v1", "multiscale_no_age_v1", "multiscale_trend_v2", "multiscale_no_age_v2"}:
+        return {"name": recipe, "version": 2 if recipe.endswith("v2") else 1, "windows": [5, 20, 40, 60],
+                "slope_time": "actual_timestamp", "unavailable_window": "partial_with_availability",
+                "units": "raw_signal_per_saved_time_basis", "age": "no_age" not in recipe}
     return {"name": recipe, "version": 1, "slope_windows": [5, 20],
             "initial_reference_measurements": 5, "pressure_limit_pa": 600.0,
             "dust_integral": "left endpoint, internal seconds, reset at gap"}
@@ -42,6 +50,10 @@ def _slope(t, y, size):
 
 
 def enrich_features(frame, dataset_id, recipe):
+    if recipe in {"multiscale_trend_v1", "multiscale_no_age_v1", "multiscale_trend_v2", "multiscale_no_age_v2"}:
+        from pdm.multiscale_features import enrich
+
+        return enrich(frame, dataset_id, version=2 if recipe.endswith("v2") else 1)
     if recipe == "base_v1":
         return frame.copy()
     names = recipe_names(dataset_id, recipe)

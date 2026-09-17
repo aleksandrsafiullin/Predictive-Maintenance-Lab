@@ -1,4 +1,4 @@
-# Unverified on this machine (developed/tested on macOS).
+# Written for Windows PowerShell (Win10/11). Full Windows execution is not done on the macOS development machine.
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 if (-not (Test-Path .\.venv\Scripts\python.exe)) {

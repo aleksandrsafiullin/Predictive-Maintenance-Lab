@@ -145,9 +145,10 @@ class UnitBalancedSampler(Sampler[int]):
 
 
 def _collate(batch):
-    x = torch.stack([b["x"] for b in batch], dim=0)
+    x = torch.nn.utils.rnn.pad_sequence([b["x"] for b in batch], batch_first=True)
     return {
         "x": x,
+        "lengths": torch.tensor([len(b["x"]) for b in batch], dtype=torch.long),
         "target": torch.stack([b["target"] for b in batch]),
         "duration": torch.stack([b["duration"] for b in batch]),
         "event": torch.stack([b["event"] for b in batch]),
@@ -537,6 +538,7 @@ def run_training(
     source_path: str | None = None,
     events_only: bool = False,
     training_protocol: dict | None = None,
+    history_mode: str | None = None,
     split_override: dict | None = None,
     run_id_override: str | None = None,
 ) -> dict[str, Any]:
@@ -547,6 +549,7 @@ def run_training(
         from pdm.training_engine import train_v2
 
         return train_v2(dataset_id, architecture=architecture, training_protocol=training_protocol,
+                        history_mode=history_mode, history_length=history_length,
                         seed=seed, n_nodes=n_nodes, graph_mode=graph_mode, readout=readout,
                         source_path=source_path, split_override=split_override,
                         resume_run_id=resume_run_id, run_id_override=run_id_override,
@@ -1231,6 +1234,7 @@ def _save_ckpt(
         "input_size": len(prep.feature_names),
         "feature_names": list(prep.feature_names),
         "dataset_id": dataset_id,
+        **({"history_policy": prep.history_policy} if prep.history_policy else {}),
     }
     if is_reservoir(mcfg["architecture"]):
         rmeta = reservoir_meta or _reservoir_meta_from_model(model, mcfg)

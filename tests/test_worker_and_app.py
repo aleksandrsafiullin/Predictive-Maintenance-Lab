@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import types
+
+import pytest
 
 from pdm.evaluate import METRICS_VERSION
-from pdm.worker import read_status, worker_alive
+from pdm.worker import worker_alive
 
 
 def _dataset_radio(at):
@@ -24,11 +28,161 @@ def _screen_radio(at):
     raise AssertionError("Screen radio not found")
 
 
-def test_worker_not_alive_without_pid():
+class _CFunc:
+    """Callable with restype/argtypes so tests can stand in for ctypes prototypes."""
+
+    def __init__(self, fn):
+        self._fn = fn
+        self.restype = None
+        self.argtypes = None
+
+    def __call__(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+def _isolate_pid_file(monkeypatch, tmp_path, contents: str | None = None):
+    import pdm.worker as worker
+
+    pid_file = tmp_path / "worker.pid"
+    if contents is not None:
+        pid_file.write_text(contents, encoding="utf-8")
+    monkeypatch.setattr(worker, "pid_path", lambda: pid_file)
+    return pid_file
+
+
+def _mock_nt_kernel32(monkeypatch, *, handle, last_error: int = 87):
+    import ctypes
+
+    import pdm.worker as worker
+
+    closed: list[object] = []
+
+    def open_process(access, inherit, pid):
+        assert access == 0x1000
+        assert inherit in {False, 0}
+        assert pid == 4321
+        return handle
+
+    def close_handle(h):
+        closed.append(h)
+        return 1
+
+    kernel32 = types.SimpleNamespace(
+        OpenProcess=_CFunc(open_process),
+        CloseHandle=_CFunc(close_handle),
+    )
+
+    def win_dll(name, use_last_error=False):
+        assert name == "kernel32"
+        assert use_last_error is True
+        return kernel32
+
+    monkeypatch.setattr(worker.os, "name", "nt")
+    monkeypatch.setattr(ctypes, "WinDLL", win_dll, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: last_error, raising=False)
+    return closed
+
+
+def test_worker_not_alive_without_pid(monkeypatch, tmp_path):
     # No duplicate training on UI rerun: spawn_worker refuses if worker_alive().
-    assert worker_alive() in {True, False}
-    st = read_status()
-    assert "status" in st
+    _isolate_pid_file(monkeypatch, tmp_path)
+    assert worker_alive() is False
+
+
+@pytest.mark.parametrize("contents", ["", "nope", "0", "-1"])
+def test_worker_alive_invalid_pid_file(monkeypatch, tmp_path, contents):
+    _isolate_pid_file(monkeypatch, tmp_path, contents)
+    assert worker_alive() is False
+
+
+def test_worker_alive_posix_current_pid(monkeypatch, tmp_path):
+    import pdm.worker as worker
+
+    monkeypatch.setattr(worker.os, "name", "posix")
+    monkeypatch.setattr(worker.os, "kill", lambda _pid, _sig: None)
+    _isolate_pid_file(monkeypatch, tmp_path, str(os.getpid()))
+    assert worker_alive() is True
+
+
+def test_worker_alive_posix_dead_pid(monkeypatch, tmp_path):
+    import pdm.worker as worker
+
+    monkeypatch.setattr(worker.os, "name", "posix")
+    _isolate_pid_file(monkeypatch, tmp_path, "99999999")
+
+    def _missing(_pid, _sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(worker.os, "kill", _missing)
+    assert worker_alive() is False
+
+
+def test_worker_alive_windows_openprocess_handle(monkeypatch, tmp_path):
+    closed = _mock_nt_kernel32(monkeypatch, handle=4242)
+    _isolate_pid_file(monkeypatch, tmp_path, "4321")
+    assert worker_alive() is True
+    assert closed == [4242]
+
+
+def test_worker_alive_windows_openprocess_zero(monkeypatch, tmp_path):
+    closed = _mock_nt_kernel32(monkeypatch, handle=0, last_error=87)
+    _isolate_pid_file(monkeypatch, tmp_path, "4321")
+    assert worker_alive() is False
+    assert closed == []
+
+
+def test_worker_alive_windows_access_denied_is_alive(monkeypatch, tmp_path):
+    closed = _mock_nt_kernel32(monkeypatch, handle=0, last_error=5)
+    _isolate_pid_file(monkeypatch, tmp_path, "4321")
+    assert worker_alive() is True
+    assert closed == []
+
+
+def test_worker_alive_windows_ctypes_error_returns_false(monkeypatch, tmp_path):
+    import ctypes
+
+    import pdm.worker as worker
+
+    def _boom(name, use_last_error=False):
+        raise AttributeError("kernel32")
+
+    monkeypatch.setattr(worker.os, "name", "nt")
+    monkeypatch.setattr(ctypes, "WinDLL", _boom, raising=False)
+    _isolate_pid_file(monkeypatch, tmp_path, "4321")
+    assert worker_alive() is False
+
+
+def test_worker_alive_windows_overflow_pid_returns_false(monkeypatch, tmp_path):
+    import ctypes
+
+    import pdm.worker as worker
+
+    def open_process(access, inherit, pid):
+        raise OverflowError("int too long")
+
+    kernel32 = types.SimpleNamespace(
+        OpenProcess=_CFunc(open_process),
+        CloseHandle=_CFunc(lambda _h: 1),
+    )
+    monkeypatch.setattr(worker.os, "name", "nt")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_a, **_k: kernel32, raising=False)
+    _isolate_pid_file(monkeypatch, tmp_path, str((1 << 32) + 1))
+    assert worker_alive() is False
+
+
+def test_worker_alive_kill_valueerror_returns_bool(monkeypatch, tmp_path):
+    import pdm.worker as worker
+
+    monkeypatch.setattr(worker.os, "name", "posix")
+    _isolate_pid_file(monkeypatch, tmp_path, str(os.getpid()))
+
+    def _windows_like(_pid, _sig):
+        raise ValueError("unsupported signal: 0")
+
+    monkeypatch.setattr(worker.os, "kill", _windows_like)
+    result = worker_alive()
+    assert result is False
+    assert isinstance(result, bool)
 
 
 def test_app_starts_without_data():
