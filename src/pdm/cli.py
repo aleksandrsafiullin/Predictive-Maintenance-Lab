@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from pdm import __version__
 from pdm.device import resolve_device
@@ -237,6 +238,11 @@ def main(argv: list[str] | None = None) -> int:
     monitor.add_argument("--split", choices=["validation", "test"], default="validation")
     export_check = sub.add_parser("validate-filter-export")
     export_check.add_argument("directory")
+    zones = sub.add_parser("zones-train", help="Train the green/yellow/red bearing health-zone model")
+    zones.add_argument("--dataset", default="bearings", choices=["bearings"])
+    zones.add_argument("--epochs", type=int, default=None)
+    zones.add_argument("--seed", type=int, default=None)
+    zones.add_argument("--red-minutes", type=float, default=None)
 
     args = parser.parse_args(argv)
     if args.cmd == "condition-study":
@@ -282,6 +288,16 @@ def main(argv: list[str] | None = None) -> int:
         result = compare_evaluations([load_evaluation(args.dataset, *pair.split(":", 1)) for pair in args.evaluation])
         print(result["table"].to_string(index=False))
         print(save_comparison(result))
+        return 0
+    if args.cmd == "zones-train":
+        from pdm.health_zones import summary_json, train_zone_model
+        from pdm.io_util import read_json
+
+        overrides = {k: v for k, v in {"epochs": args.epochs, "seed": args.seed,
+                                       "red_minutes": args.red_minutes}.items() if v is not None}
+        rec = train_zone_model(args.dataset, overrides, log=lambda m: print(m, flush=True))
+        print(json.dumps(rec, indent=2))
+        print(summary_json(read_json(Path(rec["dir"]) / "metrics.json")))
         return 0
     if args.cmd == "doctor":
         doctor()
