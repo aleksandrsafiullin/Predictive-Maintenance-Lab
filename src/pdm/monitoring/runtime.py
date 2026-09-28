@@ -5,6 +5,7 @@ import numpy as np
 
 from pdm.history import contiguous_history, resolved_length
 from pdm.monitoring.contracts import SCHEMA, observed_prefix
+from pdm.monitoring.filter_zones import assess_filter_sensor_zone
 from pdm.monitoring.normality import assess_normality
 from pdm.monitoring.quality import assess_quality
 from pdm.monitoring.signal_forecast import forecast_signal, median_crossing
@@ -80,6 +81,8 @@ def monitoring_step(frame, *, profile, reference, quality_policy, state_policy,
     if normality["model_applicability"] != "in_domain":
         event.update(status="unavailable", point=None, interval=None, probabilities=None, distribution=None, reason="unsupported_operating_regime")
     condition = {"quality": quality, "normality": normality, "measurement": last, "segment_id": segment_id}
+    filter_zone = (assess_filter_sensor_zone(prefix, quality=quality, normality=normality)
+                   if profile["dataset_id"] == "filters" else None)
     state = update_state(previous, condition, event, profile, state_policy, as_of)
     used = 0
     mode = "not_configured"
@@ -99,6 +102,7 @@ def monitoring_step(frame, *, profile, reference, quality_policy, state_policy,
               "history": {"mode": mode, "available_measurements": quality["available_measurements"],
                           "used_measurements": used, "duration": duration, "feature_context_duration": quality["duration"]},
               "condition": {**state["last_result"], "reference_status": reference["status"]},
+              "sensor_zone": filter_zone,
               "event_forecast": event, "signal_forecasts": signals, "normality": normality,
               "crossing": median_crossing(signals, state_policy.get("critical_limit")),
               "evaluation_status": "laboratory_research", "quality": quality}

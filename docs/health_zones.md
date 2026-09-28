@@ -1,86 +1,73 @@
 # Bearing health zones (green / yellow / red)
 
-**Model Report → Health zones** shows, minute by minute, whether a bearing is
+**Model Report → Health zones** groups measured bearing vibration into three
+signal states. The zones describe the current sensor condition; they do not
+represent time remaining to an event.
 
-| Zone | Meaning | Suggested action |
+| Zone | Sensor definition | Suggested action |
 |---|---|---|
-| 🟢 green | Normal | Continue operation and monitoring |
-| 🟡 yellow | Something is not right — degradation detected | Plan inspection, prepare a replacement |
-| 🔴 red | Urgent condition review: the rule crossed its calibrated RMS threshold, or the GRU predicted the retrospective red class | Inspect promptly and follow site procedures for an operating decision |
+| 🟢 green | No persistent rise above the bearing's initial vibration baseline | Continue normal operation and monitoring |
+| 🟡 yellow | Max-axis RMS exceeds `max(baseline median + 3 × baseline SD, 1.25 × baseline median)` for 5 consecutive measurements | Degradation signal detected; plan inspection |
+| 🔴 red | Max-axis RMS reaches `red_ratio` × the bearing's initial baseline median (default 2.0) | Urgent condition review; follow site procedures |
 
-Each displayed zone uses only measurements up to that moment. Red is a condition warning,
-not a 30-minute failure forecast. Laboratory result on the 15 XJTU-SY bearings; not an
-equipment-protection system.
+The baseline is the median of the first five measurements. Yellow is confirmed
+at the fifth consecutive high measurement; the label begins at that confirmation
+measurement. Red can be reached directly from green if the measured RMS crosses
+its higher threshold. Zones follow the signal back down as vibration falls below
+their thresholds. Runtime rule predictions and reference labels use current and
+past measurements only.
 
-## Zone definitions (retrospective reference)
+## What the zones mean
 
-Implemented in `src/pdm/health_zones.py` (`label_unit`).
+Implemented in `src/pdm/health_zones.py` (`label_unit`, `rule_baseline`). The
+signal bands are **weak reference labels derived from vibration**, not
+independent expert diagnoses or confirmed failure classes. The 2.0 red ratio is
+a provisional signal threshold in configuration (`red_ratio`), chosen as a
+simple separation from the 1.25 yellow ratio and requiring domain validation.
+It is not fitted to time-to-record-end labels. The green/yellow and yellow/red
+transitions therefore have separate, inspectable sensor thresholds.
 
-- **Red:** the last 30 minutes before the recording ends. This is a retrospective
-  evaluation label, not a deadline inferred by the live warning. The final recorded
-  sample is an experiment-end proxy, not a confirmed industrial failure timestamp.
-- **Yellow:** from degradation onset — the first run of 5 consecutive measurements where
-  max(horizontal, vertical) RMS stays above both 1.25 × and median + 3σ of the bearing's
-  own first 5 minutes (its healthy baseline). A pure 3σ rule was rejected: very steady
-  bearings (e.g. Bearing3_1) would turn yellow after a 5 % drift, ~40 hours before recording end.
-  A 5-minute baseline is used because Bearing3_5 starts degrading around minute 6.
-- **Green:** everything before onset.
+The experimental GRU learns to reproduce these same sensor-derived labels from
+past vibration features. Its probabilities are uncalibrated. Agreement with the
+weak labels measures consistency with the stated signal rules, not independent
+health-class accuracy. The 15 run-to-failure XJTU-SY bearings are too few to
+establish industrial operating limits or a protection function.
 
-## Zone engines
+## Separate prognosis and evaluation timing
 
-- **Calibrated rule (recommended):** yellow once an onset is confirmed (latched); red once
-  RMS ≥ *ratio* × baseline (latched). The ratio (3.25 on the current split) is fitted on
-  train bearings only. This threshold is not calibrated to a fixed time horizon.
-- **GRU classifier (experimental):** 32-unit GRU over the last 20 measurements. Inputs are
-  causal log ratios of all 20 vibration features to the bearing's own baseline, operating
-  condition, and trend features (running maximum, 10-minute slope, onset flag, time since
-  onset). Train-only scaler, class- and bearing-balanced loss, 5 epochs with the checkpoint
-  selected on validation, hysteresis smoothing (escalate after 2, de-escalate after 10
-  consistent predictions). Its red class is trained against the retrospective reference,
-  but does not provide a calibrated remaining-time estimate.
+RUL in this dataset is measured to the final recorded sample, which is an
+experiment endpoint proxy and not a confirmed industrial failure timestamp.
+First-red timing summaries describe the elapsed gap from a red signal state to
+that recorded endpoint. They do not assess whether a signal state was early or
+late, and they do not assign zones, select the red threshold, or train the
+classifier. A red zone is a present condition warning.
 
-## How the design was chosen
+## Versioned label artifact
 
-Leave-bearings-out cross-validation over the 12 train + validation bearings (4 folds; each
-holds out one bearing per operating condition). Test bearings were not used for any choice.
-Score: bearing-balanced mean of per-zone recall.
+Export the sensor-derived reference table for every bearing with:
 
-| Variant | CV score |
-|---|---:|
-| Calibrated rule (ratio fitted per fold) | **0.78–0.79** |
-| Rule: ratio OR fast 10-minute rise | 0.78 |
-| Rule-yellow + logistic-regression red | 0.78 |
-| GRU, trend features, 5 epochs | 0.75 (±0.02 across seeds) |
-| GRU, base features, 5 epochs | 0.73 |
-| GRU trained 20–40 epochs | 0.64–0.70 (overfits) |
-| Rule-yellow + gradient-boosted red | 0.73 |
+```bash
+.venv/bin/python -m pdm zones-labels
+```
 
-With 12 bearings, no learned model beat the calibrated rule, so the rule is the default engine.
+The command writes `labels.csv` and `manifest.json` under
+`runs/_zones/bearings/label_artifacts/<artifact_id>/`. The table contains unit,
+split, timestamp, measured max-axis RMS, baseline RMS, numeric zone, and zone
+name. It contains no RUL or endpoint column. The manifest records the processed
+dataset version and fingerprint, label-policy thresholds, label-file SHA-256,
+and weak-label provenance. Its artifact ID changes when the dataset fingerprint
+or zone policy changes.
 
-## Results of the shipped run
-
-`pdm zones-train` (seed 42). Score as above; "first red" = minutes before recording end.
-
-| Split | Engine | Score | First red per bearing |
-|---|---|---:|---|
-| Validation | Calibrated rule | 0.660 | 1_4: 0 · 2_4: 10 · 3_4: 69 |
-| Validation | GRU | 0.640 | 1_4: never · 2_4: 7 · 3_4: 68 |
-| Test | Calibrated rule | 0.707 | 1_5: 12 · 2_5: 146 · 3_5: 101 |
-| Test | GRU | 0.701 | 1_5: 4 · 2_5: 95 · 3_5: 99 |
-
-Neither engine shows red or yellow while the retrospective reference is green in this run.
-The warning lead time varies substantially:
-
-- **Abrupt changes near recording end** (Bearing1_4, 2_4, 1_5): vibration barely changes
-  until the last minutes, so red is late or absent.
-- **Gradual changes** (2_5, 3_4, 3_5): red appears 68–146 minutes before recording end.
-  These values do not validate a 30-minute forecast or an automatic replacement decision.
+For the current prepared snapshot, the reference labels total 7,456 green,
+570 yellow, and 1,190 red measurements across 15 bearings. Four bearings
+(`Bearing1_4`, `Bearing2_4`, `Bearing3_3`, `Bearing3_5`) have no yellow
+measurements under this policy. This is a class-coverage limitation in the
+sensor-derived labels, not evidence that those bearings lack gradual degradation.
 
 ## Commands
 
 ```bash
-.venv/bin/python -m pdm zones-train            # train + evaluate, ~15 seconds on CPU
-.venv/bin/python -m pdm zones-train --red-minutes 60 --seed 7
+.venv/bin/python -m pdm zones-train
 ```
 
 Runs are saved under `runs/_zones/bearings/<run_id>/` (`model.pt`, `meta.json`,

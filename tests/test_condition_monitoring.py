@@ -239,7 +239,7 @@ def test_action_timing_rejects_internal_units_wide_interval_and_ood():
     assert action_timing(event, p, policy, "in_domain", "valid")["reason"] == "forecast_uncertainty_too_high"
 
 
-def test_risk_path_can_escalate_without_anomaly():
+def test_forecast_urgency_is_separate_from_measured_condition_zone():
     p = dataset_profile("bearings")
     policy = default_policy(p)
     policy.update(warning_enter=5., warning_exit=2., prognostic_methods=["empirical"], max_interval_width=300)
@@ -252,7 +252,84 @@ def test_risk_path_can_escalate_without_anomaly():
                 "quality": {"data_quality_status": "valid", "last_measurement_at": t, "reason_codes": []},
                 "normality": {"model_applicability": "in_domain", "score": 0., "reason_codes": []}}
         state = update_state(state, cond, event, p, policy, t)
-    assert state["display_zone"] == "red"
+    assert state["display_zone"] == "green"
+    assert state["last_result"]["forecast_urgency"] == "urgent"
+    assert not state["critical_latch"]
+    assert any(ep["kind"] == "prognostic" and ep["level"] == "red" for ep in state["episodes"])
+
+
+def test_eligible_low_forecast_is_reported_as_low_urgency():
+    profile = dataset_profile("bearings")
+    policy = default_policy(profile)
+    policy.update(warning_enter=5., warning_exit=2., prognostic_methods=["empirical"], max_interval_width=300)
+    policy["action_profile"].update(required_action_lead_time=500, safety_buffer=100,
+                                    verification_status="laboratory_definition")
+    event = {"event_definition_id": profile["event_definition_id"], "time_basis": profile["time_basis"],
+             "timing_validated": True, "validated_horizon": 900,
+             "interval": {"lower": 400, "upper": 600, "method": "empirical"}, "risk_band": "low"}
+    state = initial_state("low-risk", "bundle")
+    for t in (60., 120., 180.):
+        cond = {"segment_id": "s", "measurement": {},
+                "quality": {"data_quality_status": "valid", "last_measurement_at": t, "reason_codes": []},
+                "normality": {"model_applicability": "in_domain", "score": 0., "reason_codes": []}}
+        state = update_state(state, cond, event, profile, policy, t)
+    assert state["last_result"]["forecast_urgency"] == "low"
+    assert state["forecast_active_episode"] is None
+
+    for invalid_band in (None, 1, {"band": "urgent"}):
+        event["risk_band"] = invalid_band
+        state = initial_state("missing-risk-band", "bundle")
+        for t in (60., 120., 180.):
+            cond = {"segment_id": "s", "measurement": {},
+                    "quality": {"data_quality_status": "valid", "last_measurement_at": t, "reason_codes": []},
+                    "normality": {"model_applicability": "in_domain", "score": 0., "reason_codes": []}}
+            state = update_state(state, cond, event, profile, policy, t)
+        assert state["last_result"]["forecast_urgency"] == "unavailable"
+        assert isinstance(state["last_result"]["forecast_urgency"], str)
+
+
+def test_forecast_recovery_requires_consecutive_eligible_observations():
+    profile = dataset_profile("bearings")
+    policy = default_policy(profile)
+    policy.update(warning_enter=5., warning_exit=2., confirmation_count=3,
+                  confirmation_duration=120., recovery_count=2, recovery_duration=60.,
+                  prognostic_methods=["empirical"], max_interval_width=300.)
+    policy["action_profile"].update(required_action_lead_time=500., safety_buffer=100.,
+                                    verification_status="laboratory_definition")
+    event = {"event_definition_id": profile["event_definition_id"], "time_basis": profile["time_basis"],
+             "timing_validated": True, "validated_horizon": 900.,
+             "interval": {"lower": 400., "upper": 600., "method": "empirical"}, "risk_band": "urgent"}
+    state = initial_state("a", "b")
+
+    def condition(t, applicability="in_domain"):
+        return {"segment_id": "s", "measurement": {},
+                "quality": {"data_quality_status": "valid", "last_measurement_at": t, "reason_codes": []},
+                "normality": {"model_applicability": applicability, "score": 0., "reason_codes": []}}
+
+    for t in (60., 120., 180.):
+        state = update_state(state, condition(t), event, profile, policy, t)
+    assert state["forecast_active_episode"] is not None
+
+    event["risk_band"] = "low"
+    state = update_state(state, condition(240.), event, profile, policy, 240.)
+    assert state["forecast_recovery_count"] == 1
+    event["timing_validated"] = False
+    state = update_state(state, condition(300.), event, profile, policy, 300.)
+    assert state["forecast_recovery_count"] == 0
+    assert state["forecast_recovery_since"] is None
+    event["timing_validated"] = True
+    state = update_state(state, condition(360.), event, profile, policy, 360.)
+    assert state["forecast_recovery_count"] == 1
+    state = update_state(state, condition(420., "out_of_domain"), event, profile, policy, 420.)
+    assert state["forecast_recovery_count"] == 0
+    assert state["forecast_recovery_since"] is None
+
+    state = update_state(state, condition(480.), event, profile, policy, 480.)
+    assert state["forecast_active_episode"] is not None
+    assert state["forecast_recovery_count"] == 1
+    state = update_state(state, condition(540.), event, profile, policy, 540.)
+    assert state["forecast_active_episode"] is None
+    assert state["episodes"][-1]["resolved_at"] == 540.
 
 
 def test_no_predictions_do_not_win_and_censored_diagnostic_is_unknown():

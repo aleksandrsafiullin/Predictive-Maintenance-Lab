@@ -95,6 +95,22 @@ def score_episodes(episodes, units, *, minimum_lead=None, maximum_horizon=None):
         "unmatched_events": n_events - len(matched), "timeliness_status": "not_configured" if minimum_lead is None else "configured"}
 
 
+def _sensor_zone_columns(sensor_zone):
+    zone = sensor_zone or {}
+    policy = zone.get("policy") or {}
+    return {
+        "sensor_zone": zone.get("zone"),
+        "sensor_zone_color": zone.get("display_zone"),
+        "sensor_zone_status": zone.get("status"),
+        "sensor_zone_reason": zone.get("reason"),
+        "sensor_zone_evidence": ";".join(zone.get("supplementary_evidence") or []),
+        "sensor_pressure_pa": zone.get("pressure_pa"),
+        "sensor_flow_rate_recorded": zone.get("flow_rate"),
+        "sensor_dust_feed_recorded": zone.get("dust_feed"),
+        "sensor_zone_policy_version": policy.get("version", zone.get("schema_version")),
+    }
+
+
 @threadpool_limits.wrap(limits=1)
 def evaluate_monitoring(bundle_id, split_name, *, should_stop=None, log=None):
     torch.set_num_threads(1)
@@ -124,6 +140,7 @@ def evaluate_monitoring(bundle_id, split_name, *, should_stop=None, log=None):
         local = []
         for result in rows:
             condition = result["condition"]
+            sensor_zone_columns = _sensor_zone_columns(result.get("sensor_zone"))
             flat = {"unit_id": uid, "as_of": result["as_of"], "bundle_id": bundle_id,
                     "segment_id": result["segment_id"], "time_basis": result["time_basis"],
                     "health_state": condition["health_state"], "display_zone": condition["display_zone"],
@@ -132,7 +149,8 @@ def evaluate_monitoring(bundle_id, split_name, *, should_stop=None, log=None):
                     "reason_codes": ";".join(condition["reason_codes"]), "alert_episode_id": condition["alert_episode_id"],
                     "used_measurements": result["history"]["used_measurements"],
                     "available_measurements": result["history"]["available_measurements"],
-                    "history_duration": result["history"]["duration"], "planning_margin": condition["timing"]["planning_margin"]}
+                    "history_duration": result["history"]["duration"], "planning_margin": condition["timing"]["planning_margin"],
+                    **sensor_zone_columns}
             records.append(flat)
             local.append(flat)
             forecasts.extend(result["signal_forecasts"])

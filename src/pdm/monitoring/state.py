@@ -13,11 +13,16 @@ def initial_state(unit_id, bundle_id):
             "display_zone": "gray", "critical_latch": False, "active_episode": None,
             "episodes": [], "warning_count": 0, "warning_since": None,
             "recovery_count": 0, "recovery_since": None, "limit_since": None,
+            "forecast_warning_count": 0, "forecast_warning_since": None,
+            "forecast_recovery_count": 0, "forecast_recovery_since": None,
+            "forecast_active_episode": None,
             "last_resolved_at": None, "reason_codes": [], "last_result": None}
 
 
 def _reset_confirmation(state):
-    state.update(warning_count=0, warning_since=None, recovery_count=0, recovery_since=None, limit_since=None)
+    state.update(warning_count=0, warning_since=None, recovery_count=0, recovery_since=None, limit_since=None,
+                 forecast_warning_count=0, forecast_warning_since=None,
+                 forecast_recovery_count=0, forecast_recovery_since=None)
 
 
 def update_state(previous, condition, event, profile, policy, as_of):
@@ -55,20 +60,35 @@ def update_state(previous, condition, event, profile, policy, as_of):
     score = normality["score"]
     enter, leave = policy["warning_enter"], policy["warning_exit"]
     eligible = timing["prognostic_escalation_eligible"]
+    raw_risk_band = event.get("risk_band")
+    risk_band = raw_risk_band if isinstance(raw_risk_band, str) and raw_risk_band in {"low", "elevated", "urgent"} else "unavailable"
     # A validated forecast can warn before any anomaly; readiness alone is insufficient.
-    risk_warning = eligible and event.get("risk_band") in {"elevated", "urgent"}
+    risk_warning = eligible and risk_band in {"elevated", "urgent"}
+    # Reflect only an upstream risk band on an eligible event; do not infer one from pressure or RUL.
+    forecast_urgency = (risk_band if eligible
+                        else "not_validated" if event.get("status") == "limited" else "unavailable")
     deviation = good and score is not None and enter is not None and score >= enter
     if fresh:
-        if deviation or risk_warning:
+        if deviation:
             if state["warning_since"] is None:
                 state["warning_since"] = measured_at
             state["warning_count"] += 1
             state.update(recovery_count=0, recovery_since=None)
         else:
             state.update(warning_count=0, warning_since=None)
+        if risk_warning:
+            if state["forecast_warning_since"] is None:
+                state["forecast_warning_since"] = measured_at
+            state["forecast_warning_count"] += 1
+            state.update(forecast_recovery_count=0, forecast_recovery_since=None)
+        else:
+            state.update(forecast_warning_count=0, forecast_warning_since=None)
     confirmed = (state["warning_count"] >= policy["confirmation_count"] and
                  state["warning_since"] is not None and measured_at - state["warning_since"] >= policy["confirmation_duration"])
-    recovering = good and normality["model_applicability"] == "in_domain" and score is not None and leave is not None and score < leave and not risk_warning and not hard
+    forecast_confirmed = (state["forecast_warning_count"] >= policy["confirmation_count"] and
+                          state["forecast_warning_since"] is not None and
+                          measured_at - state["forecast_warning_since"] >= policy["confirmation_duration"])
+    recovering = good and normality["model_applicability"] == "in_domain" and score is not None and leave is not None and score < leave and not hard
     if fresh:
         if recovering:
             if state["recovery_since"] is None:
@@ -96,16 +116,12 @@ def update_state(previous, condition, event, profile, policy, as_of):
         health, zone, action = "unknown", "gray", "assessment_unavailable"
         if enter is None:
             reasons.append("warning_threshold_not_fitted")
-    elif confirmed and eligible and timing["planning_margin"] <= 0:
-        health, zone, action = "critical", "red", "urgent_review"
-        reasons.append("eligible_prognostic_urgency")
-        state["critical_latch"] = True
     elif state["critical_latch"]:
         health, zone, action = "critical", "red", "configured_limit"
         reasons.append("open_critical_alert_awaiting_recovery")
     elif confirmed or active:
-        health, zone, action = "deviation", "yellow", "prepare_inspection" if risk_warning else "inspect_recent_deviation"
-        reasons.append("persistent_regime_adjusted_deviation" if not risk_warning else "eligible_forecast_risk")
+        health, zone, action = "deviation", "yellow", "inspect_recent_deviation"
+        reasons.append("persistent_regime_adjusted_deviation")
     else:
         health, zone, action = "normal", "green", "continue_monitoring"
         reasons.append("no_persistent_deviations_detected")
@@ -117,9 +133,9 @@ def update_state(previous, condition, event, profile, policy, as_of):
                       "first_deviation_at": state["warning_since"] or as_of, "confirmed_at": float(as_of),
                       "level": zone, "reason": reasons[-1], "escalated_at": float(as_of) if zone == "red" else None,
                       "resolved_at": None, "acknowledged": False,
-                      "kind": "prognostic" if risk_warning else "diagnostic",
-                      "event_definition_id": event.get("event_definition_id") if risk_warning else None,
-                      "issued_horizon": event.get("validated_horizon") if risk_warning else None,
+                      "kind": "diagnostic",
+                      "event_definition_id": None,
+                      "issued_horizon": None,
                       "policy_version": policy["version"], "updates": []}
             state["episodes"].append(active)
             state["active_episode"] = active
@@ -129,10 +145,50 @@ def update_state(previous, condition, event, profile, policy, as_of):
     if state["active_episode"]:
         eid = state["active_episode"]["episode_id"]
         state["episodes"] = [state["active_episode"] if e["episode_id"] == eid else e for e in state["episodes"]]
+    forecast_active = state["forecast_active_episode"]
+    if forecast_active and fresh:
+        forecast_recovering = (eligible and not risk_warning and good
+                               and normality["model_applicability"] == "in_domain")
+        if forecast_recovering:
+            if state["forecast_recovery_since"] is None:
+                state["forecast_recovery_since"] = measured_at
+            state["forecast_recovery_count"] += 1
+        else:
+            state.update(forecast_recovery_count=0, forecast_recovery_since=None)
+    forecast_recovered = (state["forecast_recovery_count"] >= policy["recovery_count"] and
+                          state["forecast_recovery_since"] is not None and
+                          measured_at - state["forecast_recovery_since"] >= policy["recovery_duration"])
+    if forecast_recovered and forecast_active:
+        forecast_active["resolved_at"] = float(as_of)
+        forecast_active["updates"].append({"as_of": float(as_of), "type": "resolved_by_forecast_recovery"})
+        state["episodes"] = [forecast_active if e["episode_id"] == forecast_active["episode_id"] else e
+                              for e in state["episodes"]]
+        state.update(forecast_active_episode=None, forecast_recovery_count=0,
+                     forecast_recovery_since=None)
+        forecast_active = None
+    if forecast_confirmed:
+        forecast_urgency = ("urgent" if timing["planning_margin"] is not None and timing["planning_margin"] <= 0
+                            else risk_band)
+        if not forecast_active:
+            eid = fingerprint([state["bundle_id"], state["unit_id"], "forecast", as_of])[:20]
+            forecast_active = {"episode_id": eid, "unit_id": state["unit_id"], "bundle_id": state["bundle_id"],
+                "first_deviation_at": state["forecast_warning_since"], "confirmed_at": float(as_of),
+                "level": "yellow", "reason": "validated_forecast_risk", "escalated_at": None,
+                "resolved_at": None, "acknowledged": False, "kind": "prognostic",
+                "event_definition_id": event.get("event_definition_id"),
+                "issued_horizon": event.get("validated_horizon"), "policy_version": policy["version"],
+                "updates": []}
+            state["episodes"].append(forecast_active)
+            state["forecast_active_episode"] = forecast_active
+        if forecast_urgency == "urgent" and forecast_active["level"] != "red":
+            forecast_active.update(level="red", escalated_at=float(as_of))
+            forecast_active["updates"].append({"as_of": float(as_of), "type": "forecast_urgency_escalation"})
+        state["episodes"] = [forecast_active if e["episode_id"] == forecast_active["episode_id"] else e
+                              for e in state["episodes"]]
     state.update(health_state=health, display_zone=zone, reason_codes=reasons)
     state["last_result"] = {"health_state": health, "display_zone": zone, "reason_codes": reasons,
         "event_status": "observed_limit" if hard else "not_observed", "urgency": action,
         "action_code": action, "action_text": ACTIONS[action], "timing": timing,
-        "critical_latch": state["critical_latch"],
+        "critical_latch": state["critical_latch"], "forecast_urgency": forecast_urgency,
         "alert_episode_id": state["active_episode"]["episode_id"] if state["active_episode"] else None}
     return state

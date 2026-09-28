@@ -242,9 +242,29 @@ def main(argv: list[str] | None = None) -> int:
     zones.add_argument("--dataset", default="bearings", choices=["bearings"])
     zones.add_argument("--epochs", type=int, default=None)
     zones.add_argument("--seed", type=int, default=None)
-    zones.add_argument("--red-minutes", type=float, default=None)
-
+    zones.add_argument("--red-ratio", type=float, default=None,
+                       help="provisional red RMS threshold as a multiple of baseline (default: 2.0)")
+    zone_labels = sub.add_parser("zones-labels", help="Export versioned sensor-derived zone labels")
+    zone_labels.add_argument("--dataset", default="bearings", choices=["bearings", "filters"])
+    zone_labels.add_argument("--red-ratio", type=float, default=None,
+                             help="bearing labels only: provisional red RMS threshold as a multiple of baseline (default: 2.0)")
+    zone_labels.add_argument("--yellow-limit-pa", type=float, default=None,
+                             help="filter labels only: provisional absolute pressure warning boundary (default: 300 Pa)")
     args = parser.parse_args(argv)
+    if args.cmd == "zones-labels":
+        if args.dataset == "filters" and args.red_ratio is not None:
+            parser.error("--red-ratio applies only to bearing zone labels")
+        if args.dataset == "bearings" and args.yellow_limit_pa is not None:
+            parser.error("--yellow-limit-pa applies only to filter zone labels")
+    if args.cmd == "zones-train" and args.red_ratio is not None or (
+        args.cmd == "zones-labels" and args.dataset == "bearings" and args.red_ratio is not None
+    ):
+        from pdm.health_zones import DEFAULT_CONFIG, validate_zone_thresholds
+
+        try:
+            validate_zone_thresholds({**DEFAULT_CONFIG, "red_ratio": args.red_ratio})
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.cmd == "condition-study":
         from pdm.monitoring.study import plan_study
 
@@ -294,10 +314,23 @@ def main(argv: list[str] | None = None) -> int:
         from pdm.io_util import read_json
 
         overrides = {k: v for k, v in {"epochs": args.epochs, "seed": args.seed,
-                                       "red_minutes": args.red_minutes}.items() if v is not None}
+                                       "red_ratio": args.red_ratio}.items() if v is not None}
         rec = train_zone_model(args.dataset, overrides, log=lambda m: print(m, flush=True))
         print(json.dumps(rec, indent=2))
         print(summary_json(read_json(Path(rec["dir"]) / "metrics.json")))
+        return 0
+    if args.cmd == "zones-labels":
+        if args.dataset == "filters":
+            from pdm.monitoring.filter_zones import export_filter_zone_labels
+
+            policy = ({"yellow_limit_pa": args.yellow_limit_pa}
+                      if args.yellow_limit_pa is not None else None)
+            print(json.dumps(export_filter_zone_labels(policy=policy), indent=2))
+        else:
+            from pdm.health_zones import export_zone_labels
+
+            overrides = {k: v for k, v in {"red_ratio": args.red_ratio}.items() if v is not None}
+            print(json.dumps(export_zone_labels(args.dataset, overrides), indent=2))
         return 0
     if args.cmd == "doctor":
         doctor()
