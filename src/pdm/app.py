@@ -194,8 +194,12 @@ def main() -> None:
         # report entry point; published bundles make condition monitoring primary.
         available_runs = {r["run_id"] for r in list_runs(dataset_id)}
         default_view = 0 if any(b["event_model_run_id"] in available_runs for b in bundles_for(dataset_id)) else 1
-        view = st.radio("Report view", ["Condition & Forecast", "Model replay", "Evaluation settings", "Experimental / Model activity"], index=default_view, horizontal=True, key="report_view", on_change=_pause_neural_runs)
-        if view == "Condition & Forecast":
+        view = st.radio("Report view", ["Condition & Forecast", "Model replay", "Evaluation settings", "Experimental / Model activity", "Health zones"], index=default_view, horizontal=True, key="report_view", on_change=_pause_neural_runs)
+        if view == "Health zones":
+            from pdm.health_zones_ui import screen_health_zones
+
+            screen_health_zones(dataset_id)
+        elif view == "Condition & Forecast":
             from pdm.monitoring.ui import screen_condition_report
 
             screen_condition_report(dataset_id)
