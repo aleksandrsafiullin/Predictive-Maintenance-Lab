@@ -21,7 +21,7 @@ from pdm.health_zones import (
 
 ZONE_COLORS = {"green": "#2ecc71", "yellow": "#f1c40f", "red": "#e74c3c"}
 METHODS = {
-    "Calibrated rule (recommended)": "rule",
+    "Signal rule (recommended)": "rule",
     "GRU classifier (experimental)": "gru",
 }
 
@@ -86,7 +86,7 @@ def _status_card(zone: int, now_min: float, recording_end_min: float | None, rat
                 <div style="font-size:1.9rem;font-weight:700;color:{color}">{name.upper()} · {escape(ZONE_LABELS[name])}</div>
                 <div style="font-size:1rem">{escape(ZONE_ACTIONS[name])}</div>
                 <div style="opacity:.8;font-size:.85rem;margin-top:.35rem">
-                  Vibration RMS: {ratio:.2f}× this bearing's healthy baseline</div>
+                  Vibration RMS: {ratio:.2f}× this bearing's initial baseline</div>
                 {extra}{truth}
               </div>
             </div>""",
@@ -109,7 +109,7 @@ def _chart(pred: pd.DataFrame, index: int, show_truth: bool) -> go.Figure:
         for x0, x1, z in _segments(t_min, pred["true_zone"].to_numpy()):
             fig.add_shape(type="rect", x0=x0, x1=x1, y0=ymax * 0.97, y1=ymax, fillcolor=ZONE_COLORS[ZONES[z]],
                           line_width=0, opacity=0.9)
-        fig.add_annotation(x=t_min[0], y=ymax, text="Retrospective reference zones", showarrow=False, xanchor="left",
+        fig.add_annotation(x=t_min[0], y=ymax, text="Sensor-rule reference zones", showarrow=False, xanchor="left",
                            yanchor="bottom", font=dict(size=11))
     fig.add_vline(x=t_min[index], line=dict(color="#5bd3f5", width=2, dash="dash"))
     fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), template="plotly_dark",
@@ -122,7 +122,7 @@ def _chart(pred: pd.DataFrame, index: int, show_truth: bool) -> go.Figure:
 def _metrics_table(metrics: dict) -> pd.DataFrame:
     rows = []
     for split in ("validation", "test"):
-        for key, label in (("rule_baseline", "Calibrated rule"), ("model", "GRU classifier")):
+        for key, label in (("rule_baseline", "Signal rule"), ("model", "GRU classifier")):
             m = metrics.get(split, {}).get(key)
             if not m:
                 continue
@@ -130,15 +130,15 @@ def _metrics_table(metrics: dict) -> pd.DataFrame:
             for uid, u in m["per_unit"].items():
                 rows.append({
                     "split": split, "method": label, "bearing": uid, "recorded duration, min": round(u["life_min"]),
-                    "first red, min before recording end": u["first_red_min_before_failure"],
-                    "min green while reference red": u["minutes_green_while_red"],
-                    "reference-zone accuracy": round(u["balanced_accuracy"], 3),
+                    "first red, min before recording end": u["first_red_min_before_endpoint"],
+                    "min green while signal reference red": u["minutes_green_while_red"],
+                    "signal-rule agreement": round(u["balanced_accuracy"], 3),
                 })
             rows.append({
                 "split": split, "method": label, "bearing": "ALL (bearing-balanced)", "recorded duration, min": None,
-                "first red, min before recording end": m["median_first_red_min_before_failure"],
-                "min green while reference red": None,
-                "reference-zone accuracy": round(m["unit_balanced_balanced_accuracy"], 3),
+                "first red, min before recording end": m["median_first_red_min_before_endpoint"],
+                "min green while signal reference red": None,
+                "signal-rule agreement": round(m["unit_balanced_balanced_accuracy"], 3),
                 "recall green/yellow/red": "/".join("—" if rec[z] is None else f"{rec[z]:.2f}" for z in ZONES),
             })
     return pd.DataFrame(rows)
@@ -154,14 +154,27 @@ def screen_health_zones(dataset_id: str) -> None:
         st.info("No health-zone model yet. Train one from a terminal:")
         st.code(".venv/bin/python -m pdm zones-train", language="bash")
         return
-    st.caption("🟢 Normal · 🟡 Degradation detected · 🔴 Urgent condition review: inspect promptly. "
-               "Red is not a 30-minute failure forecast. The recording end is an experiment-end proxy, "
-               "not a confirmed industrial failure time. Laboratory result on 15 bearings; "
-               "not an equipment-protection system.")
+    legacy = [run for run in runs if not run.get("compatible", False)]
+    runs = [run for run in runs if run.get("compatible", False)]
+    if legacy and not runs:
+        st.warning("Saved zone runs use an obsolete or incomplete zone definition and cannot be replayed under the current sensor-zone policy. Retrain the zone model:")
+        st.code(".venv/bin/python -m pdm zones-train", language="bash")
+        return
+    if legacy:
+        st.info(f"{len(legacy)} older or incomplete zone run(s) are hidden. Retrain them with the current sensor-zone policy to replay.")
+    st.caption("🟢 Baseline-level vibration · 🟡 Persistent rise above baseline · 🔴 High vibration RMS. "
+               "Zones are sensor states separate from remaining life. Signal thresholds are provisional; "
+               "the experiment-end proxy is used only for retrospective timing summaries. "
+               "Weak labels and 15 bearings do not establish industrial operating limits.")
     c1, c2, c3 = st.columns([2, 2, 2])
     run = c1.selectbox("Zone model", [r["run_id"] for r in runs], key="hz_run")
     rdir = next(r["dir"] for r in runs if r["run_id"] == run)
-    _, _, meta, metrics = _run(rdir)
+    try:
+        _, _, meta, metrics = _run(rdir)
+    except Exception as exc:
+        st.error(f"This zone run is incomplete or damaged and cannot be loaded. Retrain it with the current sensor-zone policy: {exc}")
+        st.code(".venv/bin/python -m pdm zones-train", language="bash")
+        return
     version = meta.get("dataset_version")
     if not version:
         st.error("This zone run has no saved dataset version. Retrain it before replaying predictions.")
@@ -203,14 +216,14 @@ def screen_health_zones(dataset_id: str) -> None:
             st.session_state[play_key] = False
             st.session_state[cursor_key] = 0
             st.rerun()
-        show_truth = show.checkbox("Show retrospective reference", value=True, key="hz_truth")
+        show_truth = show.checkbox("Show sensor-rule reference", value=True, key="hz_truth")
         if st.session_state[play_key]:
             st.session_state[cursor_key] = min(n - 1, st.session_state[cursor_key] + step)
             if st.session_state[cursor_key] >= n - 1:
                 st.session_state[play_key] = False
         index = st.slider("Measurement (minutes since start)", 0, n - 1, key=cursor_key)
         row = pred.iloc[index]
-        base = float(np.median(pred["combined_rms"].to_numpy()[:5]))
+        base = float(np.median(pred["combined_rms"].to_numpy()[:int(meta["config"].get("baseline_n", 5))]))
         probs = [row["p_green"], row["p_yellow"], row["p_red"]] if "p_red" in pred.columns else None
         t0 = float(pred["timestamp_s"].iloc[0])
         recording_end = (float(pred["timestamp_s"].iloc[-1]) - t0) / 60.0 if show_truth else None
@@ -222,18 +235,18 @@ def screen_health_zones(dataset_id: str) -> None:
     with st.expander("How good is it? Validation and test results"):
         cfg = meta["config"]
         st.markdown(
-            f"- **Retrospective red reference** = last {cfg['red_minutes']:.0f} min before the recording ends; "
-            "this endpoint is a proxy, not a confirmed failure time. The displayed red warning can occur "
-            "earlier or later.\n"
-            f"- **Yellow** = from degradation onset: vibration RMS stays ≥ {cfg['onset_ratio']:.2f}× (and ≥ "
-            f"{cfg['onset_sigma']:.0f}σ above) the bearing's own first-{cfg['baseline_n']} minute baseline for "
-            f"{cfg['onset_persist']} consecutive minutes.\n"
-            f"- **Calibrated rule**: confirmed onset → yellow; RMS ≥ {metrics.get('rule_baseline_red_ratio', float('nan')):.2f}× "
-            "baseline → red (ratio fitted on train bearings).\n"
+            f"- **Signal reference zones**: green below the persistent-rise threshold; yellow after max-axis RMS "
+            f"exceeds {cfg['onset_ratio']:.2f}× baseline (and {cfg['onset_sigma']:.0f} SD above baseline) for "
+            f"{cfg['onset_persist']} consecutive measurements; red at {cfg['red_ratio']:.2f}× baseline RMS.\n"
+            "- These are weak vibration-derived reference labels, not independent expert diagnoses.\n"
+            f"- **Endpoint timing** = minutes from first red to the end of this recorded experiment; "
+            "the endpoint is a proxy, not a confirmed failure timestamp. It does not define zone labels.\n"
+            f"- **Yellow threshold baseline** uses the bearing's first {cfg['baseline_n']} measurements; "
+            f"its threshold also uses {cfg['onset_sigma']:.0f} SD above baseline.\n"
             f"- **GRU classifier**: {meta['config']['hidden_size']}-unit GRU over the last {cfg['history']} measurements, "
             f"epoch {metrics.get('best_epoch')} selected on validation; zones smoothed "
             f"(escalate after {cfg['escalate_n']}, de-escalate after {cfg['deescalate_n']} consistent predictions).\n"
-            "- Abrupt changes can make the red warning late or absent; gradual changes can trigger it "
-            "well over 30 minutes before the recording ends. The table shows those lead times and misses."
+            "- GRU scores measure agreement with the weak labels, not independently validated fault detection. "
+            "The table reports zone agreement and endpoint timing separately."
         )
         st.dataframe(_metrics_table(metrics), hide_index=True, width="stretch")

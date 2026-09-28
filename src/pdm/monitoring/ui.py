@@ -22,6 +22,29 @@ COLORS = {"green": "#5bc98d", "yellow": "#efbf54", "red": "#f27580", "gray": "#9
 LABELS = {"green": "Normal", "yellow": "Attention required", "red": "Urgent action required", "gray": "Assessment unavailable"}
 
 
+def _history_ribbon_values(history_rows, dataset_id):
+    """Return ribbon title, colors and labels for the displayed history source."""
+    has_sensor_zones = dataset_id == "filters" and any("sensor_zone" in row for row in history_rows)
+    if has_sensor_zones:
+        labels, colors = [], []
+        for row in history_rows:
+            sensor = row.get("sensor_zone")
+            if sensor is None:
+                color, label = "gray", "Sensor zone unavailable"
+            else:
+                color = sensor.get("display_zone", "gray")
+                label = sensor.get("label", LABELS.get(color, LABELS["gray"]))
+            labels.append(label)
+            colors.append(COLORS.get(color, COLORS["gray"]))
+        return "Filter sensor-zone history", colors, labels
+    title = "Model condition history"
+    if dataset_id == "filters":
+        title += " · saved evaluation predates sensor zones"
+    labels = [LABELS[row["condition"]["display_zone"]] for row in history_rows]
+    colors = [COLORS[row["condition"]["display_zone"]] for row in history_rows]
+    return title, colors, labels
+
+
 def bundles_for(dataset_id):
     result = []
     for path in sorted((runs_root() / "monitoring_bundles").glob("*/monitoring_bundle.json"), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -172,15 +195,32 @@ def _render_replay(rows, measurements, bundle, directory, key):
     result = rows[min(step, n - 1)]
     condition, profile = result["condition"], bundle["profile"]
     zone, now = condition["display_zone"], result["as_of"]
-    st.subheader(LABELS[zone])
+    sensor_zone = result.get("sensor_zone") if profile["dataset_id"] == "filters" else None
+    if sensor_zone is not None:
+        sensor_colors = {"green": "🟢", "yellow": "🟡", "red": "🔴", "gray": "⚪"}
+        sensor_label = sensor_zone.get("label", "Assessment unavailable")
+        st.subheader(f"{sensor_colors.get(sensor_zone.get('display_zone'), '⚪')} Filter sensor zone: {sensor_label}")
+        st.caption(f"Model condition: {LABELS[zone]}")
+    else:
+        st.subheader(f"Model condition: {LABELS[zone]}")
     st.caption(bundle["state_policy"]["laboratory_notice"])
-    st.write(condition["action_text"])
+    st.write("Model action: " + condition["action_text"])
+    if profile["dataset_id"] == "filters":
+        if "sensor_zone" not in result:
+            st.info("This saved evaluation predates filter sensor zones. Re-evaluate with current code to see sensor zones.")
+        else:
+            pressure, flow, feed = (sensor_zone.get(k) for k in ("pressure_pa", "flow_rate", "dust_feed"))
+            pcol, fcol, dcol = st.columns(3)
+            pcol.metric("Differential pressure", "—" if pressure is None else f"{pressure:g} Pa")
+            fcol.metric("Flow rate", "—" if flow is None else f"{flow:g}")
+            dcol.metric("Dust feed", "—" if feed is None else f"{feed:g}")
+            st.caption(f"Provisional pressure warning band: {sensor_zone.get('policy', {}).get('yellow_limit_pa', 300):g} Pa · Flow and feed are displayed in recorded source values · zone `{sensor_zone.get('zone', 'unknown')}` · {sensor_zone.get('reason', '')}")
     for reason in condition["reason_codes"][:3]:
         st.write("• " + reason.replace("_", " "))
     c1, c2, c3 = st.columns(3)
     c1.metric("Observation", result["data_quality_status"])
     c2.metric("Regime", result["model_applicability"].replace("_", " "))
-    c3.metric("Forecast", result["forecast_status"])
+    c3.metric("Forecast urgency", condition.get("forecast_urgency", "unavailable").replace("_", " "))
     history = result["history"]
     duration = "not available" if history["duration"] is None else f"{history['duration']:g} " + ("seconds" if profile["time_basis"] == "physical_seconds" else "dataset time units")
     st.caption(f"History: {history['used_measurements']} measurements · duration {duration} · {history['mode']}. Reference: {condition['reference_status']}.")
@@ -227,9 +267,11 @@ def _render_replay(rows, measurements, bundle, directory, key):
     st.plotly_chart(fig, width="stretch")
     st.caption(f"Issued at {now / scale:g} {time_label}. Hold current observed conditions. Lines between discrete horizons are visual interpolation. " + crossing["reason"])
     history_rows = rows[:step+1]
+    ribbon_title, ribbon_colors, ribbon_labels = _history_ribbon_values(history_rows, profile["dataset_id"])
+    st.caption(ribbon_title)
     ribbon = go.Figure(go.Scatter(x=[r["as_of"] / scale for r in history_rows], y=[1]*len(history_rows),
-                mode="markers", marker=dict(symbol="square", size=10, color=[COLORS[r["condition"]["display_zone"]] for r in history_rows]),
-                text=[LABELS[r["condition"]["display_zone"]] for r in history_rows], hovertemplate="%{text}<extra></extra>"))
+                mode="markers", marker=dict(symbol="square", size=10, color=ribbon_colors),
+                text=ribbon_labels, hovertemplate="%{text}<extra></extra>"))
     ribbon.update_layout(height=100, margin=dict(l=20,r=20,t=10,b=20), yaxis_visible=False, xaxis_title=time_label)
     st.plotly_chart(ribbon, width="stretch")
     with st.expander("Diagnostics · event forecast and action timing"):

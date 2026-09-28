@@ -28,12 +28,16 @@ explicit and provisional. No age-dependent healthy norm or test adaptation is us
 
 ## State and action
 
-`state.py` implements channel-valid applicable limit → unavailable quality → unknown
-regime/reference → eligible prognostic urgency → persistent deviation → normal.
-Confirmation uses both counts and elapsed source time; recovery uses its own lower
-threshold and longer interval. Gaps reset confirmation, never erase the open alert.
-Hard limits operate before warmup and outside the ML domain. An acknowledgement is
-append-only feedback, not a repair, resolution or training label.
+`state.py` colors condition from measured signals: channel-valid applicable limit →
+unavailable quality → unknown regime/reference → confirmed persistent deviation →
+normal. Eligible forecast urgency has its own label and prognostic alert episodes;
+it does not change the measured condition color or critical latch. Both measured
+deviations and forecast warnings use separate confirmation and recovery counters.
+Gaps reset confirmation, never erase an open alert. Hard limits operate before
+warmup and outside the ML domain. An acknowledgement is append-only feedback, not a
+repair, resolution or training label. Filter-specific green/yellow/red/unknown sensor
+zones from measured pressure, flow context, and a provisional reference are described
+in [filter sensor zones](filter_sensor_zones.md).
 
 Critical limits require signal, unit, direction, aggregation rule, applicability, provenance
 and verification. Filters retain a **laboratory** 600 Pa definition. Bearing RMS has no
