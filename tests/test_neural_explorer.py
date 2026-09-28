@@ -161,6 +161,10 @@ def _open_explorer(at):
     _screen_radio(at).set_value("Model Report")
     at.run()
     assert not at.exception
+    report_view = next(r for r in at.radio if r.label == "Report view")
+    report_view.set_value("Historical RUL — Experimental / Model activity")
+    at.run()
+    assert not at.exception
     return at
 
 
@@ -369,12 +373,17 @@ def test_screen_switch_by_label(monkeypatch, tmp_path, tiny_bearing_tables):
     _screen_radio(at).set_value("Model Report")
     at.run()
     assert not at.exception
+    next(r for r in at.radio if r.label == "Report view").set_value(
+        "Historical RUL — Experimental / Model activity"
+    )
+    at.run()
+    assert not at.exception
     assert EXPLORER_DISCLAIMER in _app_text(at)
     _screen_radio(at).set_value("Training")
     at.run()
     assert not at.exception
     text = _app_text(at)
-    assert "Train" in text or "Training mode" in text or "Prepare data" in text
+    assert "Future-red entry training" in text
 
 
 def test_frontend_vendor_files_present():

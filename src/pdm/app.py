@@ -20,7 +20,7 @@ from pdm.alerts import (
 )
 from pdm.architectures import is_reservoir
 from pdm.cli import spawn_worker
-from pdm.config import load_dataset_config, model_defaults
+from pdm.config import load_dataset_config
 from pdm.connectome.provenance import SYNTHETIC_DISCLAIMER
 from pdm.data.prepare import load_processed, processed_ready
 from pdm.device import resolve_device
@@ -62,12 +62,6 @@ from pdm.replay import (
     split_label_for_unit,
     visible_replay_slice,
 )
-from pdm.train import (
-    load_saved_train_settings,
-    next_max_windows_on_mode_change,
-    selection_metric_spec,
-    training_mode_label,
-)
 from pdm.visualization.comparison import (
     BIOLOGICAL_SECTION,
     SMOKE_NOTE,
@@ -93,7 +87,7 @@ from pdm.visualization.explorer import (
 )
 from pdm.visualization.live import load_live_activity
 from pdm.visualization.simulation_ui import render_equipment_simulation
-from pdm.worker import read_status, request_stop, worker_alive
+from pdm.worker import read_status, worker_alive
 
 st.set_page_config(page_title="Predictive Maintenance Lab", layout="wide")
 os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
@@ -163,7 +157,7 @@ def _status_chip(*, compact: bool = False) -> dict:
 
 
 def main() -> None:
-    from pdm.lab_ui import matrix_controls, screen_comparison
+    from pdm.lab_ui import screen_comparison
     from pdm.visualization.presentation import apply_explorer_style
 
     aliases = {"Data": "Data Quality", "Train": "Training", "Neural Activity Explorer": "Model Report", "Test & Replay": "Model Report"}
@@ -171,7 +165,7 @@ def main() -> None:
     if old in aliases:
         st.session_state["screen_selection"] = aliases[old]
         if old == "Test & Replay":
-            st.session_state["report_view"] = "Evaluation settings"
+            st.session_state["report_view"] = "Historical RUL — Evaluation settings"
     if "screen_selection" not in st.session_state and st.query_params.get("view") == "brain":
         st.session_state["screen_selection"] = "Model Report"
     dataset_id = _dataset()
@@ -184,40 +178,55 @@ def main() -> None:
     if page == "Data Quality":
         screen_data(dataset_id)
     elif page == "Training":
-        matrix_controls()
         screen_train(dataset_id)
     elif page == "Model Report":
-        from pdm.monitoring.ui import bundles_for
-
-        # Legacy installations without a monitoring bundle keep their original
-        # report entry point; published bundles make condition monitoring primary.
-        available_runs = {r["run_id"] for r in list_runs(dataset_id)}
-        has_available_bundle = any(b["event_model_run_id"] in available_runs for b in bundles_for(dataset_id))
         previous_report_dataset = st.session_state.get("_report_dataset")
         if previous_report_dataset is not None and previous_report_dataset != dataset_id:
             st.session_state.pop("report_view", None)
         st.session_state["_report_dataset"] = dataset_id
-        default_view = (0 if has_available_bundle else
-                        4 if dataset_id == "filters" else 1)
-        view = st.radio("Report view", ["Condition & Forecast", "Model replay", "Evaluation settings", "Experimental / Model activity", "Health zones"], index=default_view, horizontal=True, key="report_view", on_change=_pause_neural_runs)
-        if view == "Health zones":
+        legacy_report_views = {
+            "Condition & Forecast": "Historical RUL — Condition & Forecast",
+            "Model replay": "Historical RUL — Model replay",
+            "Evaluation settings": "Historical RUL — Evaluation settings",
+            "Experimental / Model activity": "Historical RUL — Experimental / Model activity",
+        }
+        if st.session_state.get("report_view") in legacy_report_views:
+            st.session_state["report_view"] = legacy_report_views[st.session_state["report_view"]]
+        default_view = 0
+        view = st.radio(
+            "Report view",
+            [
+                "Future-red entry",
+                "Historical RUL — Condition & Forecast",
+                "Historical RUL — Model replay",
+                "Historical RUL — Evaluation settings",
+                "Historical RUL — Experimental / Model activity",
+                "Health zones",
+            ],
+            index=default_view, horizontal=True, key="report_view", on_change=_pause_neural_runs,
+        )
+        if view == "Future-red entry":
+            from pdm.future_red_ui import render_report
+            from pdm.paths import runs_root
+
+            render_report(dataset_id, runs_root() / "_future_red" / "matrix")
+        elif view == "Health zones":
             from pdm.health_zones_ui import screen_health_zones
 
             screen_health_zones(dataset_id)
-        elif view == "Condition & Forecast":
+        elif view == "Historical RUL — Condition & Forecast":
             from pdm.monitoring.ui import screen_condition_report
 
             screen_condition_report(dataset_id)
-        elif view == "Evaluation settings":
+        elif view == "Historical RUL — Evaluation settings":
             screen_replay(dataset_id)
         else:
             screen_explorer(dataset_id)
     elif page == "Compare Models":
-        if dataset_id == "filters":
-            st.info(
-                "Filter model comparison is the historical RUL research workflow. Use Health zones for the current "
-                "standalone 300/600 Pa sensor-state replay; it does not depend on trained models."
-            )
+        st.info(
+            "Historical RUL model comparisons use time-to-failure targets. They are separate from the current "
+            "future-red sensor-zone entry workflow."
+        )
         screen_comparison(dataset_id)
 
 
@@ -465,343 +474,11 @@ def screen_data(dataset_id: str) -> None:
         st.json(report)
 
 
-def _mode_badge(smoke: bool, *, kind: str = "Training") -> None:
-    label = training_mode_label(smoke)
-    st.badge(label, color="orange" if smoke else "green")
-    st.markdown(f"{kind} mode: **{label}**")
-
-
-def _fmt_windows_cap(cap) -> str:
-    if cap in (None, "", "None"):
-        return "all"
-    try:
-        n = int(cap)
-    except (TypeError, ValueError):
-        return "all"
-    return "all" if n <= 0 else str(n)
-
-
-def _windows_used_caption(rec: dict) -> str:
-    wpu = rec.get("train_windows_per_unit") or {}
-    cap = _fmt_windows_cap(rec.get("max_windows_per_unit"))
-    n_tr = rec.get("n_train_windows")
-    n_va = rec.get("n_val_windows")
-    bits = [f"Train windows: {n_tr if n_tr is not None else '—'}", f"val windows: {n_va if n_va is not None else '—'}"]
-    if wpu:
-        mean = wpu.get("mean")
-        mean_s = f"{float(mean):.1f}" if _finite_number(mean) else "—"
-        bits.append(
-            f"windows/unit used min {wpu.get('min', '—')} / max {wpu.get('max', '—')} / mean {mean_s} (cap {cap})"
-        )
-    else:
-        bits.append(f"windows/unit cap {cap}")
-    return " · ".join(bits)
-
-
 def screen_train(dataset_id: str) -> None:
-    st.header(f"Training — {LABELS[dataset_id]}")
-    if dataset_id == "filters":
-        st.info(
-            "Filter training is the historical RUL research workflow. Use Health zones for the current standalone "
-            "300/600 Pa sensor-state replay; that view needs no trained RUL model."
-        )
-    from pdm.monitoring.ui import training_controls
+    from pdm.future_red_ui import render_training
+    from pdm.paths import runs_root
 
-    training_controls(dataset_id)
-    if not processed_ready(dataset_id):
-        st.warning("Prepare data on the Data screen first. There is no dummy training path.")
-        return
-    from pdm.lab_ui import training_overview
-
-    if not training_overview(load_processed(dataset_id), load_dataset_config(dataset_id)):
-        return
-    arch = st.selectbox(
-        "Architecture", ["gru", "lstm", "fly_connectome_reservoir", "random_reservoir"], index=0,
-    )
-    scope = "1,000-node subgraph"
-    if dataset_id == "bearings" and arch == "fly_connectome_reservoir":
-        scope = st.radio("Connectome scope", ["Full MaleCNS", "1,000-node subgraph"], horizontal=True)
-    if dataset_id == "bearings" and arch == "fly_connectome_reservoir" and scope == "Full MaleCNS":
-        st.subheader("Train the complete MaleCNS")
-        st.write("All classified neurons and their directed connections participate in every measurement. "
-                 "A new forecast readout is fitted from scratch using whole-bearing cross-validation, "
-                 "with separate interval calibration.")
-        st.caption("Full chronological histories · 20-measurement warmup · CPU sparse computation. "
-                   "The population is determined by the source annotations; it is not a neuron-count setting.")
-        start, stop = st.columns(2)
-        if start.button("Train full MaleCNS from scratch", disabled=worker_alive(), type="primary"):
-            from pdm.training_protocol import protocol
-
-            spawn_worker({"kind": "train_full_cns", "dataset_id": "bearings", "training_protocol": protocol("bearings")})
-            st.rerun()
-        if stop.button("Stop", disabled=not worker_alive()):
-            request_stop()
-            st.rerun()
-        ws = read_status()
-        if worker_alive():
-            st.info(ws.get("message") or "Training the full connectome. This can take several minutes.")
-            _auto_refresh()
-        elif ws.get("status") == "failed":
-            st.error(ws.get("error") or ws.get("message") or "Job failed")
-        elif ws.get("status") == "completed":
-            st.success("Training completed. Open Model Report to run the saved model.")
-        elif ws.get("status") == "cancelled":
-            st.info("Training cancelled.")
-        return
-    graph_mode = None
-    if is_reservoir(arch):
-        graph_mode = st.selectbox("Graph source", ["real_connectome", "synthetic_fixture"])
-    cfg = load_dataset_config(dataset_id)
-    mcfg = model_defaults(cfg)
-    bundle = load_processed(dataset_id)
-    phys = (bundle.get("report") or {}).get("history_length_physical") or {}
-    sel_spec = selection_metric_spec(dataset_id)
-    smoke_cap = int(mcfg.get("smoke_max_windows_per_unit", 32))
-    smoke_epochs = int(mcfg.get("smoke_max_epochs", 5))
-    mode_key = f"train_mode_{dataset_id}"
-    cap_key = f"max_windows_widget_{dataset_id}"
-    prev_key = f"_prev_train_smoke_{dataset_id}"
-    if mode_key not in st.session_state:
-        st.session_state[mode_key] = "Full"
-    if cap_key not in st.session_state:
-        st.session_state[cap_key] = 0
-    mode = st.radio("Training mode", ["Smoke", "Full"], horizontal=True, key=mode_key)
-    smoke = mode == "Smoke"
-    optimization = st.selectbox("Optimization protocol", ["Adaptive v2", "Diagnostic 100 epochs", "Legacy"], disabled=smoke)
-    use_v2 = not smoke and optimization != "Legacy"
-    feature_recipe = "base_v1"
-    sampling = "unit_replacement"
-    near_weight = 0.0
-    if use_v2:
-        st.caption("Training v2 uses CPU for reproducible continuation and float64 survival calculations.")
-        feature_recipe = st.selectbox("Feature recipe", ["base_v1", "degradation_v1", "multiscale_trend_v2", "multiscale_no_age_v2"])
-        sampling = st.selectbox("Window sampling", ["unit_replacement", "full_pass"])
-        if dataset_id == "bearings" and sampling == "full_pass":
-            near_weight = .5 if st.checkbox("Give half the training weight to the final 30 minutes") else 0.0
-        sel_spec = {"label": "near_30m_mae_s" if dataset_id == "bearings" else "survival_nll (seconds)"}
-    _mode_badge(smoke)
-    if smoke:
-        st.warning("Smoke test — not a quality benchmark")
-        st.caption(
-            f"Smoke caps epochs at {smoke_epochs} and windows/unit at {smoke_cap} "
-            "unless you set max windows/unit to 0 (all)."
-        )
-    else:
-        st.caption("All eligible windows enter the sampling pool when max windows/unit is 0; the selected sampler determines which windows are visited.")
-        st.caption("Diagnostic mode runs exactly 100 epochs without early stopping; the best checkpoint still uses validation."
-                   if use_v2 and optimization == "Diagnostic 100 epochs" else "Early stopping uses the validation metric.")
-    st.caption(
-        f"Epoch selection metric: **{sel_spec['label']}** "
-        "(unit-equal on a fixed window mask). Do not compare NLL and MAE as one accuracy."
-    )
-    next_cap = next_max_windows_on_mode_change(
-        prev_smoke=st.session_state.get(prev_key),
-        smoke=smoke,
-        current_cap=int(st.session_state.get(cap_key) or 0),
-        smoke_cap=smoke_cap,
-    )
-    if int(st.session_state.get(cap_key) or 0) != next_cap:
-        st.session_state[cap_key] = next_cap
-    st.session_state[prev_key] = smoke
-    epochs = st.number_input("Epochs", min_value=1, max_value=200, value=100 if use_v2 else int(mcfg["max_epochs"]), disabled=use_v2)
-    history_mode = None
-    if use_v2:
-        history_mode = st.selectbox("Model history policy", ["fixed_20", "fixed_40", "fixed_60", "variable_20_60"])
-        hist = 60 if history_mode == "variable_20_60" else int(history_mode.split("_")[1])
-        st.caption("Variable history is trained with actual 20–60 lengths; padding is masked.")
-    else:
-        hist = st.number_input("History length (measurements)", min_value=2, max_value=128, value=int(mcfg["history_length"]))
-    st.caption(phys.get("note") or f"{hist} measurements of history")
-    max_w = st.number_input("Max windows / unit (0 = all)", min_value=0, key=cap_key, disabled=use_v2)
-    history_ready = True
-    if int(hist) != int(mcfg["history_length"]):
-        st.caption("Admission counts for the selected history length")
-        history_ready = training_overview(bundle, cfg, int(hist))
-    with st.expander("Advanced"):
-        learning_rate = st.number_input("Learning rate", min_value=0.00001, value=float(mcfg["learning_rate"]), format="%.5f", disabled=not use_v2 or optimization == "Diagnostic 100 epochs")
-        st.number_input("Hidden size", value=int(mcfg["hidden_size"]), disabled=True)
-        st.number_input("Batch size", value=int(mcfg["batch_size"]), disabled=True)
-    runs = [r for r in list_runs(dataset_id) if r.get("has_last")]
-    resume_opt = ["(new experiment)"] + [r["run_id"] for r in runs]
-    resume = st.selectbox("Resume last checkpoint", resume_opt)
-    resume_id = None if resume == "(new experiment)" else resume
-    resume_saved = load_saved_train_settings(run_dir(dataset_id, resume_id), resume_id) if resume_id else None
-    if resume_saved is not None:
-        st.info(
-            f"Resume uses saved **{training_mode_label(resume_saved.get('smoke'))}** "
-            f"(epochs={resume_saved.get('max_epochs', '—')}, "
-            f"windows/unit={_fmt_windows_cap(resume_saved.get('max_windows_per_unit'))}). "
-            "Form Smoke/Full, epochs, and windows cap are ignored for this job."
-        )
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Start training", disabled=worker_alive() or not history_ready):
-            job = {
-                "kind": "train",
-                "dataset_id": dataset_id,
-                "architecture": arch,
-                "graph_mode": graph_mode,
-                "n_nodes": 1000 if is_reservoir(arch) else None,
-                "readout": ("ridge" if dataset_id == "bearings" else "gradient") if is_reservoir(arch) else None,
-                "max_epochs": int(epochs),
-                "history_length": int(hist),
-                "history_mode": history_mode,
-                "smoke": bool(smoke),
-                "resume_run_id": resume_id,
-                "max_windows_per_unit": int(max_w),
-            }
-            if use_v2 and not resume_id:
-                from pdm.training_protocol import protocol
-
-                job["training_protocol"] = protocol(dataset_id, mode="diagnostic" if optimization == "Diagnostic 100 epochs" else "adaptive",
-                            learning_rate=float(learning_rate), sampling=sampling, near_weight=near_weight, feature_recipe=feature_recipe)
-            if resume_saved is not None:
-                job["smoke"] = bool(resume_saved.get("smoke", False))
-                mw_saved = resume_saved.get("max_windows_per_unit")
-                job["max_windows_per_unit"] = 0 if mw_saved is None else int(mw_saved)
-                if resume_saved.get("max_epochs") is not None:
-                    job["max_epochs"] = int(resume_saved["max_epochs"])
-            spawn_worker(job)
-            st.rerun()
-    with c2:
-        if st.button("Stop", disabled=not worker_alive()):
-            request_stop()
-            st.rerun()
-    ws = read_status()
-    if ws.get("status") in {"training", "preparing"} or worker_alive():
-        live_mode = ws.get("mode") or training_mode_label(ws.get("smoke"), ws.get("run_id") or "")
-        st.markdown(f"Live run: **{live_mode}**")
-        if ws.get("epoch") is not None:
-            st.write(f"Epoch {ws['epoch']} / {ws.get('max_epochs', '—')}")
-            st.write(
-                f"train loss {ws.get('train_loss', '—')}  val loss {ws.get('val_loss', '—')}  "
-                f"train metric {ws.get('train_metric', '—')}  "
-                f"{ws.get('selection_metric_label') or 'val metric'} {ws.get('val_metric', '—')}  "
-                f"best epoch {ws.get('best_epoch', '—')}"
-            )
-            st.caption(_windows_used_caption(ws))
-        else:
-            st.caption(f"{ws.get('status', 'running').title()} · {ws.get('stage') or ws.get('kind', '')}")
-        st.caption(ws.get("message") or "")
-        _render_train_live_activity(dataset_id, ws)
-        _auto_refresh()
-    if ws.get("status") == "failed":
-        st.error(ws.get("error") or ws.get("message") or "Job failed")
-    if ws.get("status") in {"cancelled", "stopped"}:
-        st.info(f"Job interrupted ({ws.get('status')})")
-    st.subheader("Experiments")
-    table = list_runs(dataset_id)
-    if not table:
-        st.write("No runs yet.")
-        return
-    df = pd.DataFrame(table)
-    df["mode"] = [training_mode_label(row.get("smoke"), str(row.get("run_id") or "")) for row in table]
-    cols = [
-        c
-        for c in [
-            "run_id",
-            "mode",
-            "architecture",
-            "status",
-            "best_metric",
-            "best_epoch",
-            "n_train_windows",
-            "n_val_windows",
-            "updated_at",
-            "has_best",
-        ]
-        if c in df.columns
-    ]
-    st.dataframe(df[cols] if cols else df, width="stretch", hide_index=True)
-    pick = st.selectbox("Open saved run (does not retrain)", [r["run_id"] for r in table])
-    rec = next((r for r in table if r.get("run_id") == pick), {})
-    rdir = run_dir(dataset_id, pick)
-    run_status = dict(rec)
-    status_path = rdir / "status.json"
-    if status_path.exists():
-        try:
-            run_status.update(json.loads(status_path.read_text(encoding="utf-8")))
-        except Exception:
-            pass
-    vm: dict = {}
-    vm_path = rdir / "validation_metrics.json"
-    if vm_path.exists():
-        try:
-            vm = json.loads(vm_path.read_text(encoding="utf-8"))
-            run_status.update({k: vm[k] for k in vm if k not in {"last", "last_train"}})
-        except Exception:
-            vm = {}
-    run_smoke = bool(run_status.get("smoke")) if "smoke" in run_status else str(pick).startswith("smoke_")
-    _mode_badge(run_smoke, kind="Run")
-    best_epoch = run_status.get("best_epoch") or vm.get("best_epoch")
-    best_metric = run_status.get("best_metric") if run_status.get("best_metric") is not None else vm.get("best_metric")
-    sel_label = run_status.get("selection_metric_label") or vm.get("selection_metric_label") or sel_spec["label"]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Best epoch", best_epoch if best_epoch not in (None, 0) else "—")
-    if _finite_number(best_metric):
-        m2.metric(sel_label, f"{float(best_metric):.4f}")
-    else:
-        m2.metric(sel_label, "—")
-    m3.metric(
-        "Train windows",
-        run_status.get("n_train_windows") if run_status.get("n_train_windows") is not None else "—",
-    )
-    m4.metric("Val windows", run_status.get("n_val_windows") if run_status.get("n_val_windows") is not None else "—")
-    st.caption(_windows_used_caption(run_status))
-    last_train = (vm.get("last_train") or {}) if vm else {}
-    last_val = (vm.get("last") or {}) if vm else {}
-    if last_train or last_val:
-        st.caption(
-            "Train/val diagnostics are unit-equal on the fixed window mask for this run "
-            "(train uses windows kept after the per-unit cap; val uses all validation windows)."
-        )
-        d1, d2 = st.columns(2)
-        d1.write(
-            f"Train mask {vm.get('selection_metric_name') or sel_spec.get('name', sel_label)}: "
-            f"{last_train.get('selection_metric', run_status.get('train_metric', '—'))}"
-        )
-        d2.write(
-            f"Val mask {sel_label}: "
-            f"{last_val.get('selection_metric', run_status.get('val_metric', best_metric if best_metric is not None else '—'))}"
-        )
-    hist_csv = rdir / "training_history.csv"
-    if hist_csv.exists():
-        hdf = pd.read_csv(hist_csv)
-        fig = go.Figure()
-        if "train_loss" in hdf.columns:
-            fig.add_trace(go.Scatter(x=hdf["epoch"], y=hdf["train_loss"], name="train loss"))
-        if "val_loss" in hdf.columns:
-            fig.add_trace(go.Scatter(x=hdf["epoch"], y=hdf["val_loss"], name="val loss"))
-        if fig.data:
-            if _finite_number(best_epoch):
-                fig.add_vline(x=int(best_epoch), line_dash="dash", annotation_text=f"best epoch {int(best_epoch)}")
-            fig.update_xaxes(title="Epoch")
-            fig.update_yaxes(title="Loss (not comparable across loss types)")
-            st.plotly_chart(fig, width="stretch")
-        else:
-            st.caption("Closed-form readout fitting has no gradient loss curve.")
-        if "val_metric" in hdf.columns or "train_metric" in hdf.columns:
-            fig_m = go.Figure()
-            if "train_metric" in hdf.columns:
-                fig_m.add_trace(
-                    go.Scatter(x=hdf["epoch"], y=hdf["train_metric"], name="train (unit-equal, fixed mask)")
-                )
-            if "val_metric" in hdf.columns:
-                fig_m.add_trace(
-                    go.Scatter(x=hdf["epoch"], y=hdf["val_metric"], name="val (unit-equal, fixed mask)")
-                )
-            if _finite_number(best_epoch):
-                fig_m.add_vline(x=int(best_epoch), line_dash="dash", annotation_text=f"best epoch {int(best_epoch)}")
-            fig_m.update_xaxes(title="Epoch")
-            fig_m.update_yaxes(title=sel_label)
-            st.plotly_chart(fig_m, width="stretch")
-        st.caption(
-            "MAE is in physical seconds when defined; NLL is not MAE. "
-            "Do not treat different losses as one accuracy."
-        )
-    if vm:
-        with st.expander("validation_metrics.json (debug)"):
-            st.json(vm)
+    render_training(dataset_id, runs_root() / "_future_red" / "matrix")
 
 
 def _explorer_mode_label(mode: str) -> str:
@@ -1070,7 +747,7 @@ def screen_explorer(dataset_id: str) -> None:
     table = [r for r in list_runs(dataset_id) if r.get("has_best") or r.get("has_last")]
     reservoir_rows = table
     if not reservoir_rows:
-        st.warning("No saved model. Open Training to create a full experiment.")
+        st.warning("No saved RUL model is available. Open Future-red entry for the current sensor-zone model matrix.")
         if table:
             st.info(RESERVOIR_REQUIRED_MESSAGE)
         return

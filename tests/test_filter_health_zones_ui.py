@@ -92,7 +92,7 @@ def test_filter_label_replay_rejects_tampered_labels_and_split_drift(tmp_path):
         _read_current_filter_zone_labels(data, tmp_path)
 
 
-def test_filter_health_zones_is_the_bundle_free_model_report_default(monkeypatch, tmp_path):
+def test_filter_health_zones_is_accessible_without_a_model_bundle(monkeypatch, tmp_path):
     from streamlit.testing.v1 import AppTest
 
     from pdm.data import prepare
@@ -106,23 +106,25 @@ def test_filter_health_zones_is_the_bundle_free_model_report_default(monkeypatch
     monkeypatch.setattr("pdm.filter_health_zones_ui.runs_root", lambda: tmp_path)
     monkeypatch.setattr("pdm.experiments.list_runs", lambda dataset_id: [])
     monkeypatch.setattr(monitoring_ui, "bundles_for", lambda dataset_id: [])
-    # The existing four-screen navigation reaches filters Health zones without a model bundle.
+    # Select the standalone replay view explicitly; Future-red entry is the report default.
     app_test = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=30)
+    app_test.session_state["screen_selection"] = "Model Report"
     app_test.run()
-    radios = list(app_test.sidebar.radio)
-    radios[0].set_value("Filters")
-    radios[1].set_value("Model Report")
+    next(r for r in app_test.sidebar.radio if r.label == "Dataset").set_value("Filters")
+    app_test.run()
+    report_view = next(r for r in app_test.radio if r.label == "Report view")
+    report_view.set_value("Health zones")
     app_test.run()
 
     assert not app_test.exception
     assert [r.label for r in app_test.sidebar.radio if r.label == "Screen"]
     assert any("Health zones · filters" in str(h.value) for h in app_test.subheader)
     assert any("Configured laboratory pressure limit reached" in str(m.value) for m in app_test.markdown)
-    report_view = next(r for r in app_test.radio if r.label == "Report view")
     assert report_view.value == "Health zones"
 
-    app_test.sidebar.radio[0].set_value("Bearings")
+    next(r for r in app_test.sidebar.radio if r.label == "Dataset").set_value("Bearings")
+    app_test.session_state["screen_selection"] = "Model Report"
     app_test.run()
     assert not app_test.exception
     report_view = next(r for r in app_test.radio if r.label == "Report view")
-    assert report_view.value == "Model replay"
+    assert report_view.value == "Future-red entry"

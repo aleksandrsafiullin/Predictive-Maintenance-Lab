@@ -56,6 +56,7 @@ def operational_screen(monkeypatch, tmp_path, tiny_bearing_tables):
     monkeypatch.setattr("pdm.worker.read_status", lambda: {})
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=20)
     at.session_state["screen_selection"] = "Neural Activity Explorer"
+    at.session_state["report_view"] = "Historical RUL — Experimental / Model activity"
     return at, captured, unit_ids, rows
 
 
