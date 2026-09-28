@@ -250,12 +250,20 @@ def main(argv: list[str] | None = None) -> int:
                              help="bearing labels only: provisional red RMS threshold as a multiple of baseline (default: 2.0)")
     zone_labels.add_argument("--yellow-limit-pa", type=float, default=None,
                              help="filter labels only: provisional absolute pressure warning boundary (default: 300 Pa)")
+    future_targets = sub.add_parser("future-red-targets", help="Export fixed-horizon future red-entry targets")
+    future_targets.add_argument("--dataset", required=True, choices=["bearings", "filters"])
+    future_targets.add_argument("--horizon-s", type=float, default=None)
     args = parser.parse_args(argv)
     if args.cmd == "zones-labels":
         if args.dataset == "filters" and args.red_ratio is not None:
             parser.error("--red-ratio applies only to bearing zone labels")
         if args.dataset == "bearings" and args.yellow_limit_pa is not None:
             parser.error("--yellow-limit-pa applies only to filter zone labels")
+    if args.cmd == "future-red-targets":
+        from pdm.future_red_targets import build_future_red_targets
+
+        print(json.dumps(build_future_red_targets(args.dataset, args.horizon_s), indent=2))
+        return 0
     if args.cmd == "zones-train" and args.red_ratio is not None or (
         args.cmd == "zones-labels" and args.dataset == "bearings" and args.red_ratio is not None
     ):

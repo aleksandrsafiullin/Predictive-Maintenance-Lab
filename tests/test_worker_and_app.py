@@ -356,239 +356,79 @@ def _fake_processed_bundle(dataset_id, features, units, split):
     }
 
 
-def test_app_train_screen_smoke_off_clears_window_cap(monkeypatch, tmp_path, tiny_bearing_tables):
+def test_app_training_screen_shows_future_red_matrix_without_rul_controls(monkeypatch, tiny_bearing_tables):
     from streamlit.testing.v1 import AppTest
 
     from pdm.paths import project_root
-    from pdm.splits import bearings_split
 
-    features, units = tiny_bearing_tables
-    split = bearings_split(units)
-    bundle = _fake_processed_bundle("bearings", features, units, split)
-    captured: dict = {}
-    run_id = "bearings_gru_full_fake"
-    rdir = tmp_path / run_id
-    rdir.mkdir()
-    (rdir / "training_history.csv").write_text(
-        "epoch,train_loss,val_loss,train_metric,val_metric,val_mae_events,n_val_event_units\n"
-        "1,1.0,0.9,0.80,0.70,0.70,3\n"
-        "2,0.8,0.6,0.55,0.40,0.40,3\n",
-        encoding="utf-8",
-    )
-    (rdir / "status.json").write_text(
-        json.dumps(
-            {
-                "run_id": run_id,
-                "architecture": "gru",
-                "status": "completed",
-                "smoke": False,
-                "mode": "Full",
-                "best_epoch": 2,
-                "best_metric": 0.4,
-                "n_train_windows": 100,
-                "n_val_windows": 20,
-                "max_windows_per_unit": None,
-                "train_windows_per_unit": {"min": 10, "max": 40, "mean": 25.0, "n_units": 9, "n_windows": 100},
-                "selection_metric_name": "val MAE",
-                "selection_metric_unit": "seconds",
-                "selection_metric_label": "val MAE (seconds)",
-                "updated_at": "2026-01-01T00:00:00Z",
-            }
-        ),
-        encoding="utf-8",
-    )
-    (rdir / "validation_metrics.json").write_text(
-        json.dumps(
-            {
-                "best_epoch": 2,
-                "best_metric": 0.4,
-                "selection_metric_label": "val MAE (seconds)",
-                "last": {"selection_metric": 0.4, "val_mae_events": 0.4, "n_val_event_units": 3},
-                "last_train": {"selection_metric": 0.55},
-                "n_train_windows": 100,
-                "n_val_windows": 20,
-                "max_windows_per_unit": None,
-                "train_windows_per_unit": {"min": 10, "max": 40, "mean": 25.0},
-                "smoke": False,
-                "mode": "Full",
-            }
-        ),
-        encoding="utf-8",
-    )
-    fake_row = {
-        "dataset_id": "bearings",
-        "run_id": run_id,
-        "path": str(rdir),
-        "has_best": True,
-        "has_last": True,
-        "status": "completed",
-        "smoke": False,
-        "mode": "Full",
-        "best_epoch": 2,
-        "best_metric": 0.4,
-        "architecture": "gru",
-        "n_train_windows": 100,
-        "n_val_windows": 20,
-        "updated_at": "2026-01-01T00:00:00Z",
-    }
-
-    monkeypatch.setattr("pdm.data.prepare.processed_ready", lambda ds: ds == "bearings")
-    monkeypatch.setattr("pdm.data.prepare.load_processed", lambda ds: bundle)
-    monkeypatch.setattr("pdm.experiments.list_runs", lambda ds=None: [fake_row])
-    monkeypatch.setattr("pdm.experiments.run_dir", lambda ds, rid: rdir)
-    monkeypatch.setattr("pdm.cli.spawn_worker", lambda job: captured.update(job) or captured)
     monkeypatch.setattr("pdm.worker.worker_alive", lambda: False)
-
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     assert not at.exception
+    assert list(_screen_radio(at).options) == ["Data Quality", "Training", "Model Report", "Compare Models"]
     _screen_radio(at).set_value("Training")
     at.run()
     assert not at.exception
-
-    mode = next(r for r in at.radio if "Smoke" in list(r.options) and "Full" in list(r.options))
-    assert mode.value == "Full"
-    mode.set_value("Smoke")
-    at.run()
     markdown = "\n".join(str(w.value) for w in at.markdown)
-    captions = "\n".join(str(w.value) for w in at.caption)
-    assert "Training mode: **Smoke**" in markdown
-    assert "val MAE (seconds)" in captions
-    max_w = next(n for n in at.number_input if "Max windows" in n.label)
-    assert int(max_w.value) == 32
-
-    mode = next(r for r in at.radio if "Smoke" in list(r.options) and "Full" in list(r.options))
-    mode.set_value("Full")
+    headers = "\n".join(str(w.value) for w in at.header)
+    code = "\n".join(str(w.value) for w in at.code)
+    assert "Future-red entry training — Bearings" in headers
+    assert "1,800 seconds (30 minutes)" in markdown
+    assert "--datasets bearings --architectures gru,lstm,fly,random" in code
+    assert "Test split snapshot" in markdown
+    assert not any("Start training" in button.label or "Train full MaleCNS" in button.label for button in at.button)
+    assert not any(r.label == "Training mode" for r in at.radio)
+    assert not any("Resume" in widget.label for widget in at.selectbox)
+    assert not any({"Smoke", "Full"}.issubset(set(widget.options)) for widget in at.radio)
+    _screen_radio(at).set_value("Compare Models")
     at.run()
     assert not at.exception
-    markdown = "\n".join(str(w.value) for w in at.markdown)
-    assert "Training mode: **Full**" in markdown
-    max_w = next(n for n in at.number_input if "Max windows" in n.label)
-    assert int(max_w.value) == 0
-
-    start = next(b for b in at.button if "Start training" in b.label)
-    start.click()
-    at.run()
-    assert not at.exception
-    assert captured["kind"] == "train"
-    assert captured["smoke"] is False
-    assert captured["max_windows_per_unit"] == 0
-    assert captured["max_epochs"] == 100
-    assert captured["training_protocol"]["version"] == "training_v2"
-    assert captured["training_protocol"]["selection_metric"] == "near_30m_mae_s"
-    assert captured["dataset_id"] == "bearings"
-
-    metric_by_label = {m.label: m.value for m in at.metric}
-    assert metric_by_label["Best epoch"] == "2"
-    assert "val MAE" in " ".join(metric_by_label)
-    assert metric_by_label["Train windows"] == "100"
-    assert metric_by_label["Val windows"] == "20"
-    captions = "\n".join(str(w.value) for w in at.caption)
-    assert "windows/unit used" in captions
-    markdown = "\n".join(str(w.value) for w in at.markdown)
-    assert "Run mode: **Full**" in markdown
-    frames = [w.value for w in at.dataframe]
-    exp = next(df for df in frames if "mode" in df.columns and "run_id" in df.columns)
-    assert "Full" in set(exp["mode"].astype(str))
+    info = "\n".join(str(widget.value) for widget in at.info)
+    assert "Historical RUL model comparisons" in info
 
 
-def test_app_train_screen_filters_shows_val_nll(monkeypatch, tiny_filter_tables):
+def test_app_training_screen_filters_uses_20_second_future_red_target(monkeypatch, tiny_filter_tables):
     from streamlit.testing.v1 import AppTest
 
     from pdm.paths import project_root
-    from pdm.splits import filters_split
 
-    features, units = tiny_filter_tables
-    units = units.copy()
-    if "origin_unit_id" not in units.columns:
-        units["origin_unit_id"] = units["author_data_no"]
-    split = filters_split(units)
-    bundle = _fake_processed_bundle("filters", features, units, split)
-    monkeypatch.setattr("pdm.data.prepare.processed_ready", lambda ds: ds == "filters")
-    monkeypatch.setattr("pdm.data.prepare.load_processed", lambda ds: bundle)
-    monkeypatch.setattr("pdm.experiments.list_runs", lambda ds=None: [])
     monkeypatch.setattr("pdm.worker.worker_alive", lambda: False)
-
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
-    assert not at.exception
     _dataset_radio(at).set_value("Filters")
     at.run()
     _screen_radio(at).set_value("Training")
     at.run()
     assert not at.exception
-    captions = "\n".join(str(w.value) for w in at.caption)
-    assert "survival_nll (seconds)" in captions
     markdown = "\n".join(str(w.value) for w in at.markdown)
-    assert "Training mode: **Full**" in markdown
+    code = "\n".join(str(w.value) for w in at.code)
+    assert "20 seconds" in markdown
+    assert "--datasets filters --architectures gru,lstm,fly,random" in code
+    assert not any("Start training" in button.label for button in at.button)
+    assert not any(r.label == "Training mode" for r in at.radio)
+    _screen_radio(at).set_value("Model Report")
+    at.run()
+    warnings = "\n".join(str(widget.value) for widget in at.warning)
+    assert "no observed RED-entry events" in warnings
+    assert any(r.label == "Report view" and "Health zones" in r.options for r in at.radio)
 
 
-def test_app_train_resume_keeps_full_not_form_smoke(monkeypatch, tmp_path, tiny_bearing_tables):
+def test_app_training_screen_hides_legacy_resume_controls(monkeypatch, tmp_path, tiny_bearing_tables):
     from streamlit.testing.v1 import AppTest
 
     from pdm.paths import project_root
-    from pdm.splits import bearings_split
 
-    features, units = tiny_bearing_tables
-    split = bearings_split(units)
-    bundle = _fake_processed_bundle("bearings", features, units, split)
-    captured: dict = {}
-    run_id = "bearings_gru_full_resume"
-    rdir = tmp_path / run_id
-    rdir.mkdir()
-    (rdir / "last.pt").write_bytes(b"stub")
-    (rdir / "config.yaml").write_text(
-        "dataset_id: bearings\nsmoke: false\nmode: Full\nmax_windows_per_unit: null\n"
-        "model:\n  architecture: gru\n  max_epochs: 30\n",
-        encoding="utf-8",
-    )
-    fake_row = {
-        "dataset_id": "bearings",
-        "run_id": run_id,
-        "path": str(rdir),
-        "has_best": True,
-        "has_last": True,
-        "status": "completed",
-        "smoke": False,
-        "mode": "Full",
-        "architecture": "gru",
-        "updated_at": "2026-01-01T00:00:00Z",
-    }
-    monkeypatch.setattr("pdm.data.prepare.processed_ready", lambda ds: ds == "bearings")
-    monkeypatch.setattr("pdm.data.prepare.load_processed", lambda ds: bundle)
-    monkeypatch.setattr("pdm.experiments.list_runs", lambda ds=None: [fake_row])
-    monkeypatch.setattr("pdm.experiments.run_dir", lambda ds, rid: rdir)
-    monkeypatch.setattr("pdm.cli.spawn_worker", lambda job: captured.update(job) or captured)
     monkeypatch.setattr("pdm.worker.worker_alive", lambda: False)
-
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
     at.run()
     _screen_radio(at).set_value("Training")
     at.run()
     assert not at.exception
-    next(r for r in at.radio if r.label == "Training mode").set_value("Smoke")
-    at.run()
-    markdown = "\n".join(str(w.value) for w in at.markdown)
-    assert "Training mode: **Smoke**" in markdown
-    max_w = next(n for n in at.number_input if "Max windows" in n.label)
-    assert int(max_w.value) == 32
-
-    resume_box = next(s for s in at.selectbox if "Resume" in s.label)
-    resume_box.set_value(run_id)
-    at.run()
-    assert not at.exception
-    infos = "\n".join(str(w.value) for w in at.info)
-    assert "Resume uses saved" in infos
-    assert "Full" in infos
-
-    start = next(b for b in at.button if "Start training" in b.label)
-    start.click()
-    at.run()
-    assert not at.exception
-    assert captured["resume_run_id"] == run_id
-    assert captured["smoke"] is False
-    assert captured["max_windows_per_unit"] == 0
-    assert captured["max_epochs"] == 30
+    labels = [widget.label for widget in at.selectbox]
+    assert not any("Resume" in label or "Architecture" in label for label in labels)
+    assert not any("Start training" in button.label for button in at.button)
+    markdown = "\n".join(str(widget.value) for widget in at.markdown)
+    assert "remaining useful life" in markdown
 
 
 def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables):
@@ -1734,11 +1574,22 @@ def test_app_operational_explorer_by_label_no_exception(tmp_path, monkeypatch):
         for widget in getattr(at, attr, []):
             parts.append(str(getattr(widget, "value", widget)))
     text = "\n".join(parts)
-    assert "Real model states and causal forecasts from recorded measurements" in text
+    assert "Future-red entry model report — Bearings" in text
     assert "Architecture comparison" not in text
+    report_view = next(widget for widget in at.radio if widget.label == "Report view")
+    assert "Future-red entry" in report_view.options
+    assert "Historical RUL — Condition & Forecast" in report_view.options
+    assert "Historical RUL — Model replay" in report_view.options
+    assert "Historical RUL — Evaluation settings" in report_view.options
+    assert "Historical RUL — Experimental / Model activity" in report_view.options
+    assert "Health zones" in report_view.options
     assert not any(widget.label == "Mode" for widget in at.radio)
     assert not any(widget.label == "Build trace" for widget in at.button)
-    at.session_state["report_view"] = "Evaluation settings"
-    radio.set_value("Model Report")
-    at.run()
-    assert not at.exception
+    legacy_at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    legacy_at.session_state["screen_selection"] = "Model Report"
+    legacy_at.session_state["report_view"] = "Evaluation settings"
+    legacy_at.run()
+    assert not legacy_at.exception
+    assert next(widget for widget in legacy_at.radio if widget.label == "Report view").value == (
+        "Historical RUL — Evaluation settings"
+    )

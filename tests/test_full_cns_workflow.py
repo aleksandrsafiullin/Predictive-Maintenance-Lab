@@ -4,29 +4,17 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 
-def test_fly_training_screen_dispatches_complete_population_without_old_controls(monkeypatch):
-    import pdm.app as app
+def test_model_report_defaults_to_future_red_without_old_rul_training_launch():
+    from pdm.paths import project_root
 
-    monkeypatch.setattr("pdm.lab_ui.training_overview", lambda *_: True)
-    jobs = []
-    monkeypatch.setattr(app, "processed_ready", lambda _: True)
-    monkeypatch.setattr(app, "load_processed", lambda _: {"report": {}})
-    monkeypatch.setattr(app, "list_runs", lambda _: [])
-    monkeypatch.setattr(app, "worker_alive", lambda: False)
-    monkeypatch.setattr(app, "read_status", lambda: {"status": "idle"})
-    monkeypatch.setattr(app, "spawn_worker", jobs.append)
-    at = AppTest.from_string('from pdm.app import screen_train\nscreen_train("bearings")', default_timeout=15).run()
-    next(s for s in at.selectbox if s.label == "Architecture").set_value("fly_connectome_reservoir")
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at.session_state["screen_selection"] = "Model Report"
+    at.session_state["report_view"] = "Future-red entry"
     at.run()
-    assert not at.exception
-    assert not at.number_input
-    assert not any("Smoke" in r.options for r in at.radio)
-    next(b for b in at.button if b.label == "Train full MaleCNS from scratch").click()
-    at.run()
-    assert not at.exception
-    from pdm.training_protocol import protocol
 
-    assert jobs == [{"kind": "train_full_cns", "dataset_id": "bearings", "training_protocol": protocol("bearings")}]
+    assert not at.exception
+    assert any("Future-red entry model report" in str(header.value) for header in at.header)
+    assert not any(button.label == "Train full MaleCNS from scratch" for button in at.button)
 
 
 @pytest.mark.parametrize("cancel", [False, True])
