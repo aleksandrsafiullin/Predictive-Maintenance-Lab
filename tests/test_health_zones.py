@@ -99,3 +99,60 @@ def test_health_zones_view_without_model(monkeypatch):
     at.run()
     assert not at.exception
     assert any("pdm zones-train" in str(c.value) for c in at.code)
+
+
+def test_health_zones_load_the_run_snapshot(monkeypatch):
+    import pdm.data.prepare as prepare
+    import pdm.health_zones_ui as ui
+
+    calls = []
+
+    def load_processed(dataset_id, dataset_version=None):
+        calls.append((dataset_id, dataset_version))
+        return {"features": pd.DataFrame(), "split": {"train": []}, "dataset_version": dataset_version}
+
+    monkeypatch.setattr(prepare, "load_processed", load_processed)
+    ui._features.clear()
+    try:
+        _, _, version = ui._features("saved-zone-version")
+        assert version == "saved-zone-version"
+        assert calls == [("bearings", "saved-zone-version")]
+    finally:
+        ui._features.clear()
+
+
+def test_health_zones_reject_a_mismatched_snapshot(monkeypatch):
+    import pdm.data.prepare as prepare
+    import pdm.health_zones_ui as ui
+
+    monkeypatch.setattr(prepare, "load_processed", lambda dataset_id, version: {
+        "features": pd.DataFrame(), "split": {}, "dataset_version": "different-version",
+    })
+    ui._features.clear()
+    try:
+        with pytest.raises(ValueError, match="does not match zone run"):
+            ui._features("saved-zone-version")
+    finally:
+        ui._features.clear()
+
+
+def test_health_zones_view_reports_missing_run_snapshot(monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    import pdm.health_zones_ui as ui
+    from pdm.paths import project_root
+
+    monkeypatch.setattr(ui, "list_zone_runs", lambda dataset_id="bearings": [
+        {"run_id": "saved-run", "dir": "/tmp/saved-run"},
+    ])
+    monkeypatch.setattr(ui, "_run", lambda rdir: (
+        None, None, {"dataset_version": "missing-version"}, {},
+    ))
+    monkeypatch.setattr(ui, "_features", lambda version: (_ for _ in ()).throw(
+        FileNotFoundError("missing-version")))
+    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=30)
+    at.session_state["screen_selection"] = "Model Report"
+    at.session_state["report_view"] = "Health zones"
+    at.run()
+    assert not at.exception
+    assert any("snapshot for this zone run is unavailable" in str(e.value) for e in at.error)

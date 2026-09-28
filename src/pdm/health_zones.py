@@ -1,8 +1,9 @@
-"""Bearing health zones: green (normal) / yellow (degrading) / red (fix now).
+"""Bearing health zones: green (normal) / yellow (degrading) / red (urgent review).
 
-Labels come from each bearing's own vibration history and its recorded failure:
+Retrospective labels come from each bearing's vibration history and the final
+recorded sample, which is an experiment-end proxy rather than a confirmed failure:
 
-* red    — the last ``red_minutes`` before the recorded end of life;
+* red    — the last ``red_minutes`` before the recording ends;
 * yellow — from degradation onset: the first run of ``onset_persist`` consecutive
   measurements whose max(horizontal, vertical) RMS stays above
   ``max(median + 3*std, onset_ratio * median)`` of the first ``baseline_n``
@@ -46,12 +47,12 @@ ZONES = ("green", "yellow", "red")
 ZONE_LABELS = {
     "green": "Normal",
     "yellow": "Something is not right",
-    "red": "Fix ASAP",
+    "red": "Urgent review",
 }
 ZONE_ACTIONS = {
     "green": "Continue normal operation and monitoring.",
     "yellow": "Degradation detected. Plan inspection and prepare a replacement.",
-    "red": "Failure expected within about 30 minutes. Stop and replace the bearing.",
+    "red": "Inspect promptly and follow site procedures for an operating decision.",
 }
 CHANNELS = ("horizontal", "vertical")
 SIGNALS = ("rms", "std", "abs_peak", "peak_to_peak", "crest_factor", "kurtosis",

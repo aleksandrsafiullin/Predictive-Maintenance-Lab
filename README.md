@@ -15,7 +15,7 @@ English UI (Streamlit). Heavy jobs run in a background worker. Repo: https://git
 
 ## Bearing health zones (green / yellow / red)
 
-**Model Report → Health zones** plays a bearing's history minute by minute and shows its status: 🟢 normal, 🟡 something is not right (degradation detected), 🔴 fix ASAP (failure expected within about 30 minutes). Train with `.venv/bin/python -m pdm zones-train`. The recommended engine is a calibrated rule; a GRU classifier is available for comparison. In leave-bearings-out cross-validation no learned model beat the rule on these 15 bearings. Abrupt failures still give little or no red warning. See [health zones: definitions, design study and results](docs/health_zones.md).
+**Model Report → Health zones** plays a bearing's history minute by minute and shows its status: 🟢 normal, 🟡 degradation detected, 🔴 urgent condition review. Red is a condition warning, not a 30-minute failure forecast; its retrospective training label covers the last 30 minutes before the recording ends. That endpoint is a proxy, not a confirmed industrial failure time. Train with `.venv/bin/python -m pdm zones-train`. The recommended engine is a calibrated high-vibration rule; a GRU classifier is available for comparison. In leave-bearings-out cross-validation no learned model beat the rule on these 15 bearings. See [health zones: definitions, design study and results](docs/health_zones.md).
 
 ## Condition monitoring · 17 September 2026
 
