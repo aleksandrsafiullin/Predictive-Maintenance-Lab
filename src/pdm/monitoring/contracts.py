@@ -16,8 +16,9 @@ def dataset_profile(dataset_id):
         raise ValueError("Unknown monitoring dataset")
     bearings = dataset_id == "bearings"
     return {
-        "dataset_id": dataset_id, "time_basis": "physical_seconds" if bearings else "dataset_internal",
-        "time_scale_verified": bearings, "nominal_interval": 60. if bearings else 6.,
+        "dataset_id": dataset_id, "time_basis": "physical_seconds",
+        "time_scale_verified": True, "rul_scale_verified": bearings,
+        "nominal_interval": 60. if bearings else 0.1,
         "signal_name": "horizontal_rms" if bearings else "differential_pressure",
         "signal_unit": "g" if bearings else "Pa",
         "event_definition_id": "bearing_experiment_end_proxy_v1" if bearings else "filter_lab_600pa_v1",
@@ -31,14 +32,15 @@ def unit_verification(dataset_id):
     p = dataset_profile(dataset_id)
     return {**p, "schema_version": "unit_verification_v1",
             "legacy_timestamp_field": "timestamp_s",
-            "legacy_conversion": "fragment index * 60" if dataset_id == "bearings" else "Time * 60 (unverified)",
-            "sources": ["configs/" + dataset_id + ".yaml", "docs/quality_and_comparison.md"] + (["data/raw/filters/Preventive to Predictive Maintenance dataset.pdf (v1.4, pp3,6,7)"] if dataset_id == "filters" else []),
+            "legacy_conversion": "fragment index * 60" if dataset_id == "bearings" else "CSV Time used directly (seconds)",
+            "sources": ["configs/" + dataset_id + ".yaml", "docs/quality_and_comparison.md"] + (["data/raw/filters/Preventive to Predictive Maintenance dataset.pdf (v1.4, Figure 6 p5; Sampling p7)"] if dataset_id == "filters" else []),
             "signal_unit_status": "documented",
-            "dust_feed_source_unit": "mm3/s, documented; integral uses unverified time" if dataset_id == "filters" else None,
+            "rul_scale_verified": p["rul_scale_verified"],
+            "dust_feed_source_unit": "mm3/s, documented; integrated quantity not validated as mass" if dataset_id == "filters" else None,
             "unresolved": [] if dataset_id == "bearings" else [
-                "Source Time and RUL units not reconciled with acquisition Sampling Hz",
-                "Dust feed physical integral not verified; never label internal integral as mass"],
-            "action_timing_physical_allowed": p["time_scale_verified"]}
+                "Source schema does not restate RUL unit; corresponding-duration interpretation is assumed",
+                "Dust-feed integral aggregation is not validated; never label it as mass"],
+            "action_timing_physical_allowed": p["rul_scale_verified"]}
 
 
 def observation_columns(dataset_id):

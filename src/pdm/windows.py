@@ -69,9 +69,9 @@ def raw_numeric_columns(dataset_id: str | None) -> tuple[str, ...]:
     return ()
 
 
-# Filter Δt gaps. sampling_interval_s = CSV Time step 0.1 (assumed minutes) * time_to_seconds 60.
+# Filter Δt gaps. Source Time is seconds and CSV steps by 0.1 s.
 FILTER_GAP_MULTIPLIER = 3.0
-FILTER_SAMPLING_INTERVAL_S = 6.0
+FILTER_SAMPLING_INTERVAL_S = 0.1
 GAP_RULE_VERSION = "causal_v1"
 
 

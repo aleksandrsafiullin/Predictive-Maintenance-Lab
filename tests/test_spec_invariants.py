@@ -29,7 +29,6 @@ from pdm.config import load_dataset_config
 from pdm.data.archive import _describe_mat_variable, probe_mat
 from pdm.data.bearings import numeric_csv_index, sort_csv_names_numerically
 from pdm.data.filters import (
-    FILTER_TIME_SCALE_WARNING,
     FILTER_TIME_TO_SECONDS,
     FILTERS_FULL_HISTORY_STATUSES,
     _filters_full_history_status,
@@ -345,34 +344,44 @@ def test_rul_and_time_conversion(tmp_path, tiny_filter_tables):
     assert hours * 3600.0 == 1800.0
 
     cfg = load_dataset_config("filters")
-    assert float(cfg["time_to_seconds"]) == 60.0
-    assert FILTER_TIME_TO_SECONDS == 60.0
-    assert cfg.get("time_scale_verified") is False
-    assert cfg.get("original_time_unit") == "minutes"
+    assert float(cfg["time_to_seconds"]) == 1.0
+    assert FILTER_TIME_TO_SECONDS == 1.0
+    assert cfg.get("time_scale_verified") is True
+    assert cfg.get("original_time_unit") == "seconds"
     meta = filter_time_scale_meta(cfg)
-    assert meta["time_to_seconds"] == 60.0
-    assert meta["time_scale_verified"] is False
+    assert meta["time_to_seconds"] == 1.0
+    assert meta["time_scale_verified"] is True
     note = meta["time_unit_note"]
-    assert note == FILTER_TIME_SCALE_WARNING
+    assert "Time / s" in note
     lowered = note.lower()
-    assert "unconfirmed" in lowered
-    assert "wall-clock" in lowered
-    assert "minutes before failure" in lowered
-    assert "implementation_report" in lowered
-    assert "60" in note
-    np.testing.assert_allclose(_time_to_seconds(np.array([10.0]), 60.0), np.array([600.0]))
+    assert "seconds" in lowered
+    np.testing.assert_allclose(_time_to_seconds(np.array([10.0]), 1.0), np.array([10.0]))
+
+    # Source-like CSV uses the Figure 6 seconds scale; official prefix RUL is
+    # retained exactly and the implied endpoint is prefix time + remaining time.
+    source_raw = tmp_path / "source_like"
+    _write_tiny_filter_raw(source_raw)
+    source_features, source_units = extract_filters_tables(
+        {"mode": "filters_censored", "time_to_seconds": float(cfg["time_to_seconds"])},
+        raw_dir=source_raw,
+    )
+    source_test = source_units.set_index("unit_id").loc["Test_1"]
+    assert source_test["official_rul_at_prefix_end_s"] == source_test["official_rul_at_prefix_end_original"] * cfg["time_to_seconds"]
+    assert source_test["observation_end_s"] == pytest.approx(0.2)
+    assert source_test["official_rul_at_prefix_end_s"] == pytest.approx(5.0)
+    assert source_test["observation_end_s"] + source_test["official_rul_at_prefix_end_s"] == pytest.approx(5.2)
+    source_test_rows = source_features[source_features["unit_id"] == "Test_1"].sort_values("timestamp_s")
+    np.testing.assert_allclose(source_test_rows["timestamp_s"], [0.1, 0.2])
 
     features, units = tiny_filter_tables
     assert "time_original" in features.columns
     assert features["time_original"].notna().all()
-    np.testing.assert_allclose(features["timestamp_s"], features["time_original"] * 60.0)
+    # This fixture predates the source-unit correction and intentionally keeps
+    # a synthetic minute scale; extraction from source-like CSV is checked below.
     test_units = units[units["author_split"] == "author_test"]
     assert "official_rul_at_prefix_end_original" in test_units.columns
     assert test_units["official_rul_at_prefix_end_original"].notna().all()
-    np.testing.assert_allclose(
-        test_units["official_rul_at_prefix_end_s"],
-        test_units["official_rul_at_prefix_end_original"] * 60.0,
-    )
+    assert test_units["official_rul_at_prefix_end_s"].notna().all()
     assert "official_rul_at_prefix_end_original" in FORBIDDEN_FEATURE_NAMES
     assert "official_rul_at_prefix_end_s" in FORBIDDEN_FEATURE_NAMES
 
@@ -387,11 +396,10 @@ def test_rul_and_time_conversion(tmp_path, tiny_filter_tables):
         processed_root=tmp_path / "filters",
     )
     report = rec["report"]
-    assert report["time_to_seconds"] == 60.0
-    assert report["time_scale_verified"] is False
-    assert report["original_time_unit"] == "minutes"
-    assert report["time_unit_note"] == FILTER_TIME_SCALE_WARNING
-    assert any("unverified" in str(issue).lower() for issue in report["issues_and_decisions"])
+    assert report["time_to_seconds"] == 1.0
+    assert report["time_scale_verified"] is True
+    assert report["original_time_unit"] == "seconds"
+    assert "Time / s" in report["time_unit_note"]
 
     saved_feat = pd.read_parquet(rec["dir"] / "features.parquet")
     saved_units = pd.read_parquet(rec["dir"] / "units.parquet")
@@ -402,7 +410,7 @@ def test_rul_and_time_conversion(tmp_path, tiny_filter_tables):
     assert saved_test["official_rul_at_prefix_end_original"].notna().all()
 
     stamped = filter_time_scale_from_bound({"report": report, "processed_dir": rec["dir"]})
-    assert stamped["time_to_seconds"] == 60.0
+    assert stamped["time_to_seconds"] == 1.0
     assert stamped["time_unit_note"] == report["time_unit_note"]
     # Bound report wins; live YAML is not consulted.
     from_report_only = filter_time_scale_from_bound(
@@ -411,7 +419,7 @@ def test_rul_and_time_conversion(tmp_path, tiny_filter_tables):
     assert from_report_only["time_unit_note"] == "from-bound-report"
     from_file = filter_time_scale_from_bound({"report": {}, "processed_dir": rec["dir"]})
     assert from_file["time_unit_note"] == report["time_unit_note"]
-    assert from_file["time_to_seconds"] == 60.0
+    assert from_file["time_to_seconds"] == 1.0
 
 
 def test_censored_not_event_and_weibull_nll_and_grad():
@@ -955,7 +963,7 @@ def _loop_causal_gap(dt: np.ndarray, k: float, samp: float) -> np.ndarray:
 def test_filter_gap_params_match_documented_yaml():
     k, samp = filter_gap_params()
     assert k == 3.0
-    assert samp == 6.0
+    assert samp == 0.1
 
 
 def test_filter_gap_params_persisted_on_preprocessor(tiny_filter_tables):
@@ -3022,10 +3030,13 @@ def test_inspect_filters_full_history_readable_does_not_enable(tmp_path):
     assert vars_ and vars_[0]["name"] == "Train_Data_Uncensored"
     assert vars_[0]["opaque"] is False
     assert vars_[0]["fieldnames"] is None
-    feat, units = extract_filters_tables({"mode": "filters_censored", "time_to_seconds": 60.0}, raw_dir=tmp_path)
+    feat, units = extract_filters_tables({"mode": "filters_censored"}, raw_dir=tmp_path)
     assert set(feat["author_split"]) == {"author_train", "author_test"}
     assert "differential_pressure" in feat.columns
     assert len(units) == 2
+    train_feat = feat[feat["author_split"] == "author_train"].sort_values("timestamp_s")
+    np.testing.assert_allclose(train_feat["timestamp_s"], [0.1, 0.2, 0.3])
+    np.testing.assert_allclose(train_feat["delta_t_s"], [0.0, 0.1, 0.1])
 
 
 def test_extract_filters_rejects_full_history_mode():

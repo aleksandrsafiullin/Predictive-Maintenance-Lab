@@ -23,9 +23,9 @@ def overlay_history_caption() -> str:
 
 
 def overlay_x_scale(dataset_id: str) -> tuple[float, str]:
-    """Bearings plot minutes (s/60). Filters keep internal seconds (Time × 60 caption)."""
+    """Bearings plot minutes (s/60); filter CSV Time is plotted in seconds."""
     if str(dataset_id) == "filters":
-        return 1.0, "Internal time (s; Time × 60, unit unconfirmed)"
+        return 1.0, "Time (s)"
     return 60.0, "Operating time (min)"
 
 

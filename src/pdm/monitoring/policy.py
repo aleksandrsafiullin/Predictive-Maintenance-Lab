@@ -51,7 +51,9 @@ def action_timing(event, profile, policy, applicability, quality):
               "conservative_time_to_event": None, "prognostic_escalation_eligible": False,
               "reason": "forecast_not_validated_for_operational_timing"}
     action = policy["action_profile"]
-    if action["time_basis"] != profile["time_basis"] or not profile["time_scale_verified"]:
+    if (action["time_basis"] != profile["time_basis"]
+            or not profile["time_scale_verified"]
+            or not profile.get("rul_scale_verified", profile["time_scale_verified"])):
         result["reason"] = "incompatible_or_unverified_time_basis"
         return result
     if action["required_action_lead_time"] is None or action["safety_buffer"] is None:

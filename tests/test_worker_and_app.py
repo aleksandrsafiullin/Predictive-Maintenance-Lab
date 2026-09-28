@@ -195,10 +195,9 @@ def test_app_starts_without_data():
     assert not at.exception
 
 
-def test_app_filters_data_shows_time_scale_warning():
+def test_app_filters_data_shows_source_seconds_note():
     from streamlit.testing.v1 import AppTest
 
-    from pdm.data.filters import FILTER_TIME_SCALE_WARNING
     from pdm.paths import project_root
 
     at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
@@ -207,8 +206,8 @@ def test_app_filters_data_shows_time_scale_warning():
     _dataset_radio(at).set_value("Filters")
     at.run()
     assert not at.exception
-    texts = [str(w.value) for w in at.warning]
-    assert any(FILTER_TIME_SCALE_WARNING in t for t in texts)
+    captions = [str(w.value) for w in at.caption]
+    assert any('"Time / s" (page 5)' in text for text in captions)
 
 
 def test_app_data_screen_reads_cached_counts_not_build_windows(monkeypatch, tiny_filter_tables):
@@ -519,7 +518,7 @@ def test_app_train_screen_filters_shows_val_nll(monkeypatch, tiny_filter_tables)
     at.run()
     assert not at.exception
     captions = "\n".join(str(w.value) for w in at.caption)
-    assert "survival_nll (internal seconds)" in captions
+    assert "survival_nll (seconds)" in captions
     markdown = "\n".join(str(w.value) for w in at.markdown)
     assert "Training mode: **Full**" in markdown
 

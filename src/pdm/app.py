@@ -22,7 +22,6 @@ from pdm.architectures import is_reservoir
 from pdm.cli import spawn_worker
 from pdm.config import load_dataset_config, model_defaults
 from pdm.connectome.provenance import SYNTHETIC_DISCLAIMER
-from pdm.data.filters import filter_time_scale_meta
 from pdm.data.prepare import load_processed, processed_ready
 from pdm.device import resolve_device
 from pdm.evaluate import (
@@ -193,7 +192,13 @@ def main() -> None:
         # Legacy installations without a monitoring bundle keep their original
         # report entry point; published bundles make condition monitoring primary.
         available_runs = {r["run_id"] for r in list_runs(dataset_id)}
-        default_view = 0 if any(b["event_model_run_id"] in available_runs for b in bundles_for(dataset_id)) else 1
+        has_available_bundle = any(b["event_model_run_id"] in available_runs for b in bundles_for(dataset_id))
+        previous_report_dataset = st.session_state.get("_report_dataset")
+        if previous_report_dataset is not None and previous_report_dataset != dataset_id:
+            st.session_state.pop("report_view", None)
+        st.session_state["_report_dataset"] = dataset_id
+        default_view = (0 if has_available_bundle else
+                        4 if dataset_id == "filters" else 1)
         view = st.radio("Report view", ["Condition & Forecast", "Model replay", "Evaluation settings", "Experimental / Model activity", "Health zones"], index=default_view, horizontal=True, key="report_view", on_change=_pause_neural_runs)
         if view == "Health zones":
             from pdm.health_zones_ui import screen_health_zones
@@ -208,27 +213,21 @@ def main() -> None:
         else:
             screen_explorer(dataset_id)
     elif page == "Compare Models":
+        if dataset_id == "filters":
+            st.info(
+                "Filter model comparison is the historical RUL research workflow. Use Health zones for the current "
+                "standalone 300/600 Pa sensor-state replay; it does not depend on trained models."
+            )
         screen_comparison(dataset_id)
 
 
-def _filters_time_warning(report: dict | None = None) -> str:
-    note = (report or {}).get("time_unit_note")
-    if note:
-        return str(note)
-    return str(filter_time_scale_meta(load_dataset_config("filters"))["time_unit_note"])
-
-
-def _render_filters_time_warning():
-    st.caption("Filter time scale is unverified. Time × 60 is an internal comparison unit, not confirmed wall-clock seconds.")
-    with st.expander("Time-scale assumption and source details"):
-        st.warning(_filters_time_warning())
-
-
-def _filters_scale_unverified(report: dict | None = None) -> bool:
-    if report and "time_scale_verified" in report:
-        return not bool(report["time_scale_verified"])
-    return not bool(load_dataset_config("filters").get("time_scale_verified", False))
-
+def _render_filters_time_note():
+    st.caption('Filter source timestamps are seconds: the HSE paper labels Figure 6 "Time / s" (page 5).')
+    with st.expander("Source time units and event interpretation"):
+        st.info(
+            "The HSE paper's Figure 6 labels Time in seconds. An observed 600 Pa crossing is a laboratory event label; "
+            "it is not a confirmed equipment failure timestamp or a validated time-to-failure target."
+        )
 
 def _finite_number(val) -> bool:
     try:
@@ -324,8 +323,8 @@ def _regimes_frame(report: dict) -> pd.DataFrame | None:
 
 def screen_data(dataset_id: str) -> None:
     st.header(f"Data Quality — {LABELS[dataset_id]}")
-    if dataset_id == "filters" and _filters_scale_unverified():
-        _render_filters_time_warning()
+    if dataset_id == "filters":
+        _render_filters_time_note()
     state = _data_state(dataset_id)
     st.write("Data state:", state)
     raw = dataset_raw(dataset_id)
@@ -408,7 +407,7 @@ def screen_data(dataset_id: str) -> None:
             st.metric("Total observation span", f"{float(span) / 60.0:.1f} min")
         else:
             st.metric("Total observation span", f"{float(span):.1f} s")
-            st.caption("Observation span is internal seconds (CSV Time × 60; not wall-clock minutes).")
+            st.caption('Time values follow the HSE source paper axis label "Time / s" (Figure 6, page 5).')
     regimes = _regimes_frame(report)
     if regimes is not None:
         st.subheader("Regimes")
@@ -446,7 +445,7 @@ def screen_data(dataset_id: str) -> None:
     else:
         fig.add_trace(go.Scatter(x=g["timestamp_s"], y=g["differential_pressure"], name="Δp"))
         fig.add_hline(y=600.0, line_dash="dash", annotation_text="600 Pa")
-        fig.update_xaxes(title_text="Internal time (s; Time × 60, unit unconfirmed)")
+        fig.update_xaxes(title_text="Time (s; HSE source Figure 6)")
         fig.update_yaxes(title_text="Differential pressure (Pa)")
     st.plotly_chart(fig, width="stretch")
     st.subheader("Target and quality")
@@ -455,11 +454,9 @@ def screen_data(dataset_id: str) -> None:
     st.caption(phys.get("note") or "")
     if dataset_id == "filters" and report.get("time_unit_note"):
         st.caption(
-            "Exports keep original CSV Time/RUL as time_original and "
-            "official_rul_at_prefix_end_original. Metrics use an _s suffix on the "
-            "internal Time × 60 scale — not wall-clock minutes. "
-            "Official test RUL is evaluation-only; sensor observations stop at "
-            "observation_end_s and that is not a 600 Pa event."
+            "Sensor timestamps use seconds as labelled in the source paper. Exports retain original CSV Time/RUL fields. "
+            "A 600 Pa event and any RUL derived from it are laboratory endpoint labels; official test RUL is evaluation-only, "
+            "and a sensor observation end is not itself a pressure event."
         )
     if report.get("issues_and_decisions"):
         for issue in report["issues_and_decisions"]:
@@ -503,6 +500,11 @@ def _windows_used_caption(rec: dict) -> str:
 
 def screen_train(dataset_id: str) -> None:
     st.header(f"Training — {LABELS[dataset_id]}")
+    if dataset_id == "filters":
+        st.info(
+            "Filter training is the historical RUL research workflow. Use Health zones for the current standalone "
+            "300/600 Pa sensor-state replay; that view needs no trained RUL model."
+        )
     from pdm.monitoring.ui import training_controls
 
     training_controls(dataset_id)
@@ -576,7 +578,7 @@ def screen_train(dataset_id: str) -> None:
         sampling = st.selectbox("Window sampling", ["unit_replacement", "full_pass"])
         if dataset_id == "bearings" and sampling == "full_pass":
             near_weight = .5 if st.checkbox("Give half the training weight to the final 30 minutes") else 0.0
-        sel_spec = {"label": "near_30m_mae_s" if dataset_id == "bearings" else "survival_nll (internal seconds)"}
+        sel_spec = {"label": "near_30m_mae_s" if dataset_id == "bearings" else "survival_nll (seconds)"}
     _mode_badge(smoke)
     if smoke:
         st.warning("Smoke test — not a quality benchmark")
@@ -1247,8 +1249,8 @@ def screen_replay(dataset_id: str) -> None:
     st.button("Open model replay", on_click=_open_neural_test_run)
     st.header(f"Test & Replay — {LABELS[dataset_id]}")
     st.info("Historical replay — not a live equipment connection")
-    if dataset_id == "filters" and _filters_scale_unverified():
-        _render_filters_time_warning()
+    if dataset_id == "filters":
+        _render_filters_time_note()
     if not processed_ready(dataset_id):
         st.warning("Prepare data first.")
         return
@@ -1292,8 +1294,8 @@ def screen_replay(dataset_id: str) -> None:
         ["seconds", "minutes", "hours"],
         index=0 if dataset_id == "filters" else 1,
         help=(
-            "For filters, seconds are internal Time × 60 values. Choosing minutes "
-            "only divides by 60 — not calibrated wall-clock."
+            'For filters, source Time is in seconds (HSE Figure 6, page 5). Choosing minutes only changes display units. '
+            "RUL remains an experimental estimate of a laboratory endpoint, not a validated failure deadline."
             if dataset_id == "filters"
             else "Horizon display unit. Bearings fragment interval is 60 s."
         ),
@@ -1350,8 +1352,7 @@ def screen_replay(dataset_id: str) -> None:
     )
     if dataset_id == "filters":
         st.caption(
-            "H_trigger is a threshold on internal seconds (Time × 60), not an accuracy "
-            "promise and not a calibrated “minutes before failure” clock. Changing H "
+            "H_trigger is a threshold in seconds, not an accuracy promise or a calibrated failure deadline. Changing H "
             "does not retrain the network."
         )
     else:
@@ -1689,8 +1690,8 @@ def _eval_artifact_downloads(artifacts: dict, dataset_id: str) -> None:
     eval_key = artifacts.get("eval_id") or "legacy"
     if dataset_id == "filters":
         st.caption(
-            "CSV columns use an _s suffix on the internal Time × 60 scale and keep "
-            "time_original when present. That is not calibrated wall-clock minutes. "
+            "CSV columns with an _s suffix use source seconds and keep time_original when present. "
+            "Predicted RUL describes the trained laboratory endpoint task; it is not a validated equipment failure clock. "
             "Files are read from the evaluation directory."
         )
     else:
@@ -1717,13 +1718,13 @@ def _format_h_trigger_header(h_s: float | None, dataset_id: str) -> str:
     if h_s is None or not _finite_number(h_s):
         return "unavailable"
     if dataset_id == "filters":
-        return f"{h_s:.4g} s (internal)"
+        return f"{h_s:.4g} s"
     return f"{h_s:.4g} s ({h_s / 60.0:.3g} min)"
 
 
 def _format_replay_clock(t_s: float, dataset_id: str) -> str:
     if dataset_id == "filters":
-        return f"{t_s:.1f} s (internal)"
+        return f"{t_s:.1f} s"
     return f"{t_s / 60.0:.2f} min"
 
 
@@ -1837,9 +1838,9 @@ def _replay_demo_figure(
     filter_scale = dataset_id == "filters"
     x_scale = 1.0 if filter_scale else 60.0
     x_title = (
-        "Internal time (s; Time × 60, unit unconfirmed)" if filter_scale else "Operating time (min)"
+        "Time (s; HSE source Figure 6)" if filter_scale else "Operating time (min)"
     )
-    rul_title = "Remaining useful life (s, internal)" if filter_scale else "Remaining useful life (min)"
+    rul_title = "Remaining useful life (s)" if filter_scale else "Remaining useful life (min)"
     sensor_title = "Sensor"
     rul_panel = "RUL"
     fig = make_subplots(
@@ -2149,7 +2150,7 @@ def _replay_playback_body() -> None:
         c1, c2, c3, c4 = st.columns(4)
         age_s = replay_time if math.isfinite(replay_time) else 0.0
         scale = 1.0 if filter_scale else 60.0
-        display_unit = "s, internal" if filter_scale else "min"
+        display_unit = "s" if filter_scale else "min"
         rul = current.get("predicted_rul_s") if current is not None else None
         interval = _current_replay_interval(current)
         c1.metric(f"Operating age ({display_unit})", f"{age_s / scale:.1f}")

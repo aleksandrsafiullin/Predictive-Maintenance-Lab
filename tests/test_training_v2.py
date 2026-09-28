@@ -223,7 +223,14 @@ def test_feature_recipe_replay_matches_ordinary_prediction(tiny_filter_tables):
     from pdm.replay import replay_unit
     from pdm.visualization.simulation import window_forecast_history
 
-    features, units = tiny_filter_tables
+    features, units = (frame.copy() for frame in tiny_filter_tables)
+    # The shared synthetic fixture still stores filters on its historical
+    # minute-to-second scale. This test exercises replay under the corrected
+    # source-seconds contract, so normalize its clocks and RUL labels to seconds.
+    for column in ("timestamp_s", "operating_age_s", "delta_t_s"):
+        features[column] = features[column] / 60.0
+    for column in ("event_time_s", "observation_end_s", "official_rul_at_prefix_end_s"):
+        units[column] = units[column] / 60.0
     split = {"train": ["Filter_1", "Filter_3"], "validation": ["Filter_2"], "test": ["Filter_101"]}
     cfg = load_dataset_config("filters")
     cfg["feature_recipe"] = "degradation_v1"
@@ -239,7 +246,7 @@ def test_feature_recipe_replay_matches_ordinary_prediction(tiny_filter_tables):
         assert ordinary["predicted_rul_s"] == cached["predicted_rul_s"] == traced["predicted_rul_s"]
     chart = window_forecast_history(prefix, model, prep, 20)
     replay = replay_unit(prefix, predictor, dataset_id="filters", unit_id="Filter_2", run_id="fixture",
-                         history_length=20, warning_horizon_s=420, truth_units=units)["predictions"]
+                         history_length=20, warning_horizon_s=7, truth_units=units)["predictions"]
     np.testing.assert_allclose(chart.predicted_rul_s, replay.predicted_rul_s, equal_nan=True, rtol=0, atol=0)
 
 

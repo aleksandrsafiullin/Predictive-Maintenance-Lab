@@ -198,11 +198,9 @@ def prepare_dataset(dataset_id: str, progress: ProgressFn | None = None) -> dict
         split = filters_split(units, cfg)
         ts_meta = filter_time_scale_meta(cfg)
         sensor_note = (
-            f"CSV Time is multiplied by time_to_seconds={ts_meta['time_to_seconds']} "
-            f"(original_time_unit treated as {ts_meta['original_time_unit']}, unverified). "
-            "PDF documents Sampling in Hz but does not name the Time unit. "
-            "See time_unit_note in this report and reports/implementation_report.md "
-            "(Filters / HSE; §7 Limitations). "
+            f"CSV Time is converted with time_to_seconds={ts_meta['time_to_seconds']} "
+            f"(source unit: {ts_meta['original_time_unit']}). Figure 6 labels Time / s; "
+            "p7 documents Sampling in Hz. See docs/data_units_and_endpoints.md. "
             "Training labels use 600 Pa events vs right-censoring; official test RUL is evaluation-only."
         )
 
@@ -450,8 +448,7 @@ def _data_report(dataset_id, features, units, split, cfg, sensor_note, inspectio
     ts_meta = filter_time_scale_meta(cfg) if dataset_id == "filters" else {}
     if dataset_id == "filters" and not ts_meta.get("time_scale_verified"):
         issues.append(
-            "Time/RUL scale unverified; time_to_seconds=60 is frozen. "
-            "See time_unit_note. Do not treat internal seconds as wall-clock minutes."
+            "Time/RUL scale is unverified. See time_unit_note."
         )
     if split.get("warning"):
         issues.append(split["warning"])
@@ -644,14 +641,14 @@ def _history_physical(dataset_id, cfg, features) -> dict[str, Any]:
             "note": f"{h} fragments × {dt}s interval = {h * dt / 60:.0f} minutes of operating time",
         }
     dt = float(features["delta_t_s"].median()) if "delta_t_s" in features.columns else float("nan")
-    factor = float(cfg.get("time_to_seconds", 60.0))
+    factor = float(cfg.get("time_to_seconds", 1.0))
     return {
         "history_length": h,
         "median_dt_s": dt,
         "span_s": h * dt if dt == dt else None,
         "note": (
-            f"{h} samples × median Δt_s (internal seconds = original Time × {factor:g}; "
-            "unit unconfirmed, not wall-clock minutes)"
+            f"{h} samples × median Δt_s; source Time is seconds "
+            f"(conversion factor {factor:g}). RUL is interpreted on the corresponding duration scale."
         ),
     }
 
