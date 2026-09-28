@@ -26,9 +26,9 @@ this rule: `Bearing1_4`, `Bearing2_4`, `Bearing3_3`, and `Bearing3_5`.
 Trained run `zones_20260928_200845_2f9991`
 (`runs/_zones/bearings/.../metrics.json`) selected epoch 4 of 5 on validation.
 Against the sensor-derived weak labels,
-the smoothed model had validation unit-balanced accuracy 0.973, balanced
-accuracy 0.790, and red recall 0.579; it raised red on two of three validation
-bearings. On test it had unit-balanced accuracy 0.969, balanced accuracy 0.956,
+the smoothed model had validation unit-balanced accuracy 0.973, **unit-balanced
+balanced accuracy** 0.790, and red recall 0.579; it raised red on two of three validation
+bearings. On test it had unit-balanced accuracy 0.969, unit-balanced balanced accuracy 0.956,
 and red recall 0.959, raising red on all three test bearings. Median first-red
 lead relative to the recorded endpoint was 41.5 minutes on validation and 102
 minutes on test. These are agreement and timing summaries on a small laboratory
@@ -50,59 +50,58 @@ strictly above 600 Pa, distinct from the display's red boundary at or above
 evidence and do not change the pressure class. See [filter zone definition](filter_sensor_zones.md)
 and [filter_zones.py](../src/pdm/monitoring/filter_zones.py).
 
-The current exported label artifact `filter_sensor_zones_v2_662288ba7101`
+The current exported label artifact `filter_sensor_zones_v2_876a032e8d53`
 (`runs/_zones/filters/label_artifacts/.../manifest.json`) is bound to data
-version `20260915T153833Z_4182d92b` and policy
+version `20260928T170138Z_aa9b4ad0` and policy
 `filter_pressure_warning_300pa_v1`. It includes 78,236 row-admitted measurements
 from 99 units: 72,662 green, 5,512 yellow, 5 red, and 57 gray. The source has
 78,834 measurement records; 598 were excluded before the admitted feature rows.
 The artifact records that event/RUL/future labels were not used for zone
 classification.
 
-Fresh validation evaluation `20260928T152551Z_91e713`
-(`runs/monitoring_bundles/98c47636891c3ac099dd12ea/evaluations/.../evaluation.json`)
-completed as `validation_diagnostics` for bundle `98c47636891c3ac099dd12ea`,
-processing 5,763 observations across 10 units.
-Its saved sensor-zone colors count 5,595 green, 166 yellow, 1 red, and 1 gray;
-these match the validation split of the label artifact. This is a validation
-diagnostic, not a test result.
+The validation split has 5,595 green, 166 yellow, 1 red, and 1 gray rows.
+The standalone **Health zones** screen reads the current prepared snapshot and
+this exact versioned label artifact. It checks version, fingerprint, policy,
+split, count, and label hash before replay. It does not require an event model
+or a monitoring bundle.
 
-## Existing event-model verification
+## Retired RUL training artifacts
 
-The existing event-model batch `20260915T154129Z_78a7fa`
-(`runs/batches/.../manifest.json`) contains the five bearing models and four
-filter models. They were verified from saved runs; they were **not retrained**
-for this sensor-zone change. The recorded local output is
-`output/sensor-zones-existing-event-matrix-verification.json`.
-It covers all nine models, checks forecast parity against saved predictions,
-trace/plain parity, deterministic replay, and independence from future rows and
-truth. All four saved comparison exports (bearing/filter validation/test) match
-their saved evaluations in CSV and JSON.
+The prior event-model runs, batches, comparisons, training and condition studies,
+and monitoring bundles were removed from the active local `runs/` directory on
+28 September 2026. A recoverable copy is in
+`~/.Trash/Predictive-Maintenance-Lab-old-RUL-2026-09-28/`, with
+`archive_manifest.json`. These artifacts estimated remaining time or depended on
+the old event models. They are not current red-zone training results. The
+bearing sensor-zone labels and GRU, and the refreshed filter sensor-zone labels,
+remain active. Old published study reports are historical records only.
 
 ## Limits
 
 The filter cohort has four observed events in training, one in validation, and
 none in its 50 test prefixes. Test RUL labels do not make those prefixes
 observed failures. The observed event total is five independent filter units;
-repeated rows are not additional events. Filter source `Time` and RUL physical
-units remain unverified, so filter timing is reported only in dataset-internal
-time. The bearing zone labels are weak signal rules, the red threshold is
+repeated rows are not additional events. HSE Figure 6 labels source `Time / s`;
+RUL uses the corresponding duration scale by inference from the CSV, since its
+unit is not separately restated in the source schema. The bearing zone labels
+are weak signal rules, the red threshold is
 provisional, and only three bearings are present in each validation and test
 split. Neither dataset supports a production protection claim or calibrated
 operator probabilities.
 
 ## Local artifacts and reproduction
 
-`runs/` and `output/` are ignored local directories, so the artifact files and
-verification JSON above are not included in GitHub merges. Their IDs, counts,
-and metrics are recorded here from the local manifests and outputs. Recreate
-them from the repository root when the corresponding prepared data, saved
-bundle, and prior event-model batch are available:
+`runs/` and `data/processed/` are ignored local directories, so these artifacts
+are not included in GitHub merges. Their IDs, counts, and metrics are recorded
+from local manifests. Recreate current labels from the repository root after
+preparing the source data:
 
 ```sh
-PYTHONPATH=src .venv/bin/python -m pdm zones-labels --dataset bearings
-PYTHONPATH=src .venv/bin/python -m pdm zones-labels --dataset filters
-PYTHONPATH=src .venv/bin/python -m pdm zones-train
-PYTHONPATH=src .venv/bin/python -m pdm monitor-evaluate --bundle-id 98c47636891c3ac099dd12ea --split validation
-PYTHONPATH=src .venv/bin/python scripts/verify_quality_study.py 20260915T154129Z_78a7fa --scope main --output output/sensor-zones-existing-event-matrix-verification.json
+.venv/bin/python -m pdm prepare --dataset filters
+.venv/bin/python -m pdm zones-labels --dataset filters
+.venv/bin/python -m pdm zones-labels --dataset bearings
+.venv/bin/python -m pdm zones-train
 ```
+
+See the [benchmark review](sensor_zone_benchmark_review.md) for threshold
+sensitivity and the interpretation of 0.790/0.956.

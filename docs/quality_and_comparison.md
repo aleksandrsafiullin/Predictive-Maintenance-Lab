@@ -25,7 +25,7 @@ On the real source files prepared on 2026-09-15:
 - Bearings: 9,216 admitted measurements, 15 series, no rejected records; split 9/3/3.
 - Filters: 78,236 admitted measurements, 99 series; split 39/10/50. `Train_28` (598 records) is excluded because its first source time is 157.2, followed by 0.2. Four observed train failures and one validation failure remain. Large signals marked for attention remain available.
 
-Bearing `last_recorded_sample` is an experiment-end approximation, not a verified industrial failure time. Filter times retain the project's unverified `Time × 60` convention.
+Bearing `last_recorded_sample` is an experiment-end approximation, not a verified industrial failure time. The HSE paper's Figure 6 (p5) labels Time in seconds, so filter timestamps use the CSV Time values directly; their nominal interval is 0.1 s. The source schema does not repeat the unit for RUL, so evaluation treats it as the corresponding remaining duration. This interpretation remains a caveat for RUL-based action timing.
 
 A censored series establishes that the equipment continued to operate for its remaining observed duration. The existing Weibull survival loss uses this lower bound without inventing a failure time. See the [scikit-survival introduction](https://scikit-survival.readthedocs.io/en/stable/user_guide/00-introduction.html).
 

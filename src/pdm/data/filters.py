@@ -18,22 +18,18 @@ from pdm.windows import filter_gap_params, gap_before_from_delta_t
 ProgressFn = Callable[[str, dict[str, Any]], None]
 
 PRESSURE_LIMIT_PA = 600.0
-# Frozen conversion. Not calibrated wall-clock minutes; PDF does not name Time.
-FILTER_TIME_TO_SECONDS = 60.0
+# Source Figure 6 labels Time / s; CSV Time is already seconds.
+FILTER_TIME_TO_SECONDS = 1.0
 FILTER_TIME_SCALE_SOURCES = (
-    "reports/implementation_report.md (Filters / HSE)",
-    "reports/implementation_report.md §7 Limitations",
+    "Preventive to Predictive Maintenance dataset.pdf, Figure 6 (p5)",
+    "Preventive to Predictive Maintenance dataset.pdf, Sampling description (p7)",
     "configs/filters.yaml",
 )
 FILTER_TIME_SCALE_WARNING = (
-    "Filter Time/RUL unit compatibility is unconfirmed. The source PDF does not "
-    "name the Time column unit. Internal values use Time × 60 (working assumption: "
-    "original unit = minutes → seconds). This is not calibrated wall-clock time — "
-    "do not read alerts as “X minutes before failure”. Original CSV Time and test "
-    "RUL are stored as time_original and official_rul_at_prefix_end_original. "
-    "Assumption recorded in reports/implementation_report.md (Filters / HSE; "
-    "§7 Limitations); CRAN degradr labels RUL as hours (conflict, not used). "
-    "time_to_seconds=60 is frozen; changing it requires a new data version and retrain."
+    "Source Figure 6 labels Time / s and p7 reports Sampling in Hz; CSV Time is "
+    "used as seconds. RUL is treated as the corresponding remaining duration. "
+    "Original CSV Time and test RUL are preserved as time_original and "
+    "official_rul_at_prefix_end_original."
 )
 FILTERS_CENSORED_MODE = "filters_censored"
 FILTERS_FULL_HISTORY_MAT_NAME = "Train_Data_Uncensored.mat"
@@ -251,17 +247,18 @@ def _require_columns(df: pd.DataFrame, required: list[str], path: Path) -> None:
 
 
 def filter_time_scale_meta(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Documented Time/RUL scale. Factor stays 60 unless a new data version is cut."""
+    """Documented Time/RUL scale. CSV Time is in seconds (factor 1)."""
     cfg = cfg or {}
     factor = float(cfg.get("time_to_seconds", FILTER_TIME_TO_SECONDS))
-    original = str(cfg.get("original_time_unit") or "minutes")
+    original = str(cfg.get("original_time_unit") or "seconds")
     verified = bool(cfg.get("time_scale_verified", False))
     note = (
         FILTER_TIME_SCALE_WARNING
         if not verified
         else (
-            f"Time/RUL converted with time_to_seconds={factor} "
-            f"(original unit {original}); scale marked verified in config."
+            f"Source Figure 6 labels Time / s; CSV Time is converted with "
+            f"time_to_seconds={factor} (original unit {original}). RUL is treated "
+            "as the corresponding remaining duration."
         )
     )
     return {
@@ -274,7 +271,7 @@ def filter_time_scale_meta(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def _time_to_seconds(time_original: np.ndarray, factor: float) -> np.ndarray:
-    # factor is the frozen YAML coefficient (60), not a confirmed minute clock.
+    # Source Time is already seconds; apply the configured conversion (normally 1).
     return np.asarray(time_original, dtype=np.float64) * float(factor)
 
 

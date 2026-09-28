@@ -145,10 +145,12 @@ def _metrics_table(metrics: dict) -> pd.DataFrame:
 
 
 def screen_health_zones(dataset_id: str) -> None:
-    st.subheader("Health zones")
-    if dataset_id != "bearings":
-        st.info("Health zones are available for bearings (run-to-failure vibration data). Select Bearings in the sidebar.")
+    if dataset_id == "filters":
+        from pdm.filter_health_zones_ui import screen_filter_health_zones
+
+        screen_filter_health_zones()
         return
+    st.subheader("Health zones")
     runs = list_zone_runs("bearings")
     if not runs:
         st.info("No health-zone model yet. Train one from a terminal:")

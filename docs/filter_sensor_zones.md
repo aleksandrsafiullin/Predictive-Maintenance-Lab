@@ -45,6 +45,9 @@ the UI as predating this feature and need a new evaluation. A zone-label CSV tre
 each accepted row as a contemporaneous observation; runtime checks can return gray
 when that observation is stale relative to a later `as_of` time.
 
-Flow/feed values are shown as recorded source values. HSE `Time` units remain
-unverified; trends are never converted to physical minutes or seconds. This is a
-laboratory condition view, not an operational safety claim.
+Flow/feed values are shown as recorded source values. HSE Figure 6 labels the
+source time axis `Time / s`; the CSV advances in 0.1-second steps. Trends and
+replay timestamps therefore use source seconds. The RUL column's unit is
+inferred from its relation to Time, rather than stated separately in the source
+schema. This remains a laboratory condition view, not an operational safety
+claim; see [data units and endpoints](data_units_and_endpoints.md).

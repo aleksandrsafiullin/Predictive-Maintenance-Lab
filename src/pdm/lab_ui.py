@@ -217,7 +217,7 @@ def report_evaluations(dataset_id, run_id):
             metric = "30-min MAE" if dataset_id == "bearings" else "Survival NLL" if result["split"] == "validation" else "Prefix-end MAE"
             cols = st.columns(3)
             score = row.primary_score
-            cols[0].metric(metric, "—" if pd.isna(score) else f"{score:.3f}", help="MAE is in internal seconds; NLL is dimensionless.")
+            cols[0].metric(metric, "—" if pd.isna(score) else f"{score:.3f}", help="MAE is in seconds; NLL is dimensionless.")
             cols[1].metric("Prediction coverage", f"{row.prediction_coverage:.0%}")
             cols[2].metric("Evaluation units", int(row.units))
             if row.reason:
@@ -303,7 +303,10 @@ def screen_comparison(dataset_id):
     split = st.radio("Comparison split", ["validation", "test"], horizontal=True, key="comparison_split:" + dataset_id)
     st.info("Choose models using validation. Test is a previously inspected holdout; these results are exploratory." if split == "test" else "Validation selects candidates. Interval coverage on calibration units is labelled in each model report.")
     if dataset_id == "filters":
-        st.caption("Filter time scale is unverified. MAE uses the existing internal Time × 60 convention.")
+        st.caption(
+            'Filter Time uses source seconds (HSE Figure 6, page 5). These saved-model comparisons are historical RUL research; '
+            "a 600 Pa crossing is a laboratory endpoint, not a validated equipment failure clock."
+        )
     choices = evaluation_choices(dataset_id, split)
     include_diagnostics = st.checkbox("Include historical, smoke and synthetic runs", value=False)
     if not include_diagnostics:
@@ -356,7 +359,7 @@ def screen_comparison(dataset_id):
     table = result["table"]
     metric = "MAE in the final 30 minutes" if dataset_id == "bearings" else "Survival NLL on all validation units" if split == "validation" else "MAE at official prefix endpoints"
     st.markdown(f"**Primary metric: {metric} · lower is better**")
-    st.caption("Every equipment unit has equal weight. Missing forecasts reduce coverage and prevent ranking. All MAE columns use internal seconds.")
+    st.caption("Every equipment unit has equal weight. Missing forecasts reduce coverage and prevent ranking. All MAE columns use seconds.")
     leading_columns = ["rank", "model", "nodes", "state_mode", "feature_recipe", "primary_score", "prediction_coverage", "units", "observed_events", "warning_goal_met", "reason"]
     display = table[leading_columns].copy()
     display["model"] = table.run_id.map(lambda rid: model_label(runs[rid]))
@@ -403,7 +406,7 @@ def screen_comparison(dataset_id):
         fig.add_trace(go.Scatter(x=g.timestamp_s / scale, y=g.predicted_rul_s / scale, name=label, line_color=color), row=1, col=1)
         if has_truth:
             fig.add_trace(go.Scatter(x=g.timestamp_s / scale, y=g.absolute_error_s / scale, name=label, line_color=color, showlegend=False), row=2, col=1)
-    fig.update_xaxes(title_text="Time (min)" if scale == 60 else "Time (internal seconds)", row=2 if has_truth else 1, col=1)
+    fig.update_xaxes(title_text="Time (min)" if scale == 60 else "Time (s)", row=2 if has_truth else 1, col=1)
     style_figure(fig, 740 if has_truth else 540)
     # Up to six wrapped legend lines on a narrow screen. Anchor above the
     # subplot title so labels never cover the measurements.

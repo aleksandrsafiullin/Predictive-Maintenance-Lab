@@ -30,7 +30,7 @@ from pdm.windows import raw_numeric_columns
 
 
 def fixture_frame(n=80, dataset="bearings", uid="a"):
-    dt = 60. if dataset == "bearings" else 6.
+    dt = 60. if dataset == "bearings" else 0.1
     frame = pd.DataFrame({c: np.ones(n) for c in raw_numeric_columns(dataset)})
     frame["unit_id"] = uid
     frame["dataset_id"] = dataset
@@ -58,6 +58,31 @@ def setup(frame):
     policy.update(warning_enter=5., warning_exit=2.)
     return {"profile": profile, "reference": reference, "state_policy": policy,
             "quality_policy": quality_policy(profile), "bundle_id": "synthetic_test"}
+
+
+def test_filter_profile_uses_source_seconds_and_keeps_rul_action_gate_closed():
+    from pdm.monitoring.contracts import unit_verification
+
+    profile = dataset_profile("filters")
+    assert profile["time_basis"] == "physical_seconds"
+    assert profile["time_scale_verified"] is True
+    assert profile["nominal_interval"] == pytest.approx(0.1)
+    assert profile["rul_scale_verified"] is False
+    verification = unit_verification("filters")
+    assert verification["legacy_conversion"] == "CSV Time used directly (seconds)"
+    assert verification["action_timing_physical_allowed"] is False
+    assert any("RUL unit" in reason for reason in verification["unresolved"])
+
+    policy = default_policy(profile)
+    policy["action_profile"].update(required_action_lead_time=5., safety_buffer=1.,
+                                    verification_status="laboratory_definition")
+    event = {"event_definition_id": profile["event_definition_id"],
+             "time_basis": "physical_seconds", "timing_validated": True,
+             "validated_horizon": 20.,
+             "interval": {"lower": 10., "upper": 12., "method": "research"}}
+    timing = action_timing(event, profile, policy, "in_domain", "valid")
+    assert timing["prognostic_escalation_eligible"] is False
+    assert timing["reason"] == "incompatible_or_unverified_time_basis"
 
 
 @pytest.mark.parametrize("mode", ["fixed_20", "fixed_40", "fixed_60", "variable_20_60"])
@@ -200,16 +225,16 @@ def test_hard_limit_before_warmup_ood_and_loss_preserves_latch():
     args = setup(fixture_frame(30, "filters"))
     f.loc[0, "differential_pressure"] = 650
     f.loc[0, "dust"] = "unseen"
-    result, state = monitoring_step(f.iloc[:1], as_of=6, **args)
+    result, state = monitoring_step(f.iloc[:1], as_of=.1, **args)
     assert result["condition"]["display_zone"] == "red"
     assert result["model_applicability"] == "out_of_domain"
-    result, state = monitoring_step(f.iloc[:1], as_of=60, previous=state, **args)
+    result, state = monitoring_step(f.iloc[:1], as_of=1., previous=state, **args)
     assert result["condition"]["display_zone"] == "gray"
     assert result["condition"]["critical_latch"]
     assert state["active_episode"]
     broken = f.iloc[:1].copy()
     broken["differential_pressure"] = np.nan
-    result, _ = monitoring_step(broken, as_of=6, **args)
+    result, _ = monitoring_step(broken, as_of=.1, **args)
     assert result["condition"]["display_zone"] == "gray"
 
 
@@ -402,9 +427,9 @@ def test_channel_limit_is_independent_of_broken_covariate_but_not_stale():
     args = setup(frame)
     frame.loc[29, "flow_rate"] = np.nan
     frame.loc[29, "differential_pressure"] = 700.
-    result, _ = monitoring_step(frame, as_of=180., **args)
+    result, _ = monitoring_step(frame, as_of=3.0, **args)
     assert result["condition"]["display_zone"] == "red"
-    result, _ = monitoring_step(frame, as_of=300., **args)
+    result, _ = monitoring_step(frame, as_of=3.4, **args)
     assert result["condition"]["display_zone"] == "gray"
 
 
@@ -461,11 +486,11 @@ def test_historical_fragment_damage_and_sensor_range_reset_warmup():
     profile = dataset_profile("filters")
     policy = quality_policy(profile)
     frame.loc[65, "differential_pressure"] = 3000
-    assert assess_quality(frame, profile, policy, 480)["available_measurements"] == 14
+    assert assess_quality(frame, profile, policy, 8.0)["available_measurements"] == 14
     frame.loc[65, "differential_pressure"] = 100
     frame["sample_count_ok"] = True
     frame.loc[70, "sample_count_ok"] = False
-    assert assess_quality(frame, profile, policy, 480)["available_measurements"] == 9
+    assert assess_quality(frame, profile, policy, 8.0)["available_measurements"] == 9
 
 
 def test_multiscale_feature_context_resets_at_maintenance():
@@ -532,5 +557,5 @@ def test_filter_source_event_and_engineering_limit_equality_are_explicitly_disti
     source = _train_unit_table(frame, 600.)
     assert source.event_observed.iloc[0] == 0
     assert dataset_profile("filters")["event_convention"] == "first_measurement_gt_600pa"
-    result, _ = monitoring_step(frame, as_of=6., **setup(frame))
+    result, _ = monitoring_step(frame, as_of=.1, **setup(frame))
     assert result["condition"]["display_zone"] == "red"
