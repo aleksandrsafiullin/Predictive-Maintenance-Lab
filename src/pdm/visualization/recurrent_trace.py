@@ -43,6 +43,9 @@ def render_recurrent_trace(trace, model, prep):
     import streamlit as st
     from plotly.subplots import make_subplots
 
+    from pdm.ui_theme import current_theme, style_figure, tokens
+
+    theme = current_theme()
     st.markdown(f"**{model.architecture.upper()}** · {model.encoder.rnn.num_layers} layer(s) · "
                 f"{model.encoder.rnn.hidden_size} hidden units per layer")
     st.caption("Sensor features → recurrent state → trained output head → remaining life")
@@ -58,10 +61,11 @@ def render_recurrent_trace(trace, model, prep):
     tensors = [trace["inputs"].T, states.T] + ([trace["cell_states"].T] if has_cells else [])
     for row, values in enumerate(tensors, 1):
         labels = prep.feature_names if row == 1 else model.node_order
-        fig.add_trace(go.Heatmap(z=values, x=ts, y=labels, colorscale=[[0, "#61d8ee"], [0.5, "#15202c"], [1, "#f2be68"]],
+        fig.add_trace(go.Heatmap(z=values, x=ts, y=labels, colorscale=tokens(theme)["heatmap_scale"],
                                 zmid=0, showscale=False, hovertemplate="%{y}<br>Time %{x}<br>Value %{z:.5f}<extra></extra>"), row=row, col=1)
         fig.update_yaxes(showticklabels=False, row=row, col=1)
-    fig.update_layout(height=495, paper_bgcolor="#101925", plot_bgcolor="#101925", font_color="#edf4fa", margin=dict(l=15, r=15, t=35, b=25))
+    style_figure(fig, theme, height=495)
+    fig.update_layout(margin=dict(l=15, r=15, t=35, b=25), hovermode="closest")
     fig.update_xaxes(title_text="Measurement time (internal seconds)", row=panels, col=1)
     st.plotly_chart(fig, width="stretch", theme=None)
     st.caption("Actual state values; each prediction resets at the beginning of its saved history window. Hover to inspect a feature or hidden unit.")

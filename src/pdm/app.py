@@ -4,7 +4,10 @@ import json
 import math
 import os
 import time
+import uuid
+import zipfile
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -47,7 +50,7 @@ from pdm.experiments import (
     resolve_evaluation_artifacts,
     run_dir,
 )
-from pdm.paths import dataset_raw
+from pdm.paths import dataset_raw, runs_root
 from pdm.replay import (
     END_OF_OBSERVED_DATA,
     active_warning_episode_time_s,
@@ -62,6 +65,14 @@ from pdm.replay import (
     split_label_for_unit,
     visible_replay_slice,
 )
+from pdm.ui_copy import (
+    LEGACY_OPEN_PROJECT_HELP,
+    LEGACY_PREPARE_HELP,
+    LEGACY_SENSOR_UNIT_HELP,
+    LEGACY_SOURCE_FILES_HELP,
+    LEGACY_SOURCE_FORMAT_HELP,
+)
+from pdm.ui_theme import current_theme, series_cycle, style_figure, tokens
 from pdm.visualization.comparison import (
     BIOLOGICAL_SECTION,
     SMOKE_NOTE,
@@ -116,9 +127,197 @@ def _pause_neural_runs() -> None:
             value["playing"] = False
 
 
-def _dataset() -> str:
-    choice = st.sidebar.radio("Dataset", ["Bearings", "Filters"], horizontal=True, on_change=_pause_neural_runs)
-    return "bearings" if choice == "Bearings" else "filters"
+WORKFLOW_STEPS = ("Import data", "Data Quality", "Training", "Results", "Compare")
+
+
+def _project_ids() -> list[str]:
+    """Discover datasets from files already present in the workspace."""
+    found = []
+    for ds in LABELS:
+        raw = dataset_raw(ds)
+        has_raw = raw.is_dir() and any(p.is_file() for p in raw.rglob("*"))
+        if has_raw or processed_ready(ds):
+            found.append(ds)
+    return found
+
+
+def _project_state(ds: str) -> dict[str, bool]:
+    raw = dataset_raw(ds)
+    has_raw = raw.is_dir() and any(p.is_file() for p in raw.rglob("*"))
+    prepared = processed_ready(ds)
+    historical_runs = any(
+        row.get("has_best") or row.get("has_last") or row.get("n_evaluations", 0) or row.get("has_legacy_predictions")
+        for row in list_runs(ds)
+    )
+    matrix = runs_root() / "_future_red" / "matrix"
+    future_runs = False
+    if matrix.is_dir():
+        for manifest_path in matrix.glob("*/run_manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                datasets = (manifest.get("run_config") or {}).get("datasets") or []
+                if ds not in datasets or not (manifest_path.parent / "metrics.csv").is_file():
+                    continue
+                states = json.loads((manifest_path.parent / "status.json").read_text(encoding="utf-8"))
+                future_runs |= any(
+                    key.startswith(ds + "/") and value.get("status") == "completed"
+                    for key, value in states.items()
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+    status = read_status()
+    pending_import = st.session_state.get("_import_pending_dataset") == ds
+    importing = worker_alive() and (
+        (status.get("kind") == "download" and status.get("dataset_id") == ds)
+        or (pending_import and status.get("dataset_id") in (None, ds))
+    )
+    return {"raw": has_raw, "prepared": prepared, "runs": historical_runs or future_runs, "importing": importing}
+
+
+def _store_upload(dataset_id: str, files) -> str | None:
+    """Persist supported browser uploads under raw data, returning source path."""
+    if not files:
+        return None
+    from pdm.paths import data_raw
+
+    dest = data_raw() / "_browser_import" / f"{dataset_id}-{uuid.uuid4().hex[:10]}"
+    dest.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for uploaded in files:
+        name = Path(uploaded.name).name
+        suffix = Path(name).suffix.lower()
+        allowed = {".zip"} if dataset_id == "bearings" else {".zip", ".csv"}
+        if suffix not in allowed:
+            raise ValueError(f"Unsupported file type: {name}. Supported: {', '.join(sorted(allowed))}.")
+        if dataset_id == "filters" and suffix == ".csv" and name not in {"Train_Data_CSV.csv", "Test_Data_CSV.csv"}:
+            raise ValueError("HSE CSV uploads must be named Train_Data_CSV.csv and Test_Data_CSV.csv.")
+        target = dest / name
+        uploaded.seek(0)
+        with target.open("wb") as stream:
+            while chunk := uploaded.read(1024 * 1024):
+                stream.write(chunk)
+        saved.append(target)
+    if dataset_id == "filters" and any(p.suffix.lower() == ".zip" for p in saved):
+        if len(saved) != 1:
+            raise ValueError("Upload one HSE ZIP archive at a time.")
+        extracted = dest / "filters_package"
+        extracted.mkdir(parents=True, exist_ok=True)
+        for archive in (p for p in saved if p.suffix.lower() == ".zip"):
+            if not zipfile.is_zipfile(archive):
+                raise ValueError(f"Not a valid ZIP archive: {archive.name}")
+            with zipfile.ZipFile(archive) as zf:
+                names = {Path(member.filename).name for member in zf.infolist()}
+                if not {"Train_Data_CSV.csv", "Test_Data_CSV.csv"}.issubset(names):
+                    raise ValueError("HSE ZIP must contain Train_Data_CSV.csv and Test_Data_CSV.csv.")
+                root = extracted.resolve()
+                for member in zf.infolist():
+                    target = (extracted / member.filename).resolve()
+                    if target != root and root not in target.parents:
+                        raise ValueError("The uploaded archive contains an unsafe path.")
+                zf.extractall(extracted)
+        return str(extracted)
+    if dataset_id == "bearings":
+        archive = saved[0]
+        if not zipfile.is_zipfile(archive):
+            raise ValueError("XJTU-SY browser import must be a valid ZIP archive.")
+        from pdm.data.bearings import parse_bearing_path
+
+        with zipfile.ZipFile(archive) as zf:
+            if not any(parse_bearing_path(name) for name in zf.namelist() if name.lower().endswith(".csv")):
+                raise ValueError("The ZIP does not contain recognizable XJTU-SY bearing CSV paths.")
+    elif any(p.suffix.lower() == ".csv" for p in saved):
+        if not {"Train_Data_CSV.csv", "Test_Data_CSV.csv"}.issubset({p.name for p in saved}):
+            raise ValueError("Upload both HSE files: Train_Data_CSV.csv and Test_Data_CSV.csv.")
+    return str(dest if len(saved) > 1 else saved[0])
+
+
+def _render_import() -> None:
+    st.title("Import data")
+    st.write("Start a project from a supported source. Existing local projects appear here automatically.")
+    existing = st.session_state.get("workflow_dataset")
+    options = ["XJTU-SY bearings", "HSE filters"]
+    source_type = st.selectbox("Source format", options,
+                              index=1 if existing == "filters" else 0, key="import_source_type",
+                              help=LEGACY_SOURCE_FORMAT_HELP)
+    dataset_id = "bearings" if source_type.startswith("XJTU") else "filters"
+    with st.form("source_import_form"):
+        local_path = st.text_input("Local file or folder path", key="import_local_path",
+                                   help="Recommended for the multi-GB XJTU-SY archive. The app server must be able to read this path.")
+        st.caption("Browser upload accepts the XJTU-SY ZIP, or HSE ZIP / Train_Data_CSV.csv and Test_Data_CSV.csv. Use a local path for very large files.")
+        uploaded = st.file_uploader("Source files", type=["zip"] if dataset_id == "bearings" else ["zip", "csv"],
+                                   accept_multiple_files=True, key="import_upload",
+                                   help=LEGACY_SOURCE_FILES_HELP)
+        submitted = st.form_submit_button("Import source", disabled=worker_alive())
+    if submitted:
+        try:
+            saved_path = _store_upload(dataset_id, uploaded) if uploaded else None
+            path = saved_path or local_path.strip()
+            if not path:
+                st.error("Choose browser files or enter a local file or folder path.")
+            else:
+                st.session_state["workflow_dataset"] = dataset_id
+                st.session_state["_import_pending_dataset"] = dataset_id
+                spawn_worker({"kind": "download", "dataset_id": dataset_id, "local_path": path})
+                st.session_state["workflow_step"] = "Data Quality"
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Could not import source: {exc}")
+    projects = _project_ids()
+    if projects:
+        st.subheader("Projects in this workspace")
+        labels = {ds: LABELS[ds] for ds in projects}
+        current = st.session_state.get("workflow_dataset")
+        if current not in projects:
+            current = projects[0]
+        picked = st.selectbox("Open project", projects, index=projects.index(current), format_func=lambda x: labels[x], key="project_picker",
+                              help=LEGACY_OPEN_PROJECT_HELP)
+        st.session_state["workflow_dataset"] = picked
+        if st.button("Continue with project", key="open_project"):
+            st.session_state["workflow_step"] = "Data Quality" if processed_ready(picked) else "Import data"
+            st.rerun()
+
+
+def _workflow_nav(projects: list[str], dataset_id: str | None) -> str:
+    """Render artifact-aware sequential navigation and return its current step."""
+    st.sidebar.caption("PROJECT")
+    if projects:
+        chosen = st.sidebar.selectbox("Project", projects, index=projects.index(dataset_id) if dataset_id in projects else 0,
+                                      format_func=lambda x: LABELS[x], key="workflow_project_picker")
+        if chosen != st.session_state.get("workflow_dataset"):
+            st.session_state["workflow_dataset"] = chosen
+            dataset_id = chosen
+            _pause_neural_runs()
+    step = st.session_state.get("workflow_step", "Import data")
+    legacy = st.session_state.get("screen_selection")
+    legacy_map = {"Data": "Data Quality", "Data Quality": "Data Quality", "Train": "Training", "Training": "Training",
+                  "Model Report": "Results", "Neural Activity Explorer": "Results", "Test & Replay": "Results",
+                  "Compare Models": "Compare"}
+    if legacy in legacy_map and ("workflow_step" not in st.session_state or legacy != st.session_state.get("_last_screen_selection")):
+        step = legacy_map[legacy]
+    state = _project_state(dataset_id) if dataset_id else {"raw": False, "prepared": False, "runs": False, "importing": False}
+    pending_dataset = st.session_state.get("_import_pending_dataset")
+    if pending_dataset and not worker_alive():
+        st.session_state.pop("_import_pending_dataset", None)
+    if dataset_id:
+        allowed = {"Import data": True, "Data Quality": state["raw"] or state["prepared"] or state["importing"],
+                   "Training": state["prepared"], "Results": state["runs"], "Compare": state["runs"]}
+    else:
+        allowed = {s: s == "Import data" for s in WORKFLOW_STEPS}
+    if not allowed.get(step, False):
+        step = "Import data" if dataset_id is None else "Data Quality" if allowed["Data Quality"] else "Import data"
+    st.sidebar.caption("WORKFLOW")
+    for label in WORKFLOW_STEPS:
+        enabled = allowed[label]
+        if st.sidebar.button(label, key="workflow_step_" + label.lower().replace(" ", "_"),
+                             disabled=not enabled, type="primary" if step == label else "secondary", use_container_width=True):
+            step = label
+            st.session_state["workflow_step"] = step
+            st.session_state["_workflow_nav_changed"] = True
+            _pause_neural_runs()
+    st.session_state["workflow_step"] = step
+    st.session_state["screen_selection"] = {"Data Quality": "Data Quality", "Training": "Training", "Results": "Model Report", "Compare": "Compare Models"}.get(step, "Import data")
+    st.session_state["_last_screen_selection"] = st.session_state["screen_selection"]
+    return step
 
 
 def _device_box() -> None:
@@ -156,8 +355,9 @@ def _status_chip(*, compact: bool = False) -> dict:
     return st_
 
 
-def main() -> None:
+def legacy_main() -> None:
     from pdm.lab_ui import screen_comparison
+    from pdm.ui_theme import render_theme_control
     from pdm.visualization.presentation import apply_explorer_style
 
     aliases = {"Data": "Data Quality", "Train": "Training", "Neural Activity Explorer": "Model Report", "Test & Replay": "Model Report"}
@@ -166,20 +366,45 @@ def main() -> None:
         st.session_state["screen_selection"] = aliases[old]
         if old == "Test & Replay":
             st.session_state["report_view"] = "Historical RUL — Evaluation settings"
-    if "screen_selection" not in st.session_state and st.query_params.get("view") == "brain":
+    if "workflow_step" not in st.session_state and st.query_params.get("view") == "brain":
+        st.session_state["workflow_step"] = "Results"
         st.session_state["screen_selection"] = "Model Report"
-    dataset_id = _dataset()
+    projects = _project_ids()
+    selected = st.session_state.get("workflow_dataset")
+    active_status = read_status()
+    pending_dataset = st.session_state.get("_import_pending_dataset")
+    active_import = worker_alive() and (
+        (active_status.get("kind") == "download" and active_status.get("dataset_id") == selected)
+        or (pending_dataset == selected and active_status.get("dataset_id") in (None, selected))
+    )
+    if selected not in projects and not active_import:
+        selected = projects[0] if projects else None
+        st.session_state["workflow_dataset"] = selected
+    st.sidebar.caption("APPEARANCE")
+    theme = render_theme_control(st.sidebar)
+    step = _workflow_nav(projects, selected)
+    dataset_id = st.session_state.get("workflow_dataset")
     _device_box()
-    page = st.sidebar.radio("Screen", ["Data Quality", "Training", "Model Report", "Compare Models"],
-                            key="screen_selection", on_change=_pause_neural_runs)
-    apply_explorer_style()
+    apply_explorer_style(theme)
+    if st.session_state.pop("_workflow_nav_changed", False):
+        st.rerun()
     _watch_worker_lifecycle()
     _status_chip(compact=True)
-    if page == "Data Quality":
+    if step == "Import data":
+        _render_import()
+    elif dataset_id is None:
+        _render_import()
+    elif step == "Data Quality":
         screen_data(dataset_id)
-    elif page == "Training":
+        if processed_ready(dataset_id) and st.button("Continue to Training", key="continue_training"):
+            st.session_state["workflow_step"] = "Training"
+            st.rerun()
+    elif step == "Training":
         screen_train(dataset_id)
-    elif page == "Model Report":
+        if _project_state(dataset_id)["runs"] and st.button("View results", key="continue_results"):
+            st.session_state["workflow_step"] = "Results"
+            st.rerun()
+    elif step == "Results":
         previous_report_dataset = st.session_state.get("_report_dataset")
         if previous_report_dataset is not None and previous_report_dataset != dataset_id:
             st.session_state.pop("report_view", None)
@@ -207,7 +432,6 @@ def main() -> None:
         )
         if view == "Future-red entry":
             from pdm.future_red_ui import render_report
-            from pdm.paths import runs_root
 
             render_report(dataset_id, runs_root() / "_future_red" / "matrix")
         elif view == "Health zones":
@@ -222,12 +446,19 @@ def main() -> None:
             screen_replay(dataset_id)
         else:
             screen_explorer(dataset_id)
-    elif page == "Compare Models":
-        st.info(
-            "Historical RUL model comparisons use time-to-failure targets. They are separate from the current "
-            "future-red sensor-zone entry workflow."
-        )
-        screen_comparison(dataset_id)
+    elif step == "Compare":
+        from pdm.future_red_ui import latest_matrix, load_test_metrics, render_comparison
+
+        matrix_root = runs_root() / "_future_red" / "matrix"
+        matrix = latest_matrix(matrix_root, dataset_id)
+        has_future_results = matrix is not None and bool(load_test_metrics(matrix[0], dataset_id))
+        choices = ["Future-red entry", "Historical RUL"] if has_future_results else ["Historical RUL"]
+        comparison_target = st.selectbox("Comparison target", choices)
+        if comparison_target == "Future-red entry":
+            render_comparison(dataset_id, matrix_root)
+        else:
+            st.info("Historical RUL comparisons use time-to-failure targets from saved evaluations.")
+            screen_comparison(dataset_id)
 
 
 def _render_filters_time_note():
@@ -337,18 +568,12 @@ def screen_data(dataset_id: str) -> None:
     state = _data_state(dataset_id)
     st.write("Data state:", state)
     raw = dataset_raw(dataset_id)
-    with st.expander("Prepare source data", expanded=state != "ready"):
-        st.caption(f"Raw directory: `{raw}`")
-        local = st.text_input("Local archive or folder path (optional, for multi-GB data)")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Download / locate data", disabled=worker_alive()):
-                spawn_worker({"kind": "download", "dataset_id": dataset_id, "local_path": local or None})
-                st.rerun()
-        with c2:
-            if st.button("Inspect & prepare", disabled=worker_alive()):
-                spawn_worker({"kind": "prepare", "dataset_id": dataset_id})
-                st.rerun()
+    has_raw = raw.is_dir() and any(p.is_file() for p in raw.rglob("*"))
+    with st.expander("Prepare snapshot", expanded=state != "ready"):
+        st.caption(f"Imported source directory: `{raw}`")
+        if st.button("Inspect & prepare", disabled=worker_alive() or not has_raw, help=LEGACY_PREPARE_HELP):
+            spawn_worker({"kind": "prepare", "dataset_id": dataset_id})
+            st.rerun()
     if worker_alive():
         st.info("A background job is running. This page refreshes while it works.")
         _auto_refresh()
@@ -358,7 +583,7 @@ def screen_data(dataset_id: str) -> None:
         if ws.get("traceback"):
             st.code(ws["traceback"])
     if not processed_ready(dataset_id):
-        st.warning("No prepared dataset yet. Download/locate data, then Inspect & prepare.")
+        st.warning("Import source files on the Import data step, then inspect and prepare them here.")
         return
     bundle = load_processed(dataset_id)
     units = bundle["units"]
@@ -444,19 +669,23 @@ def screen_data(dataset_id: str) -> None:
     st.subheader("Units")
     show = _units_display_frame(dataset_id, units, split)
     st.dataframe(show, width="stretch", hide_index=True)
-    uid = st.selectbox("Unit for sensor plot", show["unit_id"].tolist())
+    uid = st.selectbox("Unit for sensor plot", show["unit_id"].tolist(), help=LEGACY_SENSOR_UNIT_HELP)
     g = features[features["unit_id"] == uid].sort_values("timestamp_s")
+    theme = current_theme()
+    t = tokens(theme)
     fig = go.Figure()
     if dataset_id == "bearings" and "horizontal_rms" in g.columns:
-        fig.add_trace(go.Scatter(x=g["timestamp_s"] / 60.0, y=g["horizontal_rms"], name="horizontal RMS"))
+        fig.add_trace(go.Scatter(x=g["timestamp_s"] / 60.0, y=g["horizontal_rms"], name="horizontal RMS",
+                                 line_color=t["series_observed"]))
         fig.update_xaxes(title_text="Operating time (min)")
         fig.update_yaxes(title_text="RMS (g, original units)")
     else:
-        fig.add_trace(go.Scatter(x=g["timestamp_s"], y=g["differential_pressure"], name="Δp"))
-        fig.add_hline(y=600.0, line_dash="dash", annotation_text="600 Pa")
+        fig.add_trace(go.Scatter(x=g["timestamp_s"], y=g["differential_pressure"], name="Δp",
+                                 line_color=t["series_observed"]))
+        fig.add_hline(y=600.0, line_dash="dash", line_width=1, line_color=t["zone_red"], annotation_text="600 Pa")
         fig.update_xaxes(title_text="Time (s; HSE source Figure 6)")
         fig.update_yaxes(title_text="Differential pressure (Pa)")
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(style_figure(fig, theme), width="stretch", theme=None)
     st.subheader("Target and quality")
     st.write(report.get("sensor_time_note", ""))
     phys = report.get("history_length_physical") or {}
@@ -738,9 +967,6 @@ def _explorer_run_label(run_id: str) -> str:
 
 
 def screen_explorer(dataset_id: str) -> None:
-    from pdm.visualization.presentation import apply_explorer_style
-
-    apply_explorer_style()
     with st.sidebar.expander("About model reports"):
         st.caption("Real model states and causal forecasts from recorded measurements. Future outcomes are evaluation overlays only.")
 
@@ -1187,7 +1413,7 @@ def screen_replay(dataset_id: str) -> None:
         if fig.data:
             fig.update_xaxes(title="Epoch")
             fig.update_yaxes(title="Loss")
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(style_figure(fig, current_theme()), width="stretch", theme=None)
         else:
             st.caption("Closed-form readout fitting has no gradient loss curve.")
             st.dataframe(hdf, hide_index=True, width="stretch")
@@ -1520,6 +1746,8 @@ def _replay_demo_figure(
     rul_title = "Remaining useful life (s)" if filter_scale else "Remaining useful life (min)"
     sensor_title = "Sensor"
     rul_panel = "RUL"
+    theme = current_theme()
+    t = tokens(theme)
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -1536,6 +1764,7 @@ def _replay_demo_figure(
                 y=g["horizontal_rms"],
                 name="horizontal RMS",
                 mode="lines",
+                line_color=t["series_observed"],
             ),
             row=1,
             col=1,
@@ -1548,6 +1777,7 @@ def _replay_demo_figure(
                 y=g["differential_pressure"],
                 name="Δp (Pa)",
                 mode="lines",
+                line_color=t["series_observed"],
             ),
             row=1,
             col=1,
@@ -1555,6 +1785,8 @@ def _replay_demo_figure(
         fig.add_hline(
             y=float(pressure_limit_pa),
             line_dash="dash",
+            line_width=1,
+            line_color=t["zone_red"],
             annotation_text=f"{pressure_limit_pa:.0f} Pa",
             row=1,
             col=1,
@@ -1578,7 +1810,7 @@ def _replay_demo_figure(
                 ), row=2, col=1)
                 fig.add_trace(go.Scatter(
                     x=x, y=upper, mode="lines", line=dict(width=0),
-                    fill="tonexty", fillcolor="rgba(61, 190, 225, 0.22)",
+                    fill="tonexty", fillcolor=t["series_band"],
                     name=f"forecast range ({rul_unit})", legendgroup="forecast_range",
                     connectgaps=False,
                 ), row=2, col=1)
@@ -1587,7 +1819,7 @@ def _replay_demo_figure(
                     latest_x = float(prefix_pred.iloc[-1]["timestamp_s"]) / x_scale
                     fig.add_trace(go.Scatter(
                         x=[latest_x, latest_x], y=[bound / x_scale for bound in latest_bounds],
-                        mode="lines+markers", line=dict(color="#3dbee1", width=3),
+                        mode="lines+markers", line=dict(color=t["series_forecast"], width=2),
                         marker=dict(size=4), name="latest interval", showlegend=False,
                     ), row=2, col=1)
         fig.add_trace(
@@ -1596,6 +1828,7 @@ def _replay_demo_figure(
                 y=prefix_pred["predicted_rul_s"] / x_scale,
                 name=f"neural net RUL ({rul_unit})",
                 mode="lines+markers",
+                line_color=t["series_forecast"],
                 marker=dict(size=4),
             ),
             row=2,
@@ -1608,6 +1841,7 @@ def _replay_demo_figure(
                     y=prefix_pred["baseline_rul_s"] / x_scale,
                     name=f"baseline RUL ({rul_unit})",
                     mode="lines",
+                    line_color=series_cycle(theme)[2],
                 ),
                 row=2,
                 col=1,
@@ -1618,24 +1852,27 @@ def _replay_demo_figure(
                     x=x,
                     y=overlay_rul.to_numpy(dtype=float) / x_scale,
                     name=f"actual RUL ({rul_unit}, evaluator overlay)",
-                    line=dict(dash="dash"),
+                    line=dict(dash="dash", color=t["series_observed"]),
                     mode="lines",
                 ),
                 row=2,
                 col=1,
             )
-    fig.add_hline(y=h_s / x_scale, line_dash="dot", annotation_text="H_trigger", row=2, col=1)
+    fig.add_hline(y=h_s / x_scale, line_dash="dot", line_width=1, line_color=t["zone_yellow"],
+                  annotation_text="H_trigger", row=2, col=1)
     fig.update_yaxes(title_text=rul_title, row=2, col=1)
     fig.update_xaxes(title_text=x_title, row=2, col=1)
 
     if math.isfinite(replay_time_s):
         x_now = replay_time_s / x_scale
-        fig.add_vline(x=x_now, line_dash="dot", annotation_text="now", row=1, col=1)
-        fig.add_vline(x=x_now, line_dash="dot", row=2, col=1)
+        fig.add_vline(x=x_now, line_dash="dot", line_width=1, line_color=t["series_reference"],
+                      annotation_text="now", row=1, col=1)
+        fig.add_vline(x=x_now, line_dash="dot", line_width=1, line_color=t["series_reference"], row=2, col=1)
     if warning_time_s is not None and math.isfinite(warning_time_s):
         x_w = warning_time_s / x_scale
-        fig.add_vline(x=x_w, line_dash="dash", line_color="orange", annotation_text="warning", row=1, col=1)
-        fig.add_vline(x=x_w, line_dash="dash", line_color="orange", row=2, col=1)
+        fig.add_vline(x=x_w, line_dash="dash", line_width=1, line_color=t["zone_yellow"],
+                      annotation_text="warning", row=1, col=1)
+        fig.add_vline(x=x_w, line_dash="dash", line_width=1, line_color=t["zone_yellow"], row=2, col=1)
     # Observed event only — never official_rul_overlay as a sensor crossing.
     if (
         event_observed
@@ -1646,8 +1883,9 @@ def _replay_demo_figure(
     ):
         x_e = event_time_s / x_scale
         label = "observed 600 Pa" if dataset_id == "filters" else "event"
-        fig.add_vline(x=x_e, line_dash="dash", line_color="crimson", annotation_text=label, row=1, col=1)
-    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), margin=dict(t=60))
+        fig.add_vline(x=x_e, line_dash="dash", line_width=1, line_color=t["zone_red"], annotation_text=label, row=1, col=1)
+    style_figure(fig, theme)
+    fig.update_layout(margin=dict(t=60))
     return fig
 
 
@@ -1808,7 +2046,7 @@ def _replay_playback_body() -> None:
         event_time_s=event_t,
         event_observed=bool(end_state.get("event_observed")),
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, width="stretch", theme=None)
     mid_note = _official_rul_caption(
         end_state.get("official_rul_s"),
         show_gt=show_gt,
@@ -1943,6 +2181,13 @@ def _auto_refresh(seconds: float = 2.0) -> None:
     except Exception:
         time.sleep(min(max(seconds, 0.05), 2.0))
         st.rerun()
+
+
+def main() -> None:
+    """The persistent project workflow; research helpers above remain callable."""
+    from pdm.project_ui import main as project_main
+
+    project_main()
 
 
 if __name__ == "__main__":

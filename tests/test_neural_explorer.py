@@ -30,13 +30,22 @@ MODULE_HTTPS = re.compile(
 )
 
 
+class _WorkflowStep:
+    """Select a sequential workflow step without depending on a removed radio."""
+
+    def __init__(self, at):
+        self.at = at
+
+    def set_value(self, value):
+        step = {"Model Report": "Results", "Compare Models": "Compare"}.get(value, value)
+        self.at.session_state["workflow_step"] = step
+        self.at.session_state["screen_selection"] = value
+        return self
+
+
 def _screen_radio(at):
-    """Find the Screen radio by its options containing known screen names."""
-    for radio in at.sidebar.radio:
-        opts = list(radio.options)
-        if "Data Quality" in opts and "Training" in opts and "Model Report" in opts:
-            return radio
-    raise AssertionError("Screen radio not found")
+    """Compatibility shim for existing step-oriented UI tests."""
+    return _WorkflowStep(at)
 
 
 def _app_text(at) -> str:
@@ -169,15 +178,16 @@ def _open_explorer(at):
 
 
 def test_explorer_screen_present_in_app():
-    """Neural Activity Explorer appears in the explicit 4-way screen radio."""
+    """Results is one of the sequential workflow steps; Dataset/Screen radios are gone."""
     from streamlit.testing.v1 import AppTest
 
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     assert not at.exception
-    radio = _screen_radio(at)
-    opts = list(radio.options)
-    assert opts == ["Data Quality", "Training", "Model Report", "Compare Models"]
+    labels = [button.label for button in at.button]
+    assert any("Results" in label for label in labels)
+    assert any("Training" in label for label in labels)
+    assert not any(r.label in {"Dataset", "Screen"} for r in at.sidebar.radio)
 
 
 def test_explorer_caption_present(monkeypatch, tmp_path, tiny_bearing_tables):
@@ -185,7 +195,7 @@ def test_explorer_caption_present(monkeypatch, tmp_path, tiny_bearing_tables):
     from streamlit.testing.v1 import AppTest
 
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     assert not at.exception
     _open_explorer(at)
@@ -199,7 +209,7 @@ def test_synthetic_banner_present(monkeypatch, tmp_path, tiny_bearing_tables):
     from streamlit.testing.v1 import AppTest
 
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables, is_synthetic=True)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     warnings = "\n".join(str(w.value) for w in at.warning)
@@ -227,7 +237,7 @@ def test_gru_run_does_not_show_fake_biological_activity(monkeypatch, tmp_path, t
         is_synthetic=False,
     )
     monkeypatch.setattr("pdm.visualization.trace.predict_with_trace", _no_inline)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     text = _app_text(at)
@@ -264,7 +274,7 @@ def test_worker_busy_shows_error_not_inline(monkeypatch, tmp_path, tiny_bearing_
     monkeypatch.setattr("pdm.cli.spawn_worker", _no_spawn)
     monkeypatch.setattr("pdm.app.spawn_worker", _no_spawn)
 
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     assert not any(b.label == "Build trace" for b in at.button)
@@ -367,7 +377,7 @@ def test_screen_switch_by_label(monkeypatch, tmp_path, tiny_bearing_tables):
     from streamlit.testing.v1 import AppTest
 
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     assert not at.exception
     _screen_radio(at).set_value("Model Report")
@@ -404,7 +414,7 @@ def test_explorer_opens_test_controls_without_trace_or_demo(monkeypatch, tmp_pat
     from streamlit.testing.v1 import AppTest
 
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     assert not at.exception
@@ -419,7 +429,7 @@ def test_explorer_plain_language_copy(monkeypatch, tmp_path, tiny_bearing_tables
     from streamlit.testing.v1 import AppTest
 
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     text = _app_text(at)
@@ -621,7 +631,7 @@ def test_idle_live_json_does_not_set_selected_rul(monkeypatch, tmp_path, tiny_be
     monkeypatch.setattr("pdm.app.load_live_activity", leftover_loader)
     monkeypatch.setattr("pdm.worker.read_status", lambda: {"status": "completed", "kind": "train"})
     monkeypatch.setattr("pdm.app.read_status", lambda: {"status": "completed", "kind": "train"})
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     text = _app_text(at)
@@ -635,7 +645,7 @@ def test_operational_screen_omits_architecture_comparison(monkeypatch, tmp_path,
     from streamlit.testing.v1 import AppTest
 
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     md = [str(getattr(w, "value", w)) for w in at.markdown]
@@ -1468,7 +1478,7 @@ def test_explorer_has_one_operational_flow(monkeypatch, tmp_path, tiny_bearing_t
     from streamlit.testing.v1 import AppTest
 
     _explorer_harness(monkeypatch, tmp_path, tiny_bearing_tables)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     assert not any(r.label == "Mode" for r in at.radio)
@@ -1520,7 +1530,7 @@ def test_synthetic_harness_not_malecns_anatomy(monkeypatch, tmp_path, tiny_beari
     monkeypatch.setattr("pdm.visualization.component.neural_activity_explorer", _cap)
     monkeypatch.setattr("pdm.visualization.simulation_ui.neural_activity_explorer", _cap)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
     at.run()
     _open_explorer(at)
@@ -1546,7 +1556,7 @@ def test_real_connectome_without_soma_shows_anatomy_missing(monkeypatch, tmp_pat
     )
     captured = []
     monkeypatch.setattr("pdm.visualization.simulation_ui.neural_activity_explorer", lambda **kw: captured.append(kw))
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     assert not at.exception
@@ -1568,7 +1578,7 @@ def test_explorer_junk_soma_schema_caption_no_exception(monkeypatch, tmp_path, t
         disclaimer="",
     )
     _write_feather(tmp_path / SOMA_ALLOWLIST[0], {"foo": [1], "bar": [2]})
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     assert not at.exception
@@ -1593,7 +1603,7 @@ def test_explorer_soma_arrow_oserror_no_exception(monkeypatch, tmp_path, tiny_be
         raise OSError("arrow failed")
 
     monkeypatch.setattr("pdm.visualization.explorer.cached_soma_table", _boom)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     assert not at.exception
@@ -1623,7 +1633,7 @@ def test_explorer_explicit_weights_path_caption_no_exception(monkeypatch, tmp_pa
         return load_soma_table(loc)
 
     monkeypatch.setattr("pdm.visualization.explorer.cached_soma_table", _explicit)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     assert not at.exception
@@ -1671,7 +1681,7 @@ def test_random_rewire_synthetic_parent_not_flyem_anatomy_missing(
     monkeypatch.setattr("pdm.visualization.component.neural_activity_explorer", _cap)
     monkeypatch.setattr("pdm.visualization.simulation_ui.neural_activity_explorer", _cap)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
     at.run()
     _open_explorer(at)
@@ -1698,7 +1708,7 @@ def test_random_rewire_real_parent_without_soma_anatomy_missing(
         parent_is_synthetic=False,
         disclaimer="",
     )
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
     _open_explorer(at)
     assert not at.exception
@@ -1757,7 +1767,7 @@ def test_explorer_train_live_compact_key_does_not_hijack_overlay(
     monkeypatch.setattr("pdm.visualization.component.neural_activity_explorer", _cap)
     monkeypatch.setattr("pdm.visualization.simulation_ui.neural_activity_explorer", _cap)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     monkeypatch.setattr("pdm.app.neural_activity_explorer", _cap)
     at.run()
     _open_explorer(at)
@@ -1932,7 +1942,7 @@ def test_equipment_simulation_clock_ground_truth_and_busy(monkeypatch, tmp_path,
     monkeypatch.setattr(simulation_ui, "worker_alive", lambda: False)
     captured = {}
     monkeypatch.setattr(simulation_ui, "neural_activity_explorer", lambda **kw: captured.update(kw))
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=30)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=30)
     at.run()
     _open_explorer(at)
     assert not at.exception
@@ -1980,7 +1990,7 @@ def test_equipment_simulation_shorter_data_resets_cursor(monkeypatch, tmp_path, 
     from pdm.replay import bind_replay_to_run
 
     bound = bind_replay_to_run("bearings", "bearings_fly_explorer")
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=20)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=20)
     at.run()
     _open_explorer(at)
     next(w for w in at.slider if w.label == "Measurement").set_value(7).run()

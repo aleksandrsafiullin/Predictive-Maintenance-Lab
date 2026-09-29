@@ -12,14 +12,8 @@ import streamlit as st
 
 from pdm.monitoring.filter_zones import FILTER_ZONE_POLICY
 from pdm.paths import runs_root
+from pdm.ui_theme import current_theme, style_figure, tokens, zone_colors
 
-ZONE_COLORS = {
-    "green": "#2ecc71",
-    "yellow": "#f1c40f",
-    "red": "#e74c3c",
-    "unknown": "#9aa8b8",
-    "gray": "#9aa8b8",
-}
 ZONE_LABELS = {
     "green": "Below provisional pressure warning band",
     "yellow": "Provisional pressure warning band",
@@ -95,31 +89,30 @@ def _read_current_filter_zone_labels(data: dict, artifact_root: Path | None = No
 
 def _filter_history_chart(rows: pd.DataFrame, index: int) -> go.Figure:
     visible = rows.iloc[: index + 1]
+    theme = current_theme()
+    t, zone_color = tokens(theme), zone_colors(theme)
     fig = go.Figure()
     for _, row in visible.iterrows():
         x0 = float(row["timestamp_s"])
         x1 = float(row["next_timestamp_s"])
         zone = str(row["zone"])
-        fig.add_vrect(x0=x0, x1=x1, fillcolor=ZONE_COLORS[zone], opacity=0.16, line_width=0, layer="below")
+        fig.add_vrect(x0=x0, x1=x1, fillcolor=zone_color[zone], opacity=0.16, line_width=0, layer="below")
     fig.add_trace(go.Scatter(
         x=visible["timestamp_s"], y=visible["differential_pressure_pa"], mode="lines+markers",
-        name="Differential pressure", line=dict(color="#e8eef5", width=2), marker=dict(size=5),
+        name="Differential pressure", line=dict(color=t["series_observed"], width=2), marker=dict(size=5),
         customdata=visible[["flow_rate_recorded", "dust_feed_recorded", "zone"]],
         hovertemplate="Time: %{x:.4g} s<br>Pressure: %{y:.1f} Pa<br>Flow: %{customdata[0]:.3g}<br>Feed: %{customdata[1]:.3g}<br>Zone: %{customdata[2]}<extra></extra>",
     ))
     selected = visible.iloc[-1]
     fig.add_trace(go.Scatter(x=[selected["timestamp_s"]], y=[selected["differential_pressure_pa"]],
                              mode="markers", name="Selected measurement",
-                             marker=dict(color="#5bd3f5", size=12, line=dict(width=2, color="white"))))
-    fig.add_hline(y=300, line=dict(color=ZONE_COLORS["yellow"], dash="dash"),
+                             marker=dict(color=t["series_reference"], size=12, line=dict(width=2, color=t["surface"]))))
+    fig.add_hline(y=300, line=dict(color=zone_color["yellow"], width=1, dash="dash"),
                   annotation_text="Provisional warning · 300 Pa", annotation_position="top left")
-    fig.add_hline(y=600, line=dict(color=ZONE_COLORS["red"], dash="dash"),
+    fig.add_hline(y=600, line=dict(color=zone_color["red"], width=1, dash="dash"),
                   annotation_text="Configured limit · 600 Pa", annotation_position="top left")
-    fig.update_layout(height=430, margin=dict(l=10, r=10, t=30, b=10), template="plotly_dark",
-                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      xaxis_title="Time (s; source label: HSE Figure 6)",
-                      yaxis_title="Differential pressure, Pa", legend=dict(orientation="h", y=-0.2))
-    return fig
+    fig.update_layout(xaxis_title="Time (s; source label: HSE Figure 6)", yaxis_title="Differential pressure, Pa")
+    return style_figure(fig, theme, height=430)
 
 
 def screen_filter_health_zones() -> None:
@@ -172,7 +165,7 @@ def screen_filter_health_zones() -> None:
         st.caption("This unit has one row-admitted measurement in the matching label artifact.")
     row = rows.iloc[index]
     zone = str(row["zone"])
-    color = ZONE_COLORS[zone]
+    color = zone_colors(current_theme())[zone]
     st.markdown(
         f"<div style='border:2px solid {color};border-radius:12px;padding:14px 18px;background:{color}22;margin:.5rem 0 1rem'>"
         f"<div style='font-size:.8rem;letter-spacing:.1em;opacity:.8'>{escape(str(uid))} · {escape(split.upper())} · MEASUREMENT {index + 1} / {len(rows)}</div>"
@@ -181,7 +174,7 @@ def screen_filter_health_zones() -> None:
         f"<div style='font-size:.85rem;opacity:.8'>Quality status: {escape(str(row['quality_status']))} · {escape(str(row.get('zone_reason', '')))}</div></div>",
         unsafe_allow_html=True,
     )
-    st.plotly_chart(_filter_history_chart(rows, index), width="stretch", key=f"filter_hz_chart:{split}:{uid}")
+    st.plotly_chart(_filter_history_chart(rows, index), width="stretch", theme=None, key=f"filter_hz_chart:{split}:{uid}")
     counts = manifest.get("class_counts_by_split", {}).get(split, {})
     st.caption(
         f"Prepared snapshot {escape(str(data['dataset_version']))} · label artifact {escape(str(manifest.get('artifact_id', 'unknown')))} · "

@@ -1,0 +1,21 @@
+# Subtask 02 (B): trained signal forecast and safe worker jobs
+
+## Goal
+Train one selected signal model on the saved project snapshot and produce prefix-only, project-bound forecast results for replay.
+
+## Owner files
+`src/pdm/signal_training.py`, `src/pdm/signal_inference.py`, necessary `src/pdm/models/*` additions, `src/pdm/worker.py`, `src/pdm/cli.py`, `tests/test_signal_models.py`, and focused `tests/test_worker_and_app.py`. Consume A's project/snapshot API; do not edit `app.py`.
+
+## Acceptance criteria
+- [x] Implement exact mapping contracts `available_signal_engines`, `train_signal_run`, `list_project_runs`, `load_signal_run`, `forecast_prefix` from master-plan.md against A's contract fixture. Capability registry launches real multi-horizon numeric **GRU**, **LSTM**, and generic-adapted quantile boosting only when eligible; expose a small valid parameter set (history length, horizon grid, epochs/hidden size for RNN, boosting iterations, seed). Preserve Fly/Random/Full CNS research code/CLI with explicit ineligibility reasons for this signal task.
+- [x] Derive the signal profile from the saved snapshot schema, not `dataset_profile()` for generic projects. Generic v1 causal inputs are only canonical `signal`; no required HSE context columns. Preserve signed numeric values and `output_domain='real'` without nonnegative clipping. Numeric targets come from future observed signal in the same unit/continuous segment at saved positive horizons; mask missing, censored, gapped, ambiguous or out-of-range targets. Fit preprocessing and weights on train units only. Validation selects checkpoints/settings; freeze before a single test evaluation. Save per-unit/per-horizon support and errors, not only a global score. Check finite loss/gradients and deterministic fixed-seed behavior.
+- [x] Save project ID, snapshot fingerprint, selected engine, parameters, signal schema/units, threshold rule, model artifact hashes, validation/test metrics and any interval calibration status. A prediction is rejected if its source snapshot or artifact hash does not match. Quantile bands are labelled pointwise/unvalidated unless measured coverage is saved.
+- [x] Forecast API loads the saved artifact and accepts only the observed prefix through `as_of_s`; no future frame is passed to the numeric model. Return exact mapping keys/point and crossing keys from master-plan.md. Positive-horizon points only; show no forecast if history is too short, gap crosses the window or horizon unsupported. Red-crossing logic uses native-unit instantaneous rule and first saved discrete forecast point; sustained rules have unavailable crossing time.
+- [x] Implement `project_import` and `project_train` worker kinds, atomic launch lock before queuing, and `job_id,project_id,kind,status,stage,progress,message,error` on every status including failures. Add `status_for_project(pid)`, job-scoped stop/acknowledgment and `request_stop(expected_job_id=None)` with mismatch rejection. Archive refuses until matching job is terminal and process exited. Validate job schema before launch; preserve old worker kinds and `read_status()` callers.
+
+## Verification
+`PYTHONPATH=src .venv/bin/python -m pytest tests/test_signal_models.py tests/test_worker_and_app.py tests/test_forecasting.py tests/test_condition_monitoring.py -q`; `.venv/bin/python -m ruff check` owned paths. Train A's signed/gapped causal fixture with each launchable engine; compare forecast before/after removing or perturbing all later rows; assert signed output, numeric heads, finite gradients, snapshot/hash mismatch rejection, masked targets, worker job isolation, targeted cancellation and archive refusal. Smoke metrics are functional checks only.
+
+## Completion evidence
+
+Completed and independently reviewed on 2026-09-29. See `docs/create_ml_implementation_report_ru.md`, scoped review files, and `output/orchestration-20260929/` evidence. Final suite: 581 tests passed. D used browser GRU on real prepared observations, three actual worker engines on the signed/gapped fixture, contract tests for error/causality cases, and desktop/narrow visual checks. Full raw-data retraining and field model-quality certification were not part of this acceptance.

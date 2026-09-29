@@ -16,14 +16,15 @@ from pdm.monitoring.contracts import unit_verification
 from pdm.monitoring.journal import FEEDBACK, append_feedback
 from pdm.monitoring.study import freeze_study, plan_study
 from pdm.paths import project_root, runs_root
+from pdm.ui_theme import current_theme, style_figure, tokens, zone_colors
 from pdm.worker import read_status, request_stop, worker_alive
 
-COLORS = {"green": "#5bc98d", "yellow": "#efbf54", "red": "#f27580", "gray": "#9aa8b8"}
 LABELS = {"green": "Normal", "yellow": "Attention required", "red": "Urgent action required", "gray": "Assessment unavailable"}
 
 
-def _history_ribbon_values(history_rows, dataset_id):
+def _history_ribbon_values(history_rows, dataset_id, theme=None):
     """Return ribbon title, colors and labels for the displayed history source."""
+    colors_by_zone = zone_colors(theme or current_theme())
     has_sensor_zones = dataset_id == "filters" and any("sensor_zone" in row for row in history_rows)
     if has_sensor_zones:
         labels, colors = [], []
@@ -35,13 +36,13 @@ def _history_ribbon_values(history_rows, dataset_id):
                 color = sensor.get("display_zone", "gray")
                 label = sensor.get("label", LABELS.get(color, LABELS["gray"]))
             labels.append(label)
-            colors.append(COLORS.get(color, COLORS["gray"]))
+            colors.append(colors_by_zone.get(color, colors_by_zone["gray"]))
         return "Filter sensor-zone history", colors, labels
     title = "Model condition history"
     if dataset_id == "filters":
         title += " · saved evaluation predates sensor zones"
     labels = [LABELS[row["condition"]["display_zone"]] for row in history_rows]
-    colors = [COLORS[row["condition"]["display_zone"]] for row in history_rows]
+    colors = [colors_by_zone[row["condition"]["display_zone"]] for row in history_rows]
     return title, colors, labels
 
 
@@ -231,57 +232,62 @@ def _render_replay(rows, measurements, bundle, directory, key):
     signal, unit = profile["signal_name"], profile["signal_unit"]
     scale = 60. if profile["time_basis"] == "physical_seconds" else 1.
     time_label = "minutes" if scale == 60. else "dataset internal time"
+    theme = current_theme()
+    t, zone_color = tokens(theme), zone_colors(theme)
     fig = go.Figure()
     observed = measurements.loc[measurements.timestamp_s <= now]
-    fig.add_trace(go.Scatter(x=observed.timestamp_s / scale, y=observed[signal], mode="lines", name="Observed " + signal))
+    fig.add_trace(go.Scatter(x=observed.timestamp_s / scale, y=observed[signal], mode="lines", name="Observed " + signal,
+                             line_color=t["series_observed"]))
     if show_gt:
         future = measurements.loc[measurements.timestamp_s > now]
-        fig.add_trace(go.Scatter(x=future.timestamp_s / scale, y=future[signal], mode="lines", name="Future fact · evaluator only", line=dict(dash="dot", color="#aab0bb")))
+        fig.add_trace(go.Scatter(x=future.timestamp_s / scale, y=future[signal], mode="lines", name="Future fact · evaluator only", line=dict(dash="dot", color=t["series_observed"])))
     if show_old:
         for prior in rows[max(0, step - 20):step:5]:
             forecasts = pd.DataFrame(prior["signal_forecasts"])
             if len(forecasts):
-                fig.add_trace(go.Scatter(x=forecasts.target_time / scale, y=forecasts.point, mode="lines", opacity=.2, showlegend=False))
+                fig.add_trace(go.Scatter(x=forecasts.target_time / scale, y=forecasts.point, mode="lines", opacity=.2, showlegend=False, line_color=t["series_forecast"]))
     forecasts = pd.DataFrame(result["signal_forecasts"])
     if len(forecasts) and forecasts.point.notna().any():
-        fig.add_trace(go.Scatter(x=forecasts.target_time / scale, y=forecasts.point, mode="lines+markers", name="Sensor forecast", line_color="#61d8ee"))
+        fig.add_trace(go.Scatter(x=forecasts.target_time / scale, y=forecasts.point, mode="lines+markers", name="Sensor forecast", line_color=t["series_forecast"]))
         if forecasts.lower.notna().any():
             fig.add_trace(go.Scatter(x=forecasts.target_time / scale, y=forecasts.upper, mode="lines", line_width=0, showlegend=False))
-            fig.add_trace(go.Scatter(x=forecasts.target_time / scale, y=forecasts.lower, mode="lines", line_width=0, fill="tonexty", name="Pointwise 5–95% · unvalidated"))
+            fig.add_trace(go.Scatter(x=forecasts.target_time / scale, y=forecasts.lower, mode="lines", line_width=0, fill="tonexty", fillcolor=t["series_band"], name="Pointwise 5–95% · unvalidated"))
     else:
         st.info("Sensor forecast unavailable: " + (str(forecasts.reason.iloc[0]) if len(forecasts) else "no trained sensor model"))
     ref = result["normality"].get("residuals", {}).get(signal)
     if ref:
-        fig.add_hline(y=ref["expected"], line_dash="dot", annotation_text="Provisional regime reference")
+        fig.add_hline(y=ref["expected"], line_dash="dot", line_width=1, line_color=t["series_observed"], annotation_text="Provisional regime reference")
         enter = bundle["state_policy"]["warning_enter"]
         if enter is not None:
-            fig.add_hline(y=ref["expected"] + enter * ref["scale"], line_dash="dash", line_color=COLORS["yellow"], annotation_text="Statistical deviation boundary")
+            fig.add_hline(y=ref["expected"] + enter * ref["scale"], line_dash="dash", line_width=1, line_color=zone_color["yellow"], annotation_text="Statistical deviation boundary")
     limit = bundle["state_policy"].get("critical_limit")
     if limit:
-        fig.add_hline(y=limit["value"], line_color=COLORS["red"], annotation_text=limit["verification_status"] + " limit")
-    fig.add_vline(x=now / scale, line_dash="dot", annotation_text="Now")
+        fig.add_hline(y=limit["value"], line_dash="dash", line_width=1, line_color=zone_color["red"], annotation_text=limit["verification_status"] + " limit")
+    fig.add_vline(x=now / scale, line_dash="dot", line_width=1, line_color=t["series_reference"], annotation_text="Now")
     crossing = result["crossing"]
     if crossing["time"] is not None:
-        fig.add_vline(x=crossing["time"] / scale, line_color=COLORS["yellow"], annotation_text="Median crossing")
-    fig.update_layout(height=460, margin=dict(l=20,r=20,t=40,b=35), xaxis_title=time_label, yaxis_title=f"{signal} ({unit})", legend=dict(orientation="h"))
-    st.plotly_chart(fig, width="stretch")
+        fig.add_vline(x=crossing["time"] / scale, line_color=zone_color["yellow"], annotation_text="Median crossing")
+    fig.update_layout(xaxis_title=time_label, yaxis_title=f"{signal} ({unit})")
+    st.plotly_chart(style_figure(fig, theme, height=460), width="stretch", theme=None)
     st.caption(f"Issued at {now / scale:g} {time_label}. Hold current observed conditions. Lines between discrete horizons are visual interpolation. " + crossing["reason"])
     history_rows = rows[:step+1]
-    ribbon_title, ribbon_colors, ribbon_labels = _history_ribbon_values(history_rows, profile["dataset_id"])
+    ribbon_title, ribbon_colors, ribbon_labels = _history_ribbon_values(history_rows, profile["dataset_id"], theme)
     st.caption(ribbon_title)
     ribbon = go.Figure(go.Scatter(x=[r["as_of"] / scale for r in history_rows], y=[1]*len(history_rows),
                 mode="markers", marker=dict(symbol="square", size=10, color=ribbon_colors),
                 text=ribbon_labels, hovertemplate="%{text}<extra></extra>"))
-    ribbon.update_layout(height=100, margin=dict(l=20,r=20,t=10,b=20), yaxis_visible=False, xaxis_title=time_label)
-    st.plotly_chart(ribbon, width="stretch")
+    style_figure(ribbon, theme, height=100)
+    ribbon.update_layout(margin=dict(l=20,r=20,t=10,b=20), yaxis_visible=False, xaxis_title=time_label, hovermode="closest")
+    st.plotly_chart(ribbon, width="stretch", theme=None)
     with st.expander("Diagnostics · event forecast and action timing"):
         event = result["event_forecast"]
         st.caption("Point RUL and research probabilities do not validate operational timing. Endpoints may differ from the sensor limit.")
         st.json(event)
         st.json(condition["timing"])
         event_fig = go.Figure(go.Scatter(x=[r["as_of"] / scale for r in history_rows], y=[r["event_forecast"]["point"] for r in history_rows], name="Diagnostic point RUL"))
-        event_fig.update_layout(height=240, yaxis_title=profile["time_basis"], xaxis_title=time_label)
-        st.plotly_chart(event_fig, width="stretch")
+        event_fig.update_traces(line_color=t["series_forecast"])
+        event_fig.update_layout(yaxis_title=profile["time_basis"], xaxis_title=time_label)
+        st.plotly_chart(style_figure(event_fig, theme, height=240), width="stretch", theme=None)
     with st.expander("Alert episodes and inspection feedback"):
         alerts = pd.read_parquet(directory / "alert_episodes.parquet")
         if len(alerts):

@@ -245,7 +245,7 @@ def test_health_zones_view_without_model(monkeypatch):
     from pdm.paths import project_root
 
     monkeypatch.setattr(ui, "list_zone_runs", lambda dataset_id="bearings": [])
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=30)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=30)
     at.session_state["screen_selection"] = "Model Report"
     at.session_state["report_view"] = "Health zones"
     at.run()
@@ -336,7 +336,7 @@ def test_health_zones_view_explains_legacy_runs_need_retraining(monkeypatch):
     monkeypatch.setattr(ui, "list_zone_runs", lambda dataset_id="bearings": [
         {"run_id": "old-run", "dir": "/tmp/old-run", "compatible": False},
     ])
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=30)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=30)
     at.session_state["screen_selection"] = "Model Report"
     at.session_state["report_view"] = "Health zones"
     at.run()
@@ -359,7 +359,7 @@ def test_health_zones_view_reports_missing_run_snapshot(monkeypatch):
     ))
     monkeypatch.setattr(ui, "_features", lambda version: (_ for _ in ()).throw(
         FileNotFoundError("missing-version")))
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=30)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=30)
     at.session_state["screen_selection"] = "Model Report"
     at.session_state["report_view"] = "Health zones"
     at.run()

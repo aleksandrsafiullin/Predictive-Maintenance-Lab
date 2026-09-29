@@ -103,27 +103,27 @@ def test_filter_health_zones_is_accessible_without_a_model_bundle(monkeypatch, t
     artifact_root = tmp_path / "_zones" / "filters" / "label_artifacts"
     _write_artifact(artifact_root, data)
     monkeypatch.setattr(prepare, "load_processed", lambda dataset_id, version=None: data)
+    monkeypatch.setattr(prepare, "processed_ready", lambda dataset_id: dataset_id in {"filters", "bearings"})
     monkeypatch.setattr("pdm.filter_health_zones_ui.runs_root", lambda: tmp_path)
     monkeypatch.setattr("pdm.experiments.list_runs", lambda dataset_id: [])
     monkeypatch.setattr(monitoring_ui, "bundles_for", lambda dataset_id: [])
     # Select the standalone replay view explicitly; Future-red entry is the report default.
-    app_test = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=30)
+    app_test = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=30)
+    app_test.session_state["workflow_dataset"] = "filters"
+    app_test.session_state["workflow_step"] = "Results"
     app_test.session_state["screen_selection"] = "Model Report"
-    app_test.run()
-    next(r for r in app_test.sidebar.radio if r.label == "Dataset").set_value("Filters")
     app_test.run()
     report_view = next(r for r in app_test.radio if r.label == "Report view")
     report_view.set_value("Health zones")
     app_test.run()
 
     assert not app_test.exception
-    assert [r.label for r in app_test.sidebar.radio if r.label == "Screen"]
+    assert not any(r.label in {"Dataset", "Screen"} for r in app_test.sidebar.radio)
     assert any("Health zones · filters" in str(h.value) for h in app_test.subheader)
     assert any("Configured laboratory pressure limit reached" in str(m.value) for m in app_test.markdown)
     assert report_view.value == "Health zones"
 
-    next(r for r in app_test.sidebar.radio if r.label == "Dataset").set_value("Bearings")
-    app_test.session_state["screen_selection"] = "Model Report"
+    next(widget for widget in app_test.selectbox if widget.label == "Project").set_value("bearings")
     app_test.run()
     assert not app_test.exception
     report_view = next(r for r in app_test.radio if r.label == "Report view")

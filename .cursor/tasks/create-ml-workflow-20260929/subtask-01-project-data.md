@@ -1,0 +1,22 @@
+# Subtask 01 (A): persistent projects and admitted data
+
+## Goal
+Make project identity real and persistent, then import a browser/server folder into an isolated, versioned sensor snapshot with whole-unit Train/Validation/Test membership.
+
+## Owner files
+`src/pdm/projects.py`, project-aware helpers in `src/pdm/paths.py`, `src/pdm/data/project_import.py`, `src/pdm/data/generic_csv.py`, `src/pdm/data/project_prepare.py`, and focused `tests/test_projects.py`, `tests/test_project_import.py`, `tests/test_spec_invariants.py`. Avoid editing `app.py` and `worker.py` in this chunk.
+
+## Acceptance criteria
+- [x] Implement mapping DTOs and `ProjectStore(root: Path | None = None)` with `create/list/get/update/archive/register_legacy`, `project_store()` using `PDM_PROJECTS_ROOT`, and safe `project_path/snapshot_path/run_path`. Own all project metadata under `root/{project_id}`. `update(selected_run_id=...)` verifies binding. Registry/snapshot activation is atomic; names are unique; two same-kind projects have independent source hashes, snapshot paths and run paths. Publish the exact fixture/API before B and C integrate.
+- [x] Archive an owned project by recoverable move with receipt. For a linked legacy project, archive its owned metadata/signal-run root and tombstone the external dataset binding without touching original legacy raw/processed/research paths. Refuse an archive while that project's queued/running job or process exists; do not block unrelated project archival. Symlink/path traversal and invalid IDs cannot escape project roots.
+- [x] Accept a primary folder by browser directory upload or server path, with preserved sanitized relative paths, source size/count checks and no partial manifest on failure. Browser folder upload is a UI concern in C; this layer accepts normalized files/path. Keep large-file server path streaming.
+- [x] Generic CSV v1 requires `unit_id`, `timestamp_s`, chosen finite numeric signal, declared unit and instantaneous yellow/red rule; canonical `signal` may be signed and `output_domain='real'`. Input allowlist is `['signal']` initially; optional context is descriptive only. Infer no failure/RUL label. Missing/rejected signal rows create gap boundaries. New XJTU/HSE projects pass owned `raw_dir` to source adapters and write scoped snapshots; never call global prepare defaults. HSE author-test units remain Test-only and official RUL evaluation-only. Wrap legacy prepared data as tiny immutable project snapshots on demand without copying raw data; old runs do not make Results ready.
+- [x] Validation and Testing independently accept manual folder or automatic unit-level holdout. Desired weights default 70/15/15 and are renormalized across automatic groups in the primary pool if a manual set exists; manual units lie outside that ratio. Save desired weights and realized whole-unit counts, validate seed/minimum counts, and reject duplicate physical history/content across all sets, including renamed CSVs. HSE author-test units are never eligible for Train/Validation.
+- [x] Implement `load_snapshot(pid, sid=None)` with the exact canonical fields/schema in master-plan.md. Reuse/extend `assert_split_coverage` and snapshot fingerprint patterns. Apply admission and gap checks, preserve masked unknown future targets, and save understandable per-set counts/quality findings. Do not fit preprocessing on validation/test. Include a small `tests/fixtures/project_contract` source plus helper to build a known snapshot for B/C.
+
+## Verification
+`PYTHONPATH=src .venv/bin/python -m pytest tests/test_projects.py tests/test_project_import.py tests/test_spec_invariants.py -q`; `.venv/bin/python -m ruff check` owned paths. Include automatic, Validation-only manual, Testing-only manual, both manual, too-few-units, cross-folder duplicate, signed signal/missing-row gap, rollback, archive, linked-unregister, scoped same-kind projects, and HSE author-test fixtures. Return the fixture and finalized data schemas to B and C before integration.
+
+## Completion evidence
+
+Completed and independently reviewed on 2026-09-29. See `docs/create_ml_implementation_report_ru.md`, scoped review files, and `output/orchestration-20260929/` evidence. Final suite: 581 tests passed. D used browser GRU on real prepared observations, three actual worker engines on the signed/gapped fixture, contract tests for error/causality cases, and desktop/narrow visual checks. Full raw-data retraining and field model-quality certification were not part of this acceptance.

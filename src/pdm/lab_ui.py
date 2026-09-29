@@ -16,9 +16,10 @@ from pdm.data.quality import training_admission
 from pdm.experiments import list_evaluations, run_dir
 from pdm.io_util import read_json
 from pdm.paths import runs_root
+from pdm.ui_theme import current_theme, series_cycle, tokens
+from pdm.ui_theme import style_figure as ui_style_figure
 from pdm.worker import read_status, request_stop, worker_alive
 
-COLORS = ["#61d8ee", "#f2be68", "#b59cf8", "#82daa6", "#fc8caa", "#a6b8ff"]
 MODEL_NAMES = {"gru": "GRU", "lstm": "LSTM", "fly_connectome_reservoir": "Fly reservoir", "random_reservoir": "Random reservoir"}
 
 
@@ -29,12 +30,15 @@ def model_label(run):
     return f"{name} · {size} · {run['run_id'][-6:]}"
 
 
+def comparison_colors(theme: str) -> tuple[str, str, list[str]]:
+    """Actual, observed lower bound, and model-run colors; models never reuse either reference color."""
+    t = tokens(theme)
+    reserved = {t["series_observed"], t["series_reference"]}
+    return t["series_reference"], t["series_observed"], [c for c in series_cycle(theme) if c not in reserved]
+
+
 def style_figure(fig, height=500):
-    fig.update_layout(height=height, paper_bgcolor="#101925", plot_bgcolor="#101925", font_color="#edf4fa",
-                      margin=dict(l=30, r=20, t=50, b=35), legend=dict(orientation="h", y=1.12))
-    fig.update_xaxes(gridcolor="#263447")
-    fig.update_yaxes(gridcolor="#263447")
-    return fig
+    return ui_style_figure(fig, current_theme(), height=height)
 
 
 def quality_overview(bundle):
@@ -260,10 +264,10 @@ def report_evaluations(dataset_id, run_id):
                 st.plotly_chart(style_figure(px.line(frame, x="epoch", y="learning_rate"), 220), width="stretch", theme=None)
             cols = [c for c in ("train_metric", "val_metric") if c in frame and frame[c].notna().any()]
             if len(frame) > 1 and cols:
-                st.plotly_chart(style_figure(px.line(frame, x="epoch", y=cols, color_discrete_sequence=COLORS), 300), width="stretch", theme=None)
+                st.plotly_chart(style_figure(px.line(frame, x="epoch", y=cols, color_discrete_sequence=series_cycle(current_theme())), 300), width="stretch", theme=None)
             loss_cols = [c for c in ("train_loss", "val_loss") if c in frame and frame[c].notna().any()]
             if len(frame) > 1 and loss_cols:
-                st.plotly_chart(style_figure(px.line(frame, x="epoch", y=loss_cols, title="Optimization loss", color_discrete_sequence=COLORS), 240), width="stretch", theme=None)
+                st.plotly_chart(style_figure(px.line(frame, x="epoch", y=loss_cols, title="Optimization loss", color_discrete_sequence=series_cycle(current_theme())), 240), width="stretch", theme=None)
             st.dataframe(frame, hide_index=True, width="stretch")
             if not cols:
                 st.caption("Closed-form readout fitting has no gradient loss curve.")
@@ -394,15 +398,16 @@ def screen_comparison(dataset_id):
     fig = make_subplots(rows=2 if has_truth else 1, cols=1, shared_xaxes=True,
                         subplot_titles=("Remaining useful life", "Absolute prediction error") if has_truth else ("Remaining useful life",),
                         vertical_spacing=0.17)
+    actual_color, observed_color, colors = comparison_colors(current_theme())
     if has_truth:
-        fig.add_trace(go.Scatter(x=truth.timestamp_s / scale, y=truth.actual_rul_s / scale, name="Actual", line=dict(color="#ff7e83", dash="dash")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=truth.timestamp_s / scale, y=truth.actual_rul_s / scale, name="Actual", line=dict(color=actual_color, dash="dash")), row=1, col=1)
     elif "outcome_duration_s" in truth:
         st.caption("This filter has no registered failure. Remaining observed operation is a lower bound on RUL; point error is unavailable. Its survival likelihood still contributes to validation NLL.")
         fig.add_trace(go.Scatter(x=truth.timestamp_s / scale, y=truth.outcome_duration_s / scale,
-                                name="Observed RUL lower bound", line=dict(color="#ff7e83", dash="dash")), row=1, col=1)
+                                name="Observed RUL lower bound", line=dict(color=observed_color, dash="dash")), row=1, col=1)
     for i, (rid, g) in enumerate(visible.groupby("run_id", sort=False)):
         label = model_label(runs[rid])
-        color = COLORS[i % len(COLORS)]
+        color = colors[i % len(colors)]
         fig.add_trace(go.Scatter(x=g.timestamp_s / scale, y=g.predicted_rul_s / scale, name=label, line_color=color), row=1, col=1)
         if has_truth:
             fig.add_trace(go.Scatter(x=g.timestamp_s / scale, y=g.absolute_error_s / scale, name=label, line_color=color, showlegend=False), row=2, col=1)

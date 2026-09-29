@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import time
 import traceback
 from pathlib import Path
 
 from pdm.io_util import atomic_write_json, read_json
 from pdm.paths import worker_dir
+
+_CURRENT_PROJECT_JOB: dict | None = None
+_PROJECT_TERMINAL = {"completed", "failed", "cancelled"}
 
 
 def status_path() -> Path:
@@ -71,13 +76,39 @@ def read_status() -> dict:
     if not p.exists():
         return {"status": "not_ready"}
     try:
-        return read_json(p)
+        status = read_json(p)
+        if status.get("project_id") and status.get("status") in {"queued", "running", "stopping"}:
+            pid = status.get("pid")
+            if not pid and pid_path().exists():
+                try:
+                    pid = int(pid_path().read_text(encoding="utf-8").strip())
+                except (OSError, ValueError):
+                    pid = None
+            age = time.time() - float(status.get("updated_at", 0))
+            if (pid and not _pid_exists(int(pid)) and age > 1) or (not pid and age > 10):
+                status = {**status, "status": "failed", "stage": "worker_exit", "progress": None,
+                          "message": "Worker exited without a terminal status", "error": "Worker process exited"}
+                atomic_write_json(p, status)
+        return status
     except Exception:
         return {"status": "unknown"}
 
 
-def request_stop() -> None:
-    stop_path().write_text("stop\n", encoding="utf-8")
+def request_stop(expected_job_id: str | None = None) -> None:
+    """Request cooperative stop, optionally bound to one project job identity."""
+    status = read_status()
+    if expected_job_id is None and status.get("project_id") and status.get("status") not in _PROJECT_TERMINAL:
+        expected_job_id = str(status["job_id"])
+    if expected_job_id is not None:
+        if status.get("job_id") != expected_job_id:
+            raise ValueError("Stop request does not match the active job")
+        if status.get("status") in _PROJECT_TERMINAL:
+            raise ValueError("Job has already finished")
+        atomic_write_json(stop_path(), {"job_id": expected_job_id})
+        atomic_write_json(status_path(), {**status, "status": "stopping", "stage": "stopping",
+                                          "message": "Stop requested", "updated_at": time.time()})
+    else:
+        stop_path().write_text("stop\n", encoding="utf-8")
 
 
 def clear_stop() -> None:
@@ -107,13 +138,84 @@ def worker_alive() -> bool:
 
 def write_status(payload: dict) -> None:
     payload = dict(payload)
+    if _CURRENT_PROJECT_JOB is not None:
+        for key in ("job_id", "project_id", "kind"):
+            payload[key] = _CURRENT_PROJECT_JOB[key]
+        payload.setdefault("stage", str(payload.get("status", "running")))
+        payload.setdefault("progress", None)
+        payload.setdefault("message", None)
+        payload.setdefault("error", None)
+        payload["updated_at"] = time.time()
     payload["pid"] = os.getpid()
     atomic_write_json(status_path(), payload)
 
 
+def status_for_project(project_id: str) -> dict:
+    status = read_status()
+    return status if status.get("project_id") == project_id else {"status": "not_ready"}
+
+
+def queued_project_job() -> dict | None:
+    """Read the durable queue marker without relying on a possibly stale PID."""
+    status = read_status()
+    if status.get("project_id") and status.get("status") not in _PROJECT_TERMINAL:
+        return status
+    return None
+
+
+def _project_stopped(job_id: str) -> bool:
+    if not stop_path().exists():
+        return False
+    try:
+        saved = read_json(stop_path())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return saved.get("job_id") == job_id
+
+
+def _cleanup_project_uploads(job: dict) -> None:
+    """Remove only browser staging directories owned by this import job."""
+    from pdm.projects import project_store
+
+    uploads = project_store().project_path(job["project_id"]) / "uploads"
+    if uploads.is_symlink() or not uploads.is_dir():
+        return
+    source = job.get("source") or {}
+    for group in ("primary", "validation", "test"):
+        spec = source.get(group)
+        if not isinstance(spec, dict) or spec.get("mode") != "files":
+            continue
+        files = spec.get("files")
+        if not isinstance(files, list) or not files:
+            continue
+        paths = [Path(item["path"]) for item in files if isinstance(item, dict) and isinstance(item.get("path"), str)]
+        if len(paths) != len(files):
+            continue
+        stages = {path.relative_to(uploads).parts[0] for path in paths if path.is_relative_to(uploads)}
+        if len(stages) != 1:
+            continue
+        stage_id = next(iter(stages))
+        if len(stage_id) != 32 or any(c not in "0123456789abcdef" for c in stage_id):
+            continue
+        stage = uploads / stage_id
+        if (not stage.is_dir() or stage.is_symlink() or
+                not all(path.is_relative_to(stage) and len(path.relative_to(stage).parts) >= 2 for path in paths)):
+            continue
+        if not stage.resolve().is_relative_to(uploads.resolve()):
+            continue
+        shutil.rmtree(stage)
+
+
 def run_job(job: dict) -> None:
+    global _CURRENT_PROJECT_JOB
     kind = job.get("kind")
-    clear_stop()
+    is_project = kind in {"project_import", "project_train"}
+    if is_project:
+        if not isinstance(job.get("project_id"), str) or not isinstance(job.get("job_id"), str):
+            raise ValueError("Project job requires project_id and job_id")
+        _CURRENT_PROJECT_JOB = {"kind": kind, "project_id": job["project_id"], "job_id": job["job_id"]}
+    else:
+        clear_stop()
     pid_path().write_text(str(os.getpid()), encoding="utf-8")
     log_lines: list[str] = []
 
@@ -130,10 +232,45 @@ def run_job(job: dict) -> None:
         print(msg, flush=True)
 
     def stopped() -> bool:
-        return stop_path().exists()
+        return _project_stopped(job["job_id"]) if is_project else stop_path().exists()
 
     try:
-        if kind == "condition_study":
+        if kind == "project_import":
+            from pdm.data.project_import import import_project
+            from pdm.data.project_prepare import prepare_project
+
+            if stopped():
+                raise InterruptedError("Project import cancelled before start")
+            write_status({"status": "running", "stage": "import", "progress": 0.0,
+                          "message": "Importing project source"})
+            source = import_project(job["project_id"], job["source"], should_stop=stopped)
+            if stopped():
+                raise InterruptedError("Project import cancelled")
+            source_id = source.get("manifest_id")
+            if not source_id:
+                raise ValueError("Import did not return a source manifest ID")
+            write_status({"status": "running", "stage": "prepare", "progress": 0.5,
+                          "message": "Preparing project snapshot"})
+            snapshot = prepare_project(job["project_id"], source_id, should_stop=stopped)
+            write_status({"status": "completed", "stage": "completed", "progress": 1.0,
+                          "snapshot_id": snapshot["snapshot_id"], "message": "Project data ready"})
+        elif kind == "project_train":
+            from pdm.signal_training import train_signal_run
+
+            if stopped():
+                raise InterruptedError("Project training cancelled before start")
+            write_status({"status": "running", "stage": "training", "progress": 0.0,
+                          "message": "Training numeric signal model"})
+
+            def project_progress(update: dict) -> None:
+                write_status({"status": "running", **update})
+
+            run = train_signal_run(job["project_id"], job.get("snapshot_id"), job["engine_id"],
+                                   job.get("params") or {}, should_stop=stopped,
+                                   status_cb=project_progress)
+            write_status({"status": "completed", "stage": "completed", "progress": 1.0,
+                          "run_id": run["run_id"], "message": "Signal model ready"})
+        elif kind == "condition_study":
             from pdm.monitoring.study import run_condition_study
 
             run_condition_study(job, should_stop=stopped, log=log)
@@ -147,6 +284,34 @@ def run_job(job: dict) -> None:
             from pdm.training_study import run_training_study
 
             run_training_study(job)
+        elif kind == "future_red_matrix":
+            from scripts import run_future_red_matrix
+
+            dataset_id = str(job["dataset_id"])
+            if dataset_id not in {"bearings", "filters"}:
+                raise ValueError(f"Unsupported matrix dataset: {dataset_id}")
+            architectures = tuple(job.get("architectures") or ("gru",))
+            if not architectures or any(
+                architecture not in {"gru", "lstm", "fly", "random"}
+                for architecture in architectures
+            ):
+                raise ValueError("Choose at least one supported matrix model")
+            args = run_future_red_matrix._parser().parse_args(
+                ["--datasets", dataset_id, "--architectures", ",".join(architectures)]
+            )
+            write_status({
+                "status": "training", "kind": kind, "dataset_id": dataset_id,
+                "architectures": list(architectures), "message": "Training selected models",
+            })
+            output_dir = run_future_red_matrix.run(args)
+            states = read_json(output_dir / "status.json")
+            failures = [key for key, state in states.items() if state.get("status") != "completed"]
+            write_status({
+                "status": "failed" if failures else "completed", "kind": kind,
+                "dataset_id": dataset_id, "run_id": output_dir.name,
+                "architectures": list(architectures), "failed_models": failures,
+                "message": "Training finished" if not failures else "Some models failed; inspect run details",
+            })
         elif kind == "train_matrix":
             from pdm.batch import run_batch
 
@@ -298,17 +463,32 @@ def run_job(job: dict) -> None:
             write_status({"status": "ready", "dataset_id": job["dataset_id"], "kind": "download"})
         else:
             raise ValueError(f"Unknown job kind {kind}")
+    except InterruptedError as exc:
+        if not is_project:
+            raise
+        write_status({"status": "cancelled", "stage": "cancelled", "progress": None,
+                      "message": "Project job cancelled", "error": str(exc)})
     except Exception as exc:  # noqa: BLE001
         write_status(
             {
                 "status": "failed",
                 "kind": kind,
+                "dataset_id": job.get("dataset_id"),
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
             }
         )
         raise
     finally:
+        if is_project:
+            _CURRENT_PROJECT_JOB = None
+            if _project_stopped(job["job_id"]):
+                clear_stop()
+            if kind == "project_import":
+                try:
+                    _cleanup_project_uploads(job)
+                except (OSError, ValueError, KeyError):
+                    pass  # Staging cleanup must not replace the import outcome.
         if pid_path().exists():
             try:
                 pid_path().unlink()

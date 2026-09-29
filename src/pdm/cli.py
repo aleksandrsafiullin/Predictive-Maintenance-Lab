@@ -5,13 +5,23 @@ import json
 import os
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 
 from pdm import __version__
 from pdm.device import resolve_device
 from pdm.io_util import atomic_write_json
 from pdm.paths import data_processed, data_raw, project_root, runs_root, worker_dir
-from pdm.worker import job_path, pid_path, request_stop, worker_alive
+from pdm.worker import (
+    clear_stop,
+    job_path,
+    pid_path,
+    read_status,
+    request_stop,
+    status_path,
+    worker_alive,
+)
 
 
 def _python() -> str:
@@ -92,23 +102,72 @@ def doctor() -> dict:
 
 
 def spawn_worker(job: dict) -> subprocess.Popen:
-    if worker_alive():
-        raise RuntimeError("A heavy job is already running. Stop it before starting another.")
-    worker_dir().mkdir(parents=True, exist_ok=True)
-    atomic_write_json(job_path(), job)
+    if job.get("kind") in {"project_import", "project_train"}:
+        from pdm.projects import project_store
+
+        job = dict(job)
+        if not isinstance(job.get("project_id"), str):
+            raise ValueError("Project job requires project_id")
+        if job["kind"] == "project_import" and not isinstance(job.get("source"), dict):
+            raise ValueError("Project import requires a source specification")
+        if job["kind"] == "project_train" and (
+            job.get("engine_id") not in {"gru", "lstm", "quantile_boosting"} or not isinstance(job.get("params"), dict)
+        ):
+            raise ValueError("Project training requires one supported engine and parameter mapping")
+        job.setdefault("job_id", uuid.uuid4().hex)
+        if not isinstance(job["job_id"], str) or not job["job_id"]:
+            raise ValueError("Project job requires a job ID")
+        store = project_store()
+        store.get(job["project_id"])
+        with store.launch_lock():
+            if job["project_id"] not in store._load()["projects"]:
+                raise ValueError("Project was archived before the job could start")
+            old = read_status()
+            if worker_alive() or (old.get("project_id") and old.get("status") in
+                                  {"queued", "running", "starting", "stopping"}):
+                raise RuntimeError("A heavy job is already running or queued")
+            worker_dir().mkdir(parents=True, exist_ok=True)
+            clear_stop()
+            atomic_write_json(job_path(), job)
+            atomic_write_json(status_path(), {
+                "job_id": job["job_id"], "project_id": job["project_id"], "kind": job["kind"],
+                "status": "queued", "stage": "queued", "progress": 0.0,
+                "message": "Waiting for worker", "error": None, "updated_at": time.time(),
+            })
+            try:
+                proc = _launch_worker_process()
+            except Exception as exc:
+                atomic_write_json(status_path(), {
+                    "job_id": job["job_id"], "project_id": job["project_id"], "kind": job["kind"],
+                    "status": "failed", "stage": "launch", "progress": None,
+                    "message": "Could not start worker", "error": str(exc), "updated_at": time.time(),
+                })
+                raise
+            pid_path().write_text(str(proc.pid), encoding="utf-8")
+            return proc
+    from pdm.projects import project_store
+
+    with project_store().launch_lock():
+        current = read_status()
+        if worker_alive() or (current.get("project_id") and current.get("status") in
+                              {"queued", "running", "starting", "stopping"}):
+            raise RuntimeError("A heavy job is already running. Stop it before starting another.")
+        worker_dir().mkdir(parents=True, exist_ok=True)
+        atomic_write_json(job_path(), job)
+        proc = _launch_worker_process()
+        pid_path().write_text(str(proc.pid), encoding="utf-8")
+        return proc
+
+
+def _launch_worker_process() -> subprocess.Popen:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(project_root() / "src") + os.pathsep + env.get("PYTHONPATH", "")
     env["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
-    proc = subprocess.Popen(
+    return subprocess.Popen(
         [_python(), "-m", "pdm.worker", "--job-file", str(job_path())],
-        cwd=str(project_root()),
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        cwd=str(project_root()), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    pid_path().write_text(str(proc.pid), encoding="utf-8")
-    return proc
 
 
 def main(argv: list[str] | None = None) -> int:

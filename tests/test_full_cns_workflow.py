@@ -7,7 +7,7 @@ from streamlit.testing.v1 import AppTest
 def test_model_report_defaults_to_future_red_without_old_rul_training_launch():
     from pdm.paths import project_root
 
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=15)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.session_state["screen_selection"] = "Model Report"
     at.session_state["report_view"] = "Future-red entry"
     at.run()

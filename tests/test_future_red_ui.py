@@ -77,6 +77,19 @@ def test_latest_matrix_ignores_invalid_manifest_without_metrics(tmp_path):
     assert latest_matrix(root) is None
 
 
+def test_latest_matrix_keeps_each_project_on_its_own_run(tmp_path):
+    root = tmp_path / "matrix"
+    filters = _write_matrix(root, "filters_run", "2026-09-27T12:00:00Z")
+    bearings = _write_matrix(root, "bearings_run", "2026-09-28T12:00:00Z")
+    manifest_path = bearings / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["run_config"]["target_artifacts"] = {"bearings": {"horizon_s": 1800}}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert latest_matrix(root, "filters")[0] == filters
+    assert latest_matrix(root, "bearings")[0] == bearings
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

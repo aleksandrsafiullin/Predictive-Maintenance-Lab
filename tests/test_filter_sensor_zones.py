@@ -20,6 +20,7 @@ from pdm.monitoring.policy import default_policy
 from pdm.monitoring.quality import quality_policy
 from pdm.monitoring.runtime import monitoring_step
 from pdm.monitoring.ui import _history_ribbon_values
+from pdm.ui_theme import TOKENS
 
 
 def rows(pressure, *, flow=120., feed=200.):
@@ -191,18 +192,18 @@ def test_filter_history_ribbon_uses_measured_sensor_zones_over_model_state():
         {"condition": {"display_zone": "green"},
          "sensor_zone": {"display_zone": "gray", "label": "Assessment unavailable"}},
     ]
-    title, colors, labels = _history_ribbon_values(rows_in, "filters")
+    title, colors, labels = _history_ribbon_values(rows_in, "filters", "light")
     assert title == "Filter sensor-zone history"
-    assert colors == ["#efbf54", "#9aa8b8"]
+    assert colors == [TOKENS["light"]["zone_yellow"], TOKENS["light"]["zone_unknown"]]
     assert labels == ["Pressure at warning band", "Assessment unavailable"]
 
 
 def test_legacy_filter_history_ribbon_is_explicitly_model_condition():
     rows_in = [{"condition": {"display_zone": "green"}}]
-    title, colors, labels = _history_ribbon_values(rows_in, "filters")
+    title, colors, labels = _history_ribbon_values(rows_in, "filters", "dark")
     assert "Model condition history" in title
     assert "predates sensor zones" in title
-    assert colors == ["#5bc98d"]
+    assert colors == [TOKENS["dark"]["zone_green"]]
     assert labels == ["Normal"]
 
 

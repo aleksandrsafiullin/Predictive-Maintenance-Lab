@@ -54,7 +54,7 @@ def operational_screen(monkeypatch, tmp_path, tiny_bearing_tables):
     monkeypatch.setattr(simulation_ui, "render_equipment_simulation", simulate)
     monkeypatch.setattr("pdm.worker.worker_alive", lambda: False)
     monkeypatch.setattr("pdm.worker.read_status", lambda: {})
-    at = AppTest.from_file(str(project_root() / "src" / "pdm" / "app.py"), default_timeout=20)
+    at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=20)
     at.session_state["screen_selection"] = "Neural Activity Explorer"
     at.session_state["report_view"] = "Historical RUL — Experimental / Model activity"
     return at, captured, unit_ids, rows
@@ -67,7 +67,8 @@ def test_operational_explorer_direct_ready_run_and_test_unit(operational_screen)
     assert not at.exception
     assert captured == [("anatomical_ready", unit_ids[1])]
     assert not any(r.label == "Mode" for r in at.radio)
-    assert [b.label for b in at.button] == ["Start test run"]
+    assert sum(b.label == "Start test run" for b in at.button) == 1
+    assert all(r.label not in {"Dataset", "Screen"} for r in at.radio)
     assert EXPLORER_DISCLAIMER in "\n".join(str(c.value) for c in at.caption)
 
 

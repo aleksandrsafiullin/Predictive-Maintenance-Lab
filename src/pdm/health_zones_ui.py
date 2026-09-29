@@ -18,8 +18,8 @@ from pdm.health_zones import (
     predict_unit,
     rule_baseline,
 )
+from pdm.ui_theme import current_theme, style_figure, tokens, zone_colors
 
-ZONE_COLORS = {"green": "#2ecc71", "yellow": "#f1c40f", "red": "#e74c3c"}
 METHODS = {
     "Signal rule (recommended)": "rule",
     "GRU classifier (experimental)": "gru",
@@ -67,7 +67,7 @@ def _segments(t_min: np.ndarray, zone: np.ndarray):
 
 def _status_card(zone: int, now_min: float, recording_end_min: float | None, ratio: float, probs: dict | None) -> None:
     name = ZONES[zone]
-    color = ZONE_COLORS[name]
+    color = zone_colors(current_theme())[name]
     extra = ""
     if probs:
         extra = " · ".join(f"{ZONES[k].capitalize()} {100 * p:.0f}%" for k, p in enumerate(probs))
@@ -95,28 +95,27 @@ def _status_card(zone: int, now_min: float, recording_end_min: float | None, rat
 
 
 def _chart(pred: pd.DataFrame, index: int, show_truth: bool) -> go.Figure:
+    theme = current_theme()
+    t, zone_color = tokens(theme), zone_colors(theme)
     t_min = (pred["timestamp_s"].to_numpy(float) - float(pred["timestamp_s"].iloc[0])) / 60.0
     rms = pred["combined_rms"].to_numpy(float)
     fig = go.Figure()
     for x0, x1, z in _segments(t_min[: index + 1], pred["zone"].to_numpy()[: index + 1]):
-        fig.add_vrect(x0=x0, x1=x1, fillcolor=ZONE_COLORS[ZONES[z]], opacity=0.28, line_width=0, layer="below")
+        fig.add_vrect(x0=x0, x1=x1, fillcolor=zone_color[ZONES[z]], opacity=0.28, line_width=0, layer="below")
     fig.add_trace(go.Scatter(x=t_min[: index + 1], y=rms[: index + 1], name="Vibration RMS (max of axes)",
-                             line=dict(color="#e8eef5", width=2)))
+                             line=dict(color=t["series_observed"], width=2)))
     if show_truth:
         fig.add_trace(go.Scatter(x=t_min[index:], y=rms[index:], name="Recording (future)",
-                                 line=dict(color="#7f8c9a", width=1, dash="dot")))
+                                 line=dict(color=t["series_observed"], width=1, dash="dot")))
         ymax = float(np.nanmax(rms)) * 1.08
         for x0, x1, z in _segments(t_min, pred["true_zone"].to_numpy()):
-            fig.add_shape(type="rect", x0=x0, x1=x1, y0=ymax * 0.97, y1=ymax, fillcolor=ZONE_COLORS[ZONES[z]],
+            fig.add_shape(type="rect", x0=x0, x1=x1, y0=ymax * 0.97, y1=ymax, fillcolor=zone_color[ZONES[z]],
                           line_width=0, opacity=0.9)
         fig.add_annotation(x=t_min[0], y=ymax, text="Sensor-rule reference zones", showarrow=False, xanchor="left",
-                           yanchor="bottom", font=dict(size=11))
-    fig.add_vline(x=t_min[index], line=dict(color="#5bd3f5", width=2, dash="dash"))
-    fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), template="plotly_dark",
-                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      xaxis_title="Operating time, min", yaxis_title="RMS, g",
-                      legend=dict(orientation="h", y=-0.2))
-    return fig
+                           yanchor="bottom")
+    fig.add_vline(x=t_min[index], line=dict(color=t["series_reference"], width=1, dash="dot"))
+    fig.update_layout(xaxis_title="Operating time, min", yaxis_title="RMS, g")
+    return style_figure(fig, theme, height=380)
 
 
 def _metrics_table(metrics: dict) -> pd.DataFrame:
@@ -231,7 +230,7 @@ def screen_health_zones(dataset_id: str) -> None:
         recording_end = (float(pred["timestamp_s"].iloc[-1]) - t0) / 60.0 if show_truth else None
         _status_card(int(row["zone"]), (float(row["timestamp_s"]) - t0) / 60.0, recording_end,
                      float(row["combined_rms"]) / base, probs)
-        st.plotly_chart(_chart(pred, index, show_truth), width="stretch", key=f"hz_chart:{uid}")
+        st.plotly_chart(_chart(pred, index, show_truth), width="stretch", theme=None, key=f"hz_chart:{uid}")
 
     timeline()
     with st.expander("How good is it? Validation and test results"):

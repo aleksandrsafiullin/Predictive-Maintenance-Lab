@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from pdm import ui_copy
+
 MATRIX_SCHEMA = "future_red_matrix_v1"
 MODEL_LABELS = {
     "gru": "GRU",
@@ -20,8 +22,8 @@ MODEL_LABELS = {
 }
 
 
-def latest_matrix(matrix_root: Path) -> tuple[Path, dict[str, Any]] | None:
-    """Return the newest schema-valid matrix directory with a metrics file."""
+def latest_matrix(matrix_root: Path, dataset_id: str | None = None) -> tuple[Path, dict[str, Any]] | None:
+    """Return the newest schema-valid matrix for the requested project."""
     candidates: list[tuple[str, Path, dict[str, Any]]] = []
     for manifest_path in matrix_root.glob("*/run_manifest.json"):
         try:
@@ -34,6 +36,9 @@ def latest_matrix(matrix_root: Path) -> tuple[Path, dict[str, Any]] | None:
             or not (manifest_path.parent / "metrics.csv").is_file()
             or not (manifest.get("run_config") or {}).get("target_artifacts")
         ):
+            continue
+        targets = (manifest.get("run_config") or {}).get("target_artifacts") or {}
+        if dataset_id is not None and dataset_id not in targets:
             continue
         candidates.append((str(manifest.get("created_at") or ""), manifest_path.parent, manifest))
     if not candidates:
@@ -169,9 +174,13 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def render_training(dataset_id: str, matrix_root: Path) -> None:
-    """Render current matrix status and the exact CLI entry point."""
+    """Launch and inspect the selected dataset's future-red model training."""
     import pandas as pd
     import streamlit as st
+
+    from pdm.cli import spawn_worker
+    from pdm.data.prepare import processed_ready
+    from pdm.worker import read_status, worker_alive
 
     label = "Bearings" if dataset_id == "bearings" else "Filters"
     st.header(f"Future-red entry training — {label}")
@@ -185,7 +194,7 @@ def render_training(dataset_id: str, matrix_root: Path) -> None:
         "filters use a 20-second horizon. Health zones remains a separate sensor-state replay."
     )
 
-    current = latest_matrix(matrix_root)
+    current = latest_matrix(matrix_root, dataset_id)
     if current is None:
         st.info("No valid future-red matrix is available yet.")
     else:
@@ -229,13 +238,56 @@ def render_training(dataset_id: str, matrix_root: Path) -> None:
             st.markdown("#### Test split snapshot")
             st.dataframe(_metrics_frame(pd, metrics), width="stretch", hide_index=True)
 
-    st.markdown("#### Run or refresh the selected dataset matrix")
-    st.code(
-        f"python scripts/run_future_red_matrix.py --datasets {dataset_id} "
-        "--architectures gru,lstm,fly,random",
-        language="bash",
+    st.markdown("#### Train models")
+    st.caption("Select model families, then start a new run. Validation selects checkpoints; the test split is evaluated after the model is frozen.")
+    selected = st.multiselect(
+        "Model families", ["GRU", "LSTM", "Fly reservoir", "Random reservoir"],
+        default=["GRU"], key=f"future_red_models:{dataset_id}", help=ui_copy.LEGACY_MODEL_FAMILIES_HELP,
     )
-    st.caption("Run from the project root. Each run writes to a new timestamped directory under `runs/_future_red/matrix`. ")
+    choices = {"GRU": "gru", "LSTM": "lstm", "Fly reservoir": "fly", "Random reservoir": "random"}
+    can_train = processed_ready(dataset_id) and not worker_alive() and bool(selected)
+    if st.button("Start training", type="primary", disabled=not can_train, key=f"future_red_start:{dataset_id}",
+                 help=ui_copy.LEGACY_START_TRAINING_HELP):
+        spawn_worker({
+            "kind": "future_red_matrix", "dataset_id": dataset_id,
+            "architectures": [choices[label] for label in selected],
+        })
+        st.rerun()
+    if not processed_ready(dataset_id):
+        st.info("Import and inspect source data before training.")
+    status = read_status()
+    if status.get("kind") == "future_red_matrix" and status.get("dataset_id") == dataset_id:
+        state = status.get("status")
+        if state == "training" and worker_alive():
+            st.info("Training is running. Model progress appears in the run table above.")
+            @st.fragment(run_every=3)
+            def live_matrix_progress() -> None:
+                manifests = sorted(matrix_root.glob("*/run_manifest.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                for manifest_path in manifests:
+                    manifest = _read_json(manifest_path)
+                    if dataset_id not in ((manifest.get("run_config") or {}).get("datasets") or []):
+                        continue
+                    states = _read_json(manifest_path.parent / "status.json")
+                    rows = [
+                        {"Model": MODEL_LABELS.get(key.split("/", 1)[1], key),
+                         "Status": str(value.get("status") or "pending").title()}
+                        for key, value in states.items() if key.startswith(dataset_id + "/")
+                    ]
+                    if rows:
+                        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                    break
+
+            live_matrix_progress()
+        elif state == "failed":
+            st.error(status.get("message") or "Training failed")
+        elif state == "completed":
+            st.success("Training finished. Open Results to review held-out test metrics.")
+    with st.expander("Command-line run"):
+        st.code(
+            f"python scripts/run_future_red_matrix.py --datasets {dataset_id} "
+            "--architectures gru,lstm,fly,random",
+            language="bash",
+        )
 
 
 def render_report(dataset_id: str, matrix_root: Path) -> None:
@@ -245,7 +297,7 @@ def render_report(dataset_id: str, matrix_root: Path) -> None:
 
     label = "Bearings" if dataset_id == "bearings" else "Filters"
     st.header(f"Future-red entry model report — {label}")
-    current = latest_matrix(matrix_root)
+    current = latest_matrix(matrix_root, dataset_id)
     if current is None:
         st.info("No valid future-red matrix is available yet.")
         return
@@ -310,6 +362,55 @@ def render_report(dataset_id: str, matrix_root: Path) -> None:
         "Test metrics are for the held-out split after checkpoint and threshold selection on validation. "
         "They are exploratory, label-bound results; compare precision, event recall, lead time, and alert burden together."
     )
+
+
+def render_comparison(dataset_id: str, matrix_root: Path) -> None:
+    """Compare models evaluated on one frozen future-red target and test split."""
+    import pandas as pd
+    import streamlit as st
+
+    st.header(f"Compare models — {'Bearings' if dataset_id == 'bearings' else 'Filters'}")
+    current = latest_matrix(matrix_root, dataset_id)
+    if current is None:
+        st.info("Train models to create a comparable future-red test result.")
+        return
+    directory, manifest = current
+    rows = load_test_metrics(directory, dataset_id)
+    if dataset_id == "bearings":
+        full_cns = matching_full_cns_run(matrix_root, manifest)
+        if full_cns:
+            full_dir, full_manifest = full_cns
+            full_row = full_cns_test_metric_row(full_manifest, f"Separate run: {full_dir.name}")
+            if full_row:
+                rows.append(full_row)
+    if not rows:
+        st.info("This matrix has no held-out test metrics for this project yet.")
+        return
+    st.caption(
+        f"Matrix {manifest['run_id']} · same project, frozen target, and held-out test split. "
+        "The separately trained Full MaleCNS is included only when its target and artifacts match."
+    )
+    options = [str(row["architecture"]) for row in rows]
+    selected = st.multiselect(
+        "Models to compare", options, default=options,
+        format_func=lambda key: MODEL_LABELS.get(key, key),
+        key=f"future_red_compare:{dataset_id}:{manifest['run_id']}", help=ui_copy.LEGACY_COMPARE_MODELS_HELP,
+    )
+    chosen = [row for row in rows if row["architecture"] in selected]
+    if not chosen:
+        st.info("Select at least one model to inspect its test metrics.")
+        return
+    st.dataframe(_metrics_frame(pd, chosen), width="stretch", hide_index=True)
+    if dataset_id == "filters":
+        st.warning(
+            "The filter test split has no observed RED-entry events. Event recall and warning lead time "
+            "cannot be ranked from this holdout."
+        )
+    else:
+        st.caption(
+            "Compare precision, missed events, warning lead time, and alert burden together. "
+            "A high row-level score alone does not prove a useful maintenance warning."
+        )
 
 
 def _metrics_frame(pd: Any, rows: list[dict[str, Any]]) -> Any:

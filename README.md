@@ -1,6 +1,8 @@
 # Predictive Maintenance Lab
 
-A local laboratory for **sensor-signal condition zones** on two public datasets. Green, yellow and red describe the current measurements, not a remaining-life window or a predicted failure time.
+A local laboratory for **sensor-signal forecasting**, with independent projects and a Create ML-style workflow: **Projects → Import data → Data Quality → Training → Results**. Import sensor CSV folders or the supported XJTU-SY/HSE formats, choose one model, and replay its saved forecast beside the measurements received so far. Yellow and red are signal limits; crossing one is not automatically an equipment failure.
+
+See the [project workflow guide](docs/create_ml_workflow.md) for folder formats, automatic/manual splits, model settings, playback and recoverable deletion. The public datasets and earlier research below remain available without copying their raw files into each project.
 
 | Dataset | Public source | Signal and sampling | Split |
 |---|---|---|---|
@@ -11,7 +13,7 @@ The bundled HSE source document at `data/raw/filters/Preventive to Predictive Ma
 
 ## Current sensor zones
 
-**Model Report → Health zones** in the Streamlit app replays both datasets without an RUL model or monitoring bundle.
+The existing sensor-zone research utilities describe both datasets without an RUL model or monitoring bundle. The new primary app has one signal Results screen; it does not expose the former report selector.
 
 - **Bearings:** green is vibration near that bearing's initial baseline; yellow is a persistent rise; red is measured RMS at least 2× that baseline. These are provisional signal rules, not expert fault diagnoses. [Rule and limitations](docs/health_zones.md).
 - **Filters:** green is usable pressure below a provisional 300 Pa band, yellow is 300–<600 Pa, red is at least 600 Pa, and gray means an unusable or incomplete measurement. Green means only “below this provisional band.” The source's observed-event convention is strictly >600 Pa, whereas the display boundary is ≥600 Pa. [Rule and limitations](docs/filter_sensor_zones.md).
@@ -200,7 +202,9 @@ Launch the UI:
 # or: .venv/bin/python -m pdm app
 ```
 
-Open **http://127.0.0.1:8501**. Select **Model Report → Health zones**, then choose a dataset, split and unit to replay. Filters open on Health zones when no monitoring bundle is present. **Data Quality** shows admission and signal context. Legacy RUL Training, Compare Models and event-model reports remain visible as historical workflows; their old local training artifacts are archived.
+Open **http://127.0.0.1:8501**. In **Projects**, enter a name and source format, then choose **Create project**. **Import data** accepts a browser-selected folder or a folder path visible to the app's computer. Generic CSV files require `unit_id`, `timestamp_s` and a chosen numeric signal. Use a server folder path for multi-GB sources such as XJTU-SY.
+
+Validation and Testing can each be held out automatically or supplied as a separate folder. **Data Quality** shows the three sets, their units, measurements and gaps. **Training** launches one GRU, LSTM or quantile boosting signal model with editable settings. **Results** shows a gray observed line, yellow/red limits, and the saved model's future signal points. Play advances through a held-out Test unit; Pause, Reset and the observation slider control the cursor. Light and dark appearance are available. The [workflow guide](docs/create_ml_workflow.md) explains model and threshold limits.
 
 To check the repository:
 
@@ -219,6 +223,7 @@ src/pdm/          CLI, train, evaluate, Streamlit app, models, connectome, visua
 src/pdm/monitoring/ observation quality, reference, sensor forecast, state, bundles, replay
 data/raw/         downloaded datasets (gitignored)
 data/processed/   prepared features + splits (gitignored)
+data/projects/    independent project sources, snapshots, signal runs and archive (gitignored)
 runs/             checkpoints, metrics, evaluations, traces (gitignored)
 docs/             monitoring, sensor/history, training, quality and connectome protocols
 reports/          published study summaries
@@ -230,6 +235,8 @@ scripts/          setup.sh / run.sh (and Windows .ps1)
 
 ## More documentation
 
+- [Project workflow guide](docs/create_ml_workflow.md) — folder import, split rules, training, playback and storage
+- [Implementation plan (Russian)](docs/create_ml_implementation_plan_ru.md) — scope, architecture and acceptance criteria
 - [Sensor-zone benchmark review](docs/sensor_zone_benchmark_review.md) — weak-label score, baselines and filter threshold sensitivity
 - [Future-red forecast report](docs/future_red_forecast_report.md) — horizon targets, censored masks, full model matrix and limits
 - [Sensor-zone implementation](docs/sensor_zones_implementation_report.md) — current artifact IDs, counts and limitations
