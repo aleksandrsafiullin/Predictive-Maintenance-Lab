@@ -193,6 +193,79 @@ def test_hse_manual_validation_and_author_test_never_train(tmp_path: Path):
         import_project(pid, spec, store=store)
 
 
+@pytest.mark.parametrize("manual_validation", [False, True])
+@pytest.mark.parametrize("primary_author_test", [False, True])
+@pytest.mark.parametrize("mixed_testing_folder", [False, True])
+def test_hse_separate_official_testing_source_preserves_provenance_and_protection(
+    tmp_path: Path, manual_validation: bool, primary_author_test: bool, mixed_testing_folder: bool,
+):
+    store = ProjectStore(tmp_path / "projects")
+    pid = store.create("HSE", "hse_filters")["project_id"]
+    primary, testing = tmp_path / "primary", tmp_path / "testing"
+    validation = tmp_path / "validation" if manual_validation else None
+    _write_filter(primary / "Train_Data_CSV.csv", [1, 2, 3, 4], base=100)
+    # The same author Data_No in different sources must remain distinguishable.
+    _write_filter(testing / "nested" / "Test_Data_CSV.csv", [1], base=200, official_test=True)
+    official_ids = {"test_Test_1"}
+    if primary_author_test:
+        _write_filter(primary / "Test_Data_CSV.csv", [1], base=300, official_test=True)
+        official_ids.add("Test_1")
+    if validation:
+        _write_filter(validation / "Train_Data_CSV.csv", [1], base=400)
+    expected_test = set(official_ids)
+    if mixed_testing_folder:
+        _write_filter(testing / "Train_Data_CSV.csv", [1], base=500)
+        expected_test.add("test_Train_1")
+    spec = _spec(primary, validation, testing)
+    spec["signal_unit"] = "Pa"
+    manifest = import_project(pid, spec, store=store)
+    prepare_project(pid, manifest["manifest_id"], store=store)
+    loaded = load_snapshot(pid, store=store)
+    split, units = loaded["split"], loaded["units"].set_index("unit_id")
+    assert set(split["test"]) == expected_test
+    assert official_ids.isdisjoint(split["train"] + split["validation"])
+    assert len(split["train"]) == (4 if manual_validation else 3)
+    assert len(split["validation"]) == 1
+    assert units.loc["test_Test_1", "source_folder"] == "test"
+    assert units.loc[list(official_ids), "source_group"].eq("author_test").all()
+    assert units.loc[["Train_1", "Train_2", "Train_3", "Train_4"], "source_folder"].eq("primary").all()
+    if primary_author_test:
+        assert units.loc["Test_1", "source_folder"] == "primary"
+    if manual_validation:
+        assert split["validation"] == ["validation_Train_1"]
+        assert units.loc["validation_Train_1", "source_folder"] == "validation"
+    if mixed_testing_folder:
+        assert units.loc["test_Train_1", "source_folder"] == "test"
+        assert units.loc["test_Train_1", "source_group"] == "test"
+    for destination in ("train", "validation"):
+        assert preview_move(loaded, sorted(official_ids), destination)["problem"] == (
+            "Official HSE test units stay in Testing Data."
+        )
+
+
+@pytest.mark.parametrize("unrecognized_csv", [False, True])
+def test_hse_primary_official_test_cannot_fill_empty_separate_testing_source(
+    tmp_path: Path, unrecognized_csv: bool,
+):
+    store = ProjectStore(tmp_path / "projects")
+    pid = store.create("HSE", "hse_filters")["project_id"]
+    primary, testing = tmp_path / "primary", tmp_path / "testing"
+    _write_filter(primary / "Train_Data_CSV.csv", [1, 2, 3, 4], base=100)
+    _write_filter(primary / "Test_Data_CSV.csv", [1], base=200, official_test=True)
+    spec = _spec(primary)
+    manifest = import_project(pid, spec, store=store)
+    prepare_project(pid, manifest["manifest_id"], store=store)
+    previous = store.get(pid)
+    testing.mkdir()
+    if unrecognized_csv:
+        _write_filter(testing / "unrecognized.csv", [1], base=300)
+    error = "Separate test folder has no admitted units" if unrecognized_csv else "Source needs"
+    with pytest.raises(ValueError, match=error):
+        import_project(pid, _spec(primary, test=testing), store=store)
+    assert store.get(pid) == previous
+    assert not list((store.project_path(pid) / "source").glob(".import-*"))
+
+
 def test_hse_rejects_nonmonotonic_acquisition_time(tmp_path: Path):
     store = ProjectStore(tmp_path / "projects")
     pid = store.create("HSE", "hse_filters")["project_id"]

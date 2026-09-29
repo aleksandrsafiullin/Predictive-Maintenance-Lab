@@ -687,9 +687,32 @@ def test_explorer_css_has_no_glow_or_gradient():
     import re
 
     css = _EXPLORER_CSS.read_text(encoding="utf-8")
-    rules = re.findall(r"[^{}]*\{[^{}]*\}", css)
-    gradient_rules = [rule for rule in rules if "linear-gradient(" in rule]
-    assert len(gradient_rules) == 1 and '[data-testid="stSlider"]' in gradient_rules[0]
+    rules = re.findall(r"[^{}]*\{[^{}]*\}", re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL))
+    # These hard color stops encode progress, rather than decorative gradients.
+    # Match both the exact selector and declaration so unrelated rules (including
+    # additional slider/rail gradients) cannot inherit a broad component exception.
+    allowed_gradients = {
+        'body:has(.brain-lab-shell) [data-testid="stSlider"] '
+        '[data-orientation="horizontal"] > [data-orientation="horizontal"] > div:first-child': (
+            "background:linear-gradient(to right,var(--lab-accent) 0%,"
+            "var(--lab-accent) var(--lab-progress,0%),"
+            "var(--pdm-border-soft) var(--lab-progress,0%),var(--pdm-border-soft) 100%);"
+        ),
+        'body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > '
+        '[data-testid="stElementContainer"]:has(button[kind="primary"]):not(:first-child)::after': (
+            "background:linear-gradient(var(--pdm-accent) 23px,var(--pdm-border) 23px);"
+        ),
+    }
+    gradient_rules = []
+    for rule in rules:
+        selector, declarations = rule[:-1].split("{", 1)
+        if re.search(r"\b[\w-]*gradient\s*\(", declarations, flags=re.IGNORECASE):
+            gradient_rules.append((re.sub(r"\s+", " ", selector.strip()),
+                                   re.sub(r"\s+", "", declarations)))
+    assert sorted(gradient_rules) == sorted(
+        (selector, re.sub(r"\s+", "", declarations))
+        for selector, declarations in allowed_gradients.items()
+    )
     assert "radial-gradient(" not in css and "conic-gradient(" not in css
     assert not re.findall(r"box-shadow:\s*0(?:px)?\s+0(?:px)?\s+[1-9]", css)
     assert "--pdm-focus-ring" in css

@@ -15,7 +15,7 @@ pump-01,60,0.34
 pump-01,120,0.36
 ```
 
-Choose `vibration` as the signal column, provide a readable name and its physical unit, then set yellow/red limits and whether deterioration rises above or falls below them. Signed numeric signals are supported. Each physical unit needs its own stable `unit_id`; files may contain several units or fragments of one unit. The first version trains on the selected signal history only. Extra outcome, RUL or future-label columns never become model inputs.
+Choose `vibration` as the signal column and provide a readable name and its physical unit. Set yellow/red limits on **Data Quality after import**. A first Sensor CSV import has no zone rule: measurements are shown as **Not zoned** until limits are edited or saved. Signed numeric signals are supported. Each physical unit needs its own stable `unit_id`; files may contain several units or fragments of one unit. The first version trains on the selected signal history only. Extra outcome, RUL or future-label columns never become model inputs.
 
 Time must be finite seconds without duplicate timestamps within a unit. The generic importer sorts each unit's records by time. Invalid signal values are rejected and break continuous history. Inferred large time gaps also break history. Models cannot train or forecast across a gap. Preparation fails with an actionable message if the source cannot form a valid snapshot.
 
@@ -23,7 +23,9 @@ XJTU-SY imports use the documented raw vibration layout and compute combined max
 
 ## Training, Validation and Testing data
 
-The Training folder initially supplies a pool of whole physical histories. Validation and Testing independently select **Automatic holdout** or **Separate folder**.
+**Import data** has three cards: **Training Data**, **Validation Data**, and **Testing Data**. The Training folder initially supplies a pool of whole physical histories. Validation and Testing independently select **Split from training** or **Separate folder**. Each supplied source can use a browser-selected folder or a server folder path.
+
+Before import the cards show **No data yet**. After preparation they show the active snapshot's Units, Gaps and Admitted rows. **View** opens that set's Data Quality tab. These counts describe saved data, not the files currently selected for a replacement import. **Split settings** controls the weights and random seed (defaults: 70 / 15 / 15 and 42); it is disabled when both holdouts use separate folders.
 
 | Validation | Testing | Allocation from the primary pool |
 |---|---|---|
@@ -34,9 +36,28 @@ The Training folder initially supplies a pool of whole physical histories. Valid
 
 Weights are configurable and are normalized over the automatic groups. Actual integer unit counts are shown after import; small datasets cannot exactly match every percentage. Each set must contain at least one usable unit. Rows/windows of one unit never go into different sets. Duplicate unit identities or matching source content in separate groups are rejected, including renamed duplicate files.
 
-**Data Quality** has three visible tabs. Each shows unit and row counts, interior gaps, time/signal ranges, rejected rows when present, an equipment selector, a signal chart and a readable measurement table. Train fits preprocessing and weights; Validation selects the model; Testing is evaluated after selection. Repeatedly choosing a model based on its Test result would still bias a real study; the app cannot prevent that human decision.
+For HSE, official `Test_Data_CSV.csv` units in the Training source folder are assigned directly to Testing; the remaining primary histories are divided between the automatic Train/Validation groups. If that file is absent, automatic Testing is drawn from the primary pool too. Alternatively, choose **Separate folder** for Testing and supply its official `Test_Data_CSV.csv` there. Official Test histories retain their protected status regardless of source folder and cannot enter Training or Validation. The selected Testing folder must itself contain admitted histories; official Test units in the Training source do not make an empty or unsupported Testing folder valid.
+
+**Data Quality** has three visible tabs. Each shows unit and row counts, interior gaps, time/signal ranges, rejected rows when present, an equipment selector, a signal chart and a readable measurement table. With a valid rule, the chart and table show Green/Yellow/Red/Not zoned classifications and the tab reports zone counts. These are rule-derived signal zones, not failure diagnoses or the model's training labels. Train fits preprocessing and weights; Validation selects the model; Testing is evaluated after selection. Repeatedly choosing a model based on its Test result would still bias a real study; the app cannot prevent that human decision.
 
 A replacement import becomes active only after preparation succeeds. A failed or stopped replacement leaves the prior active source, snapshot and saved model usable. Previous immutable artifacts remain on disk.
+
+### Move whole units after import
+
+In a Data Quality tab, expand **Move units**, choose **Units to move** and **Move to**, review the resulting counts, then press **Move selected units**. The move is blocked if it would empty a set, if a background job is active, or if the page refers to an outdated snapshot. Official HSE Test units cannot leave Testing. Linked legacy projects retain their published split; create an owned project to use a different split.
+
+A move publishes a new snapshot with a parent reference and move history. Source files and measurement values stay unchanged. Saved limits follow the new snapshot; unsaved previews do not. The selected model is cleared, so **train again for the new split**. Earlier snapshots and models remain on disk, but Results lists only models bound to the active snapshot. Re-importing builds a fresh split from the source settings rather than replaying manual moves. Moving units after inspecting Test results can bias subsequent evaluation.
+
+### Edit yellow and red limits
+
+The panel beside the signal chart applies to all units and all three sets in the current snapshot. On narrow screens it appears below the chart at full width. Choose **Above** for a rising warning signal (`yellow < red`) or **Below** for a falling signal (`yellow > red`). Finite numeric limits use the signal's physical unit.
+
+- A valid edit immediately previews zones on Data Quality in the current session.
+- **Save** persists the rule and makes Results use it for limit lines and predicted red entry. **Cancel** restores the last saved rule, or the original import rule if no override was saved.
+- Invalid edits are not saved; the chart retains the last valid rule. During a background job, preview remains available but Save is disabled.
+- Saving limits does not change the snapshot ID, model weights, saved forecast values or error metrics. It writes `zone_limits.json` beside the immutable snapshot files, outside their fingerprint. Training continues to forecast numeric signal values.
+
+First imports of HSE use provisional 300/600 Pa limits. XJTU-SY uses its initial-baseline rule; opening Data Quality does not replace that rule with the editor's initial 1/2 g values. Editing a value or direction previews an absolute rule, and saving commits that override. On re-import, saved limits are reused for the same signal; changing the Sensor CSV signal column or unit clears the old rule.
 
 ## Train one signal model
 
@@ -60,7 +81,7 @@ There is one Results view. Select a saved model and a held-out Test unit.
 
 Play supplies observations in order. Pause holds the cursor; Reset returns to the start. Moving the observation slider pauses playback. A new project, model or unit starts a fresh replay. No later measurement enters an earlier forecast. The app waits for enough continuous history and clearly reports unavailable forecasts, no predicted crossing inside the horizon, and measurements that are already red.
 
-For linked bearings, limits use only the unit's initial observed baseline. Linked HSE defaults remain provisional 300/600 Pa signal bands. User-entered limits express operating rules; they are not inferred fault diagnoses. A signal crossing does not establish mechanical failure or usable maintenance lead time. Boosting's pointwise quantiles are unvalidated distribution estimates, without a calibrated coverage guarantee; recurrent runs do not invent uncertainty bounds.
+Without a saved absolute override, bearing limits use only the unit's initial observed baseline; HSE defaults remain provisional 300/600 Pa signal bands. Results uses saved limits, not an unsaved Data Quality preview. User-entered limits express operating rules; they are not inferred fault diagnoses. A signal crossing does not establish mechanical failure or usable maintenance lead time. Boosting's pointwise quantiles are unvalidated distribution estimates, without a calibrated coverage guarantee; recurrent runs do not invent uncertainty bounds.
 
 ## Persistence and deletion
 
@@ -70,4 +91,4 @@ Default storage is `data/projects/`, overrideable with `PDM_PROJECTS_ROOT`. The 
 
 ## Validation boundary
 
-The implementation includes contract, isolation, split, artifact-binding, causal inference, worker and UI regression tests. The delivery report records the actual browser and full-suite checks. Short fixture or real-data smoke training verifies the workflow; it is not evidence of field prediction accuracy, calibrated intervals, or production maintenance readiness.
+The implementation includes contract, isolation, split, artifact-binding, causal inference, worker and UI regression tests. The [29 September review and corrective verification](create_ml_review_20260929_ru.md) records the original findings and their fixes: 718 tests pass, with desktop/mobile and light/dark browser checks. The original delivery report predates these changes. Short fixture or real-data smoke training verifies the workflow; it is not evidence of field prediction accuracy, calibrated intervals, or production maintenance readiness.

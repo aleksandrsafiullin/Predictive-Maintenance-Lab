@@ -407,7 +407,7 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
                     continue
                 frame = summary["frame"].loc[summary["frame"]["unit_id"].astype(str) == selected]
                 labelled = project_zones.label_unit(frame, zones_schema)
-                chart_col, limits_col = st.columns([4, 1], gap="small", vertical_alignment="top", wrap=False)
+                chart_col, limits_col = st.columns([4, 1], gap="small", vertical_alignment="top", wrap=True)
                 with chart_col:
                     st.plotly_chart(zone_figure(labelled, zones_schema, label, unit, theme),
                                     width="stretch", theme=None)

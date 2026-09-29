@@ -204,7 +204,11 @@ Launch the UI:
 
 Open **http://127.0.0.1:8501**. In **Projects**, enter a name and source format, then choose **Create project**. **Import data** accepts a browser-selected folder or a folder path visible to the app's computer. Generic CSV files require `unit_id`, `timestamp_s` and a chosen numeric signal. Use a server folder path for multi-GB sources such as XJTU-SY.
 
-Validation and Testing can each be held out automatically or supplied as a separate folder. **Data Quality** shows the three sets, their units, measurements and gaps. **Training** launches one GRU, LSTM or quantile boosting signal model with editable settings. **Results** shows a gray observed line, yellow/red limits, and the saved model's future signal points. Play advances through a held-out Test unit; Pause, Reset and the observation slider control the cursor. Light and dark appearance are available. The [workflow guide](docs/create_ml_workflow.md) explains model and threshold limits.
+**Import data** has Training Data, Validation Data and Testing Data cards. Validation and Testing each offer **Split from training** or **Separate folder**; **Split settings** controls weights and seed. Saved counts and **View** link each card to its Data Quality tab. HSE's official Test file can be supplied in the Training source or in a separate Testing folder; its histories always remain held out. See the [workflow guide](docs/create_ml_workflow.md).
+
+**Data Quality** shows the three sets, their units, measurements, gaps and signal zones. **Move units** changes the allocation of whole histories and creates a new snapshot requiring new training. Yellow/red limits are edited here after import: edits preview the zones, **Save** persists them for Results, and **Cancel** restores the saved rule. Saving limits preserves the trained model; a first Sensor CSV import has no zone rule until one is provided.
+
+**Training** launches one GRU, LSTM or quantile boosting signal model with editable settings. **Results** shows a gray observed line, saved yellow/red limits, and the saved model's future signal points. Play advances through a held-out Test unit; Pause, Reset and the observation slider control the cursor. Light and dark appearance are available. The [workflow guide](docs/create_ml_workflow.md) explains model and threshold limits; the [latest review and fixes](docs/create_ml_review_20260929_ru.md) record verification results.
 
 To check the repository:
 

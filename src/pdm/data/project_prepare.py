@@ -44,17 +44,23 @@ def allocate_project_split(units: pd.DataFrame, request: Mapping[str, Any]) -> d
     seed = int(request.get("seed", 42))
     if units["unit_id"].astype(str).duplicated().any():
         raise ValueError("Duplicate physical unit IDs")
-    groups = units.set_index("unit_id").get("source_group")
+    indexed_units = units.set_index("unit_id")
+    groups = indexed_units.get("source_group")
     if groups is None:
         groups = pd.Series("primary", index=units["unit_id"])
     manual = {
         name: sorted(groups.index[groups.eq(name)].astype(str).tolist())
         for name in ("validation", "test")
     }
+    # Official HSE test histories retain their protected split group, but
+    # only those imported from the selected Testing source can fill it.
+    source_folders = indexed_units.get("source_folder", groups)
+    folder_author_test = groups.eq("author_test") & source_folders.eq("test")
     for name in ("validation", "test"):
-        if modes[name] == "folder" and not manual[name]:
+        has_folder_units = bool(manual[name]) or (name == "test" and folder_author_test.any())
+        if modes[name] == "folder" and not has_folder_units:
             raise ValueError(f"Separate {name} folder has no admitted units")
-        if modes[name] == "auto" and manual[name]:
+        if modes[name] == "auto" and has_folder_units:
             raise ValueError(f"Unexpected manual {name} units")
     primary = sorted(groups.index[groups.eq("primary")].astype(str).tolist())
     # HSE's official author-test histories remain test-only, regardless of
@@ -284,6 +290,7 @@ def _owned_adapted(
             feat["unit_id"] = prefix + feat["unit_id"].astype(str)
             unit_table["unit_id"] = prefix + unit_table["unit_id"].astype(str)
             unit_table["origin_unit_id"] = unit_table["unit_id"]
+            unit_table["source_folder"] = group_name
             group_for_split = "author_test" if author == "author_test" else group_name
             source_groups.update({str(uid): group_for_split for uid in unit_table["unit_id"]})
             feature_parts.append(feat)

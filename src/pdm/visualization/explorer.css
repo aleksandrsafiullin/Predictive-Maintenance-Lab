@@ -103,12 +103,17 @@ body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="s
 
 /* Buttons. */
 body:has(.brain-lab-shell) [data-testid="stButton"] button,
+body:has(.brain-lab-shell) [data-testid="stPopoverButton"],
 body:has(.brain-lab-shell) [data-testid="stFormSubmitButton"] button {background: var(--pdm-control); border: 1px solid var(--pdm-border); color: var(--pdm-text); border-radius: 8px; font-weight: 500; min-height: 36px; padding: 0 16px; transition: border-color .15s ease-out, background .15s ease-out, color .15s ease-out;}
 body:has(.brain-lab-shell) [data-testid="stButton"] button p,
+body:has(.brain-lab-shell) [data-testid="stPopoverButton"] p,
 body:has(.brain-lab-shell) [data-testid="stFormSubmitButton"] button p {font-size: 14px; line-height: 20px; font-weight: inherit;}
+body:has(.brain-lab-shell) [data-testid="stPopoverButton"] :is([data-testid="stMarkdownContainer"], svg) {color: inherit;}
 body:has(.brain-lab-shell) [data-testid="stButton"] button:not(:disabled):hover,
+body:has(.brain-lab-shell) [data-testid="stPopoverButton"]:not(:disabled):hover,
 body:has(.brain-lab-shell) [data-testid="stFormSubmitButton"] button:not(:disabled):hover {background: var(--pdm-control-hover); border-color: var(--pdm-border-strong); color: var(--pdm-text);}
 body:has(.brain-lab-shell) [data-testid="stButton"] button:disabled,
+body:has(.brain-lab-shell) [data-testid="stPopoverButton"]:disabled,
 body:has(.brain-lab-shell) [data-testid="stFormSubmitButton"] button:disabled {opacity:.4; cursor:not-allowed;}
 body:has(.brain-lab-shell) [data-testid="stButton"] button[kind="primary"],
 body:has(.brain-lab-shell) [data-testid="stFormSubmitButton"] button[kind="primaryFormSubmit"] {background: var(--pdm-accent); border-color: var(--pdm-accent); color: var(--pdm-accent-ink); font-weight: 600;}
@@ -120,6 +125,7 @@ body:has(.brain-lab-shell) [data-testid="stFormSubmitButton"] button[kind="prima
 body:has(.brain-lab-shell) :focus-visible,
 body:has(.brain-lab-shell) [data-testid="stButton"] button:focus-visible,
 body:has(.brain-lab-shell) [data-testid="stFormSubmitButton"] button:focus-visible,
+body:has(.brain-lab-shell) [data-testid="stPopoverButton"]:focus-visible,
 body:has(.brain-lab-shell) [data-testid="stSidebar"] [data-testid="stButton"] button:focus-visible,
 body:has(.brain-lab-shell) [data-testid="stTab"]:focus-visible,
 body:has(.brain-lab-shell) [data-testid="stExpander"] summary:focus-visible,
@@ -329,6 +335,7 @@ body:has(.brain-lab-shell) [role="tooltip"] > [data-testid="stDataFrameTooltipCo
 body:has(.brain-lab-shell) [data-testid="stTooltipContent"] *,
 body:has(.brain-lab-shell) [data-testid="stTooltipErrorContent"] * {color:var(--pdm-text); background:transparent;}
 body:has(.brain-lab-shell) [data-testid="stSelectboxVirtualDropdown"],
+body:has(.brain-lab-shell) [data-testid="stPopoverBody"],
 body:has(.brain-lab-shell) [data-testid="stMainMenuPopover"],
 body:has(.brain-lab-shell) [data-baseweb="popover"] > div {
   background:var(--pdm-surface); color:var(--pdm-text); border:1px solid var(--pdm-border); border-radius:8px;
@@ -420,6 +427,11 @@ body:has(.brain-lab-shell) hr {border-color:var(--lab-line-soft);}
 .lab-explanation {display:flex; justify-content:space-between; gap:24px; font-size:12px; color:var(--lab-muted); padding:8px 4px; line-height:17px;}
 .lab-explanation b {color:var(--lab-muted-strong); font-weight:500;}
 @media(max-width:1000px) {.lab-metrics {grid-template-columns:repeat(2,minmax(0,1fr));}.lab-metric-value {font-size:28px;}}
+/* Keep the plot and its limits editor full width when the viewport is narrow. */
+@media(max-width:768px) {
+ body:has(.brain-lab-shell) [data-testid="stHorizontalBlock"]:has(.st-key-pdm-quality-limits) {flex-wrap:wrap !important;}
+ body:has(.brain-lab-shell) [data-testid="stHorizontalBlock"]:has(.st-key-pdm-quality-limits) > [data-testid="stColumn"] {flex:1 1 100% !important; width:100% !important; max-width:100% !important; min-width:0;}
+}
 @media(max-width:640px) {
  body:has(.brain-lab-shell) [data-testid="stMainBlockContainer"] {padding:24px 16px 32px;}
  .lab-hero {flex-direction:column;align-items:flex-start; gap:12px;padding-bottom:12px;}.lab-hero h1 {font-size:28px;}.lab-eyebrow {font-size:11px;letter-spacing:.06em;}
