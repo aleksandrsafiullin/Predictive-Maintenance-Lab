@@ -12,9 +12,24 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from pdm.data.project_import import import_project
-from pdm.data.project_prepare import load_snapshot, move_units, prepare_project, preview_move
+from pdm.data.project_import import (
+    XJTU_BASELINE_THRESHOLDS,
+    _signal_schema,
+    import_project,
+    validate_thresholds,
+)
+from pdm.data.project_prepare import (
+    ZONE_LIMITS_FILE,
+    load_snapshot,
+    load_zone_limits,
+    move_units,
+    prepare_project,
+    preview_move,
+    read_zone_limits,
+    save_zone_limits,
+)
 from pdm.io_util import sha256_file
+from pdm.project_zones import has_valid_rule
 from pdm.projects import ProjectStore
 from tests.project_contract import make_contract_snapshot
 
@@ -569,3 +584,127 @@ def test_move_units_old_run_not_selectable_on_new_snapshot(tmp_path: Path, idle_
         store.update(pid, selected_run_id="run1")
     assert (run_dir / "manifest.json").is_file()
     load_snapshot(pid, old_id, store=store)
+
+
+def test_validate_thresholds_accepts_xjtu_baseline_rule_only():
+    rule = validate_thresholds("xjtu_bearings", {"mode": "initial_baseline_multiple", "direction": "above"})
+    assert rule == XJTU_BASELINE_THRESHOLDS
+    custom = validate_thresholds("xjtu_bearings", {**XJTU_BASELINE_THRESHOLDS, "baseline_n": 4, "red_ratio": 3})
+    assert (custom["baseline_n"], custom["red_ratio"]) == (4, 3.0)
+    for kind, bad in (("generic_sensor_csv", {"mode": "initial_baseline_multiple"}),
+                      ("hse_filters", {"mode": "initial_baseline_multiple"}),
+                      ("xjtu_bearings", {"mode": "initial_baseline_multiple", "direction": "below"}),
+                      ("xjtu_bearings", {"mode": "initial_baseline_multiple", "baseline_n": 0}),
+                      ("xjtu_bearings", {"mode": "initial_baseline_multiple", "baseline_n": 2.5}),
+                      ("xjtu_bearings", {"mode": "initial_baseline_multiple", "red_ratio": float("nan")}),
+                      ("xjtu_bearings", {"mode": "relative"})):
+        with pytest.raises(ValueError):
+            validate_thresholds(kind, bad)
+
+
+def test_signal_schema_rejects_baseline_rule_outside_xjtu_and_allows_unzoned_generic():
+    baseline = {"mode": "initial_baseline_multiple", "direction": "above"}
+    for kind in ("hse_filters", "generic_sensor_csv"):
+        with pytest.raises(ValueError):
+            _signal_schema(kind, {"signal_column": "vibration", "signal_unit": "g", "thresholds": baseline})
+    with pytest.raises(ValueError):
+        _signal_schema("hse_filters", {"thresholds": {}})
+    schema = _signal_schema("generic_sensor_csv", {"signal_column": "vibration", "signal_unit": "g"})
+    assert schema["thresholds"] == {} and not has_valid_rule(schema)
+
+
+def test_first_generic_import_without_limits_is_not_zoned(tmp_path: Path):
+    store = ProjectStore(tmp_path / "projects")
+    pid = store.create("Project", "generic_sensor_csv")["project_id"]
+    primary = _write_generic(tmp_path / "primary", [f"p{i}" for i in range(6)])
+    manifest = import_project(pid, {**_spec(primary), "thresholds": {}}, store=store)
+    prepare_project(pid, manifest["manifest_id"], store=store)
+    assert not has_valid_rule(load_snapshot(pid, store=store)["schema"])
+
+
+def test_save_zone_limits_writes_sidecar_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_a: False)
+    store, project, ref = make_contract_snapshot(tmp_path / "projects")
+    pid, sid = project["project_id"], ref["snapshot_id"]
+    before = store.get(pid)
+    directory = store.snapshot_path(pid, sid)
+    files = {name: (directory / name).read_bytes() for name in ("feature_schema.json", "processed_fingerprint.json")}
+    rule = {"mode": "absolute", "direction": "below", "yellow": -0.2, "red": -0.6}
+    save_zone_limits(pid, rule, expected_snapshot_id=sid, store=store)
+    assert load_zone_limits(pid, sid, store=store) == rule
+    stamp = (directory / ZONE_LIMITS_FILE).stat().st_mtime_ns
+    save_zone_limits(pid, rule, expected_snapshot_id=sid, store=store)
+    assert (directory / ZONE_LIMITS_FILE).stat().st_mtime_ns == stamp
+    assert {name: (directory / name).read_bytes() for name in files} == files
+    loaded = load_snapshot(pid, store=store)
+    assert loaded["snapshot_id"] == sid and loaded["schema"]["thresholds"]["yellow"] == 0.4
+    assert store.get(pid) == before
+    with pytest.raises(ValueError):
+        save_zone_limits(pid, {**rule, "yellow": -0.9}, expected_snapshot_id=sid, store=store)
+    assert load_zone_limits(pid, sid, store=store) == rule
+
+
+def test_save_zone_limits_refusals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    store, project, ref = make_contract_snapshot(tmp_path / "projects")
+    pid, sid = project["project_id"], ref["snapshot_id"]
+    rule = {"mode": "absolute", "direction": "above", "yellow": 0.1, "red": 0.2}
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_a: True)
+    with pytest.raises(RuntimeError, match="background job"):
+        save_zone_limits(pid, rule, expected_snapshot_id=sid, store=store)
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_a: False)
+    with pytest.raises(ValueError, match="changed since"):
+        save_zone_limits(pid, rule, expected_snapshot_id="other", store=store)
+    assert load_zone_limits(pid, sid, store=store) is None
+
+
+def test_save_zone_limits_linked_legacy_writes_sidecar_not_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_a: False)
+    store, project, ref = make_contract_snapshot(tmp_path / "projects")
+    pid, sid = project["project_id"], ref["snapshot_id"]
+    directory = store.snapshot_path(pid, sid)
+    schema_before = (directory / "feature_schema.json").read_bytes()
+    fingerprint_before = (directory / "processed_fingerprint.json").read_bytes()
+    registry = json.loads(store.registry_path.read_text())
+    registry["projects"][pid]["storage_mode"] = "linked_legacy"
+    store.registry_path.write_text(json.dumps(registry))
+    rule = {"mode": "absolute", "direction": "above", "yellow": 0.1, "red": 0.2}
+    assert save_zone_limits(pid, rule, expected_snapshot_id=sid, store=store) == rule
+    assert load_zone_limits(pid, sid, store=store) == rule
+    assert (directory / "feature_schema.json").read_bytes() == schema_before
+    assert (directory / "processed_fingerprint.json").read_bytes() == fingerprint_before
+    assert load_snapshot(pid, store=store)["schema"]["thresholds"]["yellow"] == 0.4
+
+
+def test_move_units_keeps_saved_zone_limits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_a: False)
+    store, project, ref = make_contract_snapshot(tmp_path / "projects")
+    pid, sid = project["project_id"], ref["snapshot_id"]
+    rule = {"mode": "absolute", "direction": "above", "yellow": 0.3, "red": 0.9}
+    save_zone_limits(pid, rule, expected_snapshot_id=sid, store=store)
+    unit = sorted(load_snapshot(pid, store=store)["split"]["train"])[-1]
+    child = move_units(pid, [unit], "validation", expected_snapshot_id=sid, store=store)
+    assert child["snapshot_id"] != sid
+    assert load_zone_limits(pid, child["snapshot_id"], store=store) == rule
+    assert load_snapshot(pid, child["snapshot_id"], store=store)["schema"]["thresholds"]["yellow"] == 0.4
+
+
+def test_read_zone_limits_keeps_file_on_read_error_and_drops_bad_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    sidecar = tmp_path / ZONE_LIMITS_FILE
+    rule = {"mode": "absolute", "direction": "above", "yellow": 0.1, "red": 0.2}
+    sidecar.write_text(json.dumps(rule))
+
+    def denied(_path):
+        raise PermissionError("sharing violation")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("pdm.data.project_prepare.read_json", denied)
+        assert read_zone_limits(tmp_path) is None
+    assert sidecar.exists()
+    assert read_zone_limits(tmp_path) == rule
+    for bad in ("{not json", json.dumps({"mode": "absolute", "direction": "above", "yellow": 3, "red": 1}),
+                json.dumps(["absolute"])):
+        sidecar.write_text(bad)
+        assert read_zone_limits(tmp_path) is None
+        assert not sidecar.exists()

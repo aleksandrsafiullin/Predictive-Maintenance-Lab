@@ -6,11 +6,12 @@ import json
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
+from streamlit.testing.v1.errors import AppTestError
 
 from pdm import project_zones
-from pdm.data.project_prepare import load_snapshot
+from pdm.data.project_prepare import load_snapshot, load_zone_limits, move_units, save_zone_limits
 from pdm.paths import project_root
-from pdm.project_quality_ui import gap_safe_trace, part_summary
+from pdm.project_quality_ui import gap_safe_trace, limits_key, part_summary
 from pdm.project_training_ui import _parse_horizons
 from pdm.project_ui import _auto_shares, _open_step, _stage_uploads
 from pdm.projects import project_store
@@ -261,6 +262,523 @@ def test_quality_baseline_rule_caption_uses_schema_values(monkeypatch, tmp_path)
     assert zones[:3] == ["Not zoned"] * 3
     assert zones[3:] == ["Green", "Yellow", "Red"]
     assert "Zones: Green 1 · Yellow 1 · Red 1 · Not zoned 3 rows" in _captions(at)
+
+
+def test_import_page_has_no_limit_widgets(monkeypatch, tmp_path):
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
+    project = project_store().create("Bearings", "xjtu_bearings")
+    at = _import_app(project["project_id"])
+    assert not at.exception
+    assert not any(r.label == "Red condition" for r in at.radio)
+    assert not any(n.label.startswith(("Yellow limit", "Red limit")) for n in at.number_input)
+    assert "Yellow and red limits are set on Data Quality after import." in _captions(at)
+    assert any("max-axis RMS" in c for c in _captions(at))
+
+
+def _capture_import(monkeypatch, project_id: str, signal_column: str | None = None) -> dict:
+    jobs = []
+    monkeypatch.setattr("pdm.project_ui._import_cards",
+                        lambda *_args: ({"mode": "folder", "path": "/tmp/source"}, None, None, "auto", "auto"))
+    monkeypatch.setattr("pdm.project_ui.worker_alive", lambda: False)
+    monkeypatch.setattr("pdm.project_ui.status_for_project", lambda _pid: {"status": "not_ready"})
+    monkeypatch.setattr("pdm.project_ui.spawn_worker", jobs.append)
+    at = _import_app(project_id)
+    if signal_column is not None:
+        next(w for w in at.text_input if w.label == "Signal column").set_value(signal_column)
+        at.run()
+    next(button for button in at.button if button.label == "Import and check data").click()
+    at.run()
+    assert not at.exception
+    assert len(jobs) == 1
+    return jobs[0]["source"]
+
+
+def test_first_hse_import_sends_provisional_limits(monkeypatch, tmp_path):
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
+    project = project_store().create("First", "hse_filters")
+    source = _capture_import(monkeypatch, project["project_id"])
+    assert source["thresholds"] == {"mode": "absolute", "direction": "above", "yellow": 300.0, "red": 600.0}
+
+
+def test_first_generic_import_sends_no_limits(monkeypatch, tmp_path):
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
+    project = project_store().create("First", "generic_sensor_csv")
+    assert _capture_import(monkeypatch, project["project_id"])["thresholds"] == {}
+
+
+def test_first_xjtu_import_sends_baseline_rule(monkeypatch, tmp_path):
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
+    project = project_store().create("Bearings", "xjtu_bearings")
+    rule = _capture_import(monkeypatch, project["project_id"])["thresholds"]
+    assert rule["mode"] == "initial_baseline_multiple"
+    assert (rule["direction"], rule["baseline_n"], rule["onset_sigma"], rule["onset_ratio"], rule["red_ratio"]) == (
+        "above", 5, 3.0, 1.25, 2.0)
+
+
+def test_reimport_reuses_saved_baseline_rule(monkeypatch, tmp_path):
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
+    store = project_store()
+    project = store.create("Bearings", "xjtu_bearings")
+    pid = project["project_id"]
+    store.update(pid, active_snapshot_id="snapshot1", state="ready")
+    saved = {"source_kind": "xjtu_bearings", "signal_column": "combined_rms", "signal_unit": "g",
+             "thresholds": {"mode": "initial_baseline_multiple", "direction": "above", "baseline_n": 4,
+                            "onset_sigma": 2.0, "onset_ratio": 1.5, "red_ratio": 3.0}}
+    directory = store.snapshot_path(pid, "snapshot1")
+    directory.mkdir(parents=True)
+    (directory / "feature_schema.json").write_text(json.dumps(saved))
+    rule = _capture_import(monkeypatch, pid)["thresholds"]
+    assert rule["mode"] == "initial_baseline_multiple"
+    assert (rule["baseline_n"], rule["onset_sigma"], rule["onset_ratio"], rule["red_ratio"]) == (4, 2.0, 1.5, 3.0)
+
+
+def test_reimport_reuses_replaced_snapshot_limits_not_other_snapshot_edits(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    jobs = []
+    monkeypatch.setattr("pdm.project_ui._import_cards",
+                        lambda *_args: ({"mode": "folder", "path": "/tmp/source"}, None, None, "auto", "auto"))
+    monkeypatch.setattr("pdm.project_ui.worker_alive", lambda: False)
+    monkeypatch.setattr("pdm.project_ui.status_for_project", lambda _pid: {"status": "not_ready"})
+    monkeypatch.setattr("pdm.project_ui.spawn_worker", jobs.append)
+    at = _app()
+    at.session_state["project_id"] = pid
+    at.session_state["project_step"] = "Import data"
+    at.session_state[limits_key(pid, "older-snapshot")] = {"mode": "absolute", "direction": "below",
+                                                           "yellow": -5.0, "red": -9.0}
+    at.run()
+    next(button for button in at.button if button.label == "Import and check data").click()
+    at.run()
+    assert not at.exception
+    source = jobs[0]["source"]
+    assert source["thresholds"] == {"mode": "absolute", "direction": "above", "yellow": 0.4, "red": 0.8}
+    assert (source["signal_column"], source["signal_label"], source["signal_unit"]) == (
+        "vibration", "Signed vibration", "g")
+
+
+def test_reimport_honors_replaced_snapshot_sidecar(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, ref = make_contract_snapshot(root)
+    rule = {"mode": "absolute", "direction": "above", "yellow": 0.2, "red": 0.5}
+    save_zone_limits(project["project_id"], rule, expected_snapshot_id=ref["snapshot_id"], store=store)
+    assert _capture_import(monkeypatch, project["project_id"])["thresholds"] == rule
+
+
+def test_generic_reimport_with_new_signal_column_drops_old_limits(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _, project, _ = make_contract_snapshot(root)
+    source = _capture_import(monkeypatch, project["project_id"], signal_column="pressure")
+    assert source["signal_column"] == "pressure"
+    assert source["thresholds"] == {}
+
+
+def _zone_rule_caption(at: AppTest) -> str:
+    return next(c for c in _captions(at) if "forecast future" in c)
+
+
+def _key(name: str, pid: str, sid: str) -> str:
+    return f"quality_limit_{name}:{pid}:{sid}"
+
+
+def _limit_button(name: str, pid: str, sid: str) -> str:
+    return f"quality_limit_{name}:{pid}:{sid}"
+
+
+def _snapshot_bytes(store, pid: str, sid: str) -> tuple[bytes, bytes]:
+    directory = store.snapshot_path(pid, sid)
+    return (directory / "feature_schema.json").read_bytes(), (directory / "processed_fingerprint.json").read_bytes()
+
+
+def test_quality_limit_edit_writes_sidecar_and_recolors_chart(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    before = project_store().get(pid)
+    sid = before["active_snapshot_id"]
+    original = _snapshot_bytes(store, pid, sid)
+    snapshot = load_snapshot(pid, store=store)
+    at = _quality_app(pid, "Training Data")
+    assert not at.exception
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.4)
+    at.number_input(key=_key("yellow", pid, sid)).set_value(0.1)
+    at.run()
+    assert not at.exception
+    rule = _zone_rule_caption(at)
+    assert "yellow at ≥ 0.1 g" in rule and "red at ≥ 0.8 g" in rule
+    limits = {"mode": "absolute", "direction": "above", "yellow": 0.1, "red": 0.8}
+    edited = {**snapshot["schema"], "thresholds": limits}
+    selected = sorted(str(uid) for uid in snapshot["split"]["train"])[0]
+    features = snapshot["features"]
+    labelled = project_zones.label_unit(features[features["unit_id"].astype(str) == selected], edited)
+    names = {"green": "Green", "yellow": "Yellow", "red": "Red", "unknown": "Not zoned"}
+    assert list(at.table[0].value["Zone"]) == [names[zone] for zone in labelled["zone"]]
+    counts = project_zones.zone_counts(features, snapshot["split"]["train"], edited)
+    assert (f"Zones: Green {counts['green']} · Yellow {counts['yellow']} · Red {counts['red']} · "
+            f"Not zoned {counts['unknown']} rows") in _captions(at)
+    assert load_zone_limits(pid, sid, store=store) is None
+    assert not at.button(key=_limit_button("save", pid, sid)).disabled
+    at.button(key=_limit_button("save", pid, sid)).click()
+    at.run()
+    assert not at.exception and not at.error
+    assert project_store().get(pid) == before
+    assert _snapshot_bytes(store, pid, sid) == original
+    assert load_zone_limits(pid, sid, store=store) == limits
+    assert load_snapshot(pid, store=store)["schema"]["thresholds"]["yellow"] == 0.4
+    assert not any("Preview only" in c or "Saved with this data" in c for c in _captions(at))
+    assert limits_key(pid, sid) not in at.session_state
+    assert at.button(key=_limit_button("save", pid, sid)).disabled
+    assert at.button(key=_limit_button("cancel", pid, sid)).disabled
+    assert "yellow at ≥ 0.1 g" in _zone_rule_caption(at)
+    reopened = _quality_app(pid, "Training Data")
+    assert "yellow at ≥ 0.1 g" in _zone_rule_caption(reopened)
+    assert reopened.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.1)
+
+
+def test_quality_limit_cancel_reverts_preview_without_writing(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    sid = project_store().get(pid)["active_snapshot_id"]
+    original = _snapshot_bytes(store, pid, sid)
+    at = _quality_app(pid, "Training Data")
+    before = _zone_rule_caption(at)
+    assert at.button(key=_limit_button("cancel", pid, sid)).disabled
+    assert at.button(key=_limit_button("save", pid, sid)).disabled
+    at.number_input(key=_key("red", pid, sid)).set_value(1.5)
+    at.radio(key=_key("direction", pid, sid)).set_value("above")
+    at.run()
+    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    assert load_zone_limits(pid, sid, store=store) is None
+    assert not at.button(key=_limit_button("cancel", pid, sid)).disabled
+    at.button(key=_limit_button("cancel", pid, sid)).click()
+    at.run()
+    assert not at.exception and not at.error
+    assert _zone_rule_caption(at) == before
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(0.8)
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.4)
+    assert at.radio(key=_key("direction", pid, sid)).value == "above"
+    assert at.button(key=_limit_button("cancel", pid, sid)).disabled
+    assert at.button(key=_limit_button("save", pid, sid)).disabled
+    assert load_zone_limits(pid, sid, store=store) is None
+    assert _snapshot_bytes(store, pid, sid) == original
+
+
+def test_quality_limit_cancel_restores_sidecar_not_schema(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    sid = project_store().get(pid)["active_snapshot_id"]
+    sidecar = {"mode": "absolute", "direction": "above", "yellow": 0.2, "red": 0.6}
+    save_zone_limits(pid, sidecar, expected_snapshot_id=sid, store=store)
+    at = _quality_app(pid, "Training Data")
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.2)
+    before = _zone_rule_caption(at)
+    assert "yellow at ≥ 0.2 g" in before and "red at ≥ 0.6 g" in before
+    at.number_input(key=_key("yellow", pid, sid)).set_value(0.1)
+    at.number_input(key=_key("red", pid, sid)).set_value(1.5)
+    at.run()
+    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    at.button(key=_limit_button("cancel", pid, sid)).click()
+    at.run()
+    assert not at.exception and not at.error
+    assert _zone_rule_caption(at) == before
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.2)
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(0.6)
+    assert at.button(key=_limit_button("cancel", pid, sid)).disabled
+    assert load_zone_limits(pid, sid, store=store) == sidecar
+
+
+def test_quality_linked_legacy_save_respects_job_and_writes_sidecar_only(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch, active=True)
+    store, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    sid = project_store().get(pid)["active_snapshot_id"]
+    registry = json.loads(store.registry_path.read_text())
+    registry["projects"][pid]["storage_mode"] = "linked_legacy"
+    store.registry_path.write_text(json.dumps(registry))
+    original = _snapshot_bytes(store, pid, sid)
+    sidecar_path = store.snapshot_path(pid, sid) / "zone_limits.json"
+    at = _quality_app(pid, "Training Data")
+    assert not at.exception
+    assert "A background job is running. Save is available after it finishes." in _captions(at)
+    at.number_input(key=_key("red", pid, sid)).set_value(1.5)
+    at.run()
+    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    assert at.button(key=_limit_button("save", pid, sid)).disabled
+    assert not sidecar_path.exists()
+    _no_job(monkeypatch)
+    at.run()
+    assert not at.button(key=_limit_button("save", pid, sid)).disabled
+    at.button(key=_limit_button("save", pid, sid)).click()
+    at.run()
+    assert not at.exception and not at.error
+    assert load_zone_limits(pid, sid, store=store) == {"mode": "absolute", "direction": "above",
+                                                       "yellow": 0.4, "red": 1.5}
+    assert _snapshot_bytes(store, pid, sid) == original
+    assert project_store().get(pid)["storage_mode"] == "linked_legacy"
+
+
+def test_quality_limit_edit_back_to_committed_rule_is_clean(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    _, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    sid = project_store().get(pid)["active_snapshot_id"]
+    at = _quality_app(pid, "Training Data")
+    at.number_input(key=_key("red", pid, sid)).set_value(1.5)
+    at.run()
+    at.number_input(key=_key("red", pid, sid)).set_value(0.8)
+    at.run()
+    assert not at.exception
+    assert limits_key(pid, sid) not in at.session_state
+    assert at.button(key=_limit_button("cancel", pid, sid)).disabled
+    assert at.button(key=_limit_button("save", pid, sid)).disabled
+
+
+def test_quality_invalid_limits_cancel_reverts_numbers(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    sid = project_store().get(pid)["active_snapshot_id"]
+    at = _quality_app(pid, "Training Data")
+    at.number_input(key=_key("yellow", pid, sid)).set_value(0.9)
+    at.run()
+    assert at.error
+    assert at.button(key=_limit_button("save", pid, sid)).disabled
+    assert not at.button(key=_limit_button("cancel", pid, sid)).disabled
+    at.button(key=_limit_button("cancel", pid, sid)).click()
+    at.run()
+    assert not at.exception and not at.error
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.4)
+    assert load_zone_limits(pid, sid, store=store) is None
+
+
+def test_quality_invalid_limits_keep_last_valid_rule_and_do_not_save(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    sid = project_store().get(pid)["active_snapshot_id"]
+    at = _quality_app(pid, "Training Data")
+    at.number_input(key=_key("yellow", pid, sid)).set_value(0.9)
+    at.run()
+    assert not at.exception
+    assert any("yellow limit must be below red" in str(e.value) for e in at.error)
+    assert "yellow at ≥ 0.4 g" in _zone_rule_caption(at)
+    assert load_zone_limits(pid, sid, store=store) is None
+    at.number_input(key=_key("yellow", pid, sid)).set_value(0.4)
+    at.radio(key=_key("direction", pid, sid)).set_value("below")
+    at.run()
+    assert not at.exception
+    assert any("yellow limit must be above red" in str(e.value) for e in at.error)
+    assert "yellow at ≥ 0.4 g" in _zone_rule_caption(at)
+    assert load_zone_limits(pid, sid, store=store) is None
+    at.number_input(key=_key("yellow", pid, sid)).set_value(0.9)
+    at.run()
+    assert not at.exception and not at.error
+    assert "yellow at ≤ 0.9 g" in _zone_rule_caption(at) and "red at ≤ 0.8 g" in _zone_rule_caption(at)
+    assert load_zone_limits(pid, sid, store=store) is None
+
+
+def test_quality_limits_are_preview_while_job_runs(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch, active=True)
+    store, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    sid = project_store().get(pid)["active_snapshot_id"]
+    at = _quality_app(pid, "Training Data")
+    job_caption = "A background job is running. Save is available after it finishes."
+    assert job_caption in _captions(at)
+    at.number_input(key=_key("red", pid, sid)).set_value(1.5)
+    at.run()
+    assert not at.exception
+    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    assert job_caption in _captions(at)
+    assert not any("Preview only" in c or "Saved with this data" in c for c in _captions(at))
+    assert load_zone_limits(pid, sid, store=store) is None
+    save = at.button(key=_limit_button("save", pid, sid))
+    assert save.disabled
+    with pytest.raises(AppTestError):
+        save.click()
+    assert load_zone_limits(pid, sid, store=store) is None
+
+
+def test_quality_save_failure_keeps_preview_and_shows_error(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    sid = project_store().get(pid)["active_snapshot_id"]
+    original = _snapshot_bytes(store, pid, sid)
+    at = _quality_app(pid, "Training Data")
+    at.number_input(key=_key("red", pid, sid)).set_value(1.5)
+    at.run()
+    _no_job(monkeypatch, active=True)
+    at.button(key=_limit_button("save", pid, sid)).click()
+    at.run()
+    assert not at.exception
+    assert any("Press Save after the job finishes." in str(e.value) for e in at.error)
+    assert not any("Change a limit again" in str(e.value) for e in at.error)
+    assert load_zone_limits(pid, sid, store=store) is None
+    assert _snapshot_bytes(store, pid, sid) == original
+    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    assert at.session_state[limits_key(pid, sid)]["red"] == 1.5
+    assert at.button(key=_limit_button("save", pid, sid)).disabled
+
+
+def test_quality_edit_does_not_follow_to_a_new_snapshot(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch, active=True)
+    store, project, _ = make_contract_snapshot(root)
+    pid = project["project_id"]
+    old_sid = project_store().get(pid)["active_snapshot_id"]
+    at = _quality_app(pid, "Training Data")
+    at.number_input(key=_key("red", pid, old_sid)).set_value(1.5)
+    at.run()
+    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    _no_job(monkeypatch)
+    unit = sorted(load_snapshot(pid, store=store)["split"]["train"])[-1]
+    new_sid = move_units(pid, [unit], "validation", expected_snapshot_id=old_sid, store=store)["snapshot_id"]
+    at.run()
+    assert not at.exception
+    assert "red at ≥ 0.8 g" in _zone_rule_caption(at)
+    assert at.number_input(key=_key("red", pid, new_sid)).value == pytest.approx(0.8)
+    assert not any(c.startswith(("Preview only", "Saved with this data")) for c in _captions(at))
+
+
+def test_quality_save_with_bound_run_keeps_run_and_results_use_sidecar(monkeypatch, tmp_path):
+    from pdm.project_results_ui import replay_figure
+    from pdm.signal_inference import forecast_prefix
+    from pdm.signal_training import load_signal_run, train_signal_run
+
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, ref = make_contract_snapshot(root)
+    pid, sid = project["project_id"], ref["snapshot_id"]
+    run = train_signal_run(pid, sid, "gru", {"history_length": 4, "horizons_s": [10.0], "epochs": 1,
+                                             "hidden_size": 8})
+    manifest_before = (store.run_path(pid, run["run_id"]) / "manifest.json").read_bytes()
+    record = project_store().get(pid)
+    at = _quality_app(pid, "Training Data")
+    at.number_input(key=_key("red", pid, sid)).set_value(1.5)
+    at.run()
+    at.button(key=_limit_button("save", pid, sid)).click()
+    at.run()
+    assert not at.exception and not at.error
+    assert not any("Preview only" in c for c in _captions(at))
+    assert project_store().get(pid) == record and record["selected_run_id"] == run["run_id"]
+    assert (store.run_path(pid, run["run_id"]) / "manifest.json").read_bytes() == manifest_before
+    loaded = load_signal_run(pid, run["run_id"])
+    assert loaded["schema"]["thresholds"]["red"] == 0.8
+    limits = load_zone_limits(pid, sid, store=store)
+    unit = str(load_snapshot(pid, store=store)["split"]["test"][0])
+    plain = forecast_prefix(pid, run["run_id"], unit, 130.0)
+    shown = forecast_prefix(pid, run["run_id"], unit, 130.0, thresholds=limits)
+    assert shown["points"] == plain["points"]
+    assert (plain["thresholds"]["red"], shown["thresholds"]["red"]) == (0.8, 1.5)
+    passed = []
+    monkeypatch.setattr("pdm.project_results_ui._play_fragment",
+                        lambda *args, **_kwargs: passed.append(args[-1]))
+    results = _app()
+    results.session_state["project_id"] = pid
+    results.session_state["project_step"] = "Results"
+    results.run()
+    assert not results.exception
+    assert passed == [limits]
+    figure = replay_figure(shown, load_snapshot(pid, store=store)["schema"])
+    lines = {round(float(shape["y0"]), 6) for shape in figure.to_dict()["layout"].get("shapes", [])
+             if shape.get("y0") == shape.get("y1")}
+    assert 1.5 in lines and 0.8 not in lines
+
+
+def test_quality_baseline_snapshot_open_does_not_write(monkeypatch, tmp_path):
+    from pdm.io_util import sha256_file
+
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, ref = make_contract_snapshot(root)
+    pid, sid = project["project_id"], ref["snapshot_id"]
+    directory = store.snapshot_path(pid, sid)
+    schema = json.loads((directory / "feature_schema.json").read_text())
+    schema["thresholds"] = {"mode": "initial_baseline_multiple", "direction": "above", "baseline_n": 4}
+    (directory / "feature_schema.json").write_text(json.dumps(schema))
+    fingerprint = json.loads((directory / "processed_fingerprint.json").read_text())
+    fingerprint["file_hashes"]["feature_schema.json"] = sha256_file(directory / "feature_schema.json")
+    (directory / "processed_fingerprint.json").write_text(json.dumps(fingerprint))
+    original = _snapshot_bytes(store, pid, sid)
+    at = _quality_app(pid, "Training Data")
+    assert not at.exception
+    assert "first 4" in _zone_rule_caption(at)
+    assert "Zones use the saved initial-baseline rule" not in " ".join(_captions(at))
+    assert at.button(key=_limit_button("cancel", pid, sid)).disabled
+    assert at.button(key=_limit_button("save", pid, sid)).disabled
+    at.session_state["quality_tab"] = "Validation Data"
+    at.run()
+    assert not at.exception
+    assert not (directory / "zone_limits.json").exists()
+    assert _snapshot_bytes(store, pid, sid) == original
+
+
+def test_quality_baseline_rule_switches_to_absolute_only_after_edit(monkeypatch, tmp_path):
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
+    schema = {"signal_label": "Vibration", "signal_unit": "g",
+              "thresholds": {"mode": "initial_baseline_multiple", "direction": "above", "baseline_n": 4}}
+    project_id = _patch_quality_snapshot(monkeypatch, schema)
+    at = _quality_app(project_id)
+    assert not at.exception
+    assert "first 4" in _zone_rule_caption(at)
+    assert at.number_input(key=_key("yellow", project_id, "snapshot1")).value == 1.0
+    at.number_input(key=_key("red", project_id, "snapshot1")).set_value(1.2)
+    at.run()
+    assert not at.exception
+    assert "yellow at ≥ 1 g" in _zone_rule_caption(at) and "red at ≥ 1.2 g" in _zone_rule_caption(at)
+    assert list(at.table[0].value["Zone"]) == ["Yellow"] * 4 + ["Red", "Red"]
+    at.number_input(key=_key("red", project_id, "snapshot1")).set_value(2.0)
+    at.run()
+    assert "red at ≥ 2 g" in _zone_rule_caption(at)
+    assert not at.button(key=_limit_button("cancel", project_id, "snapshot1")).disabled
+    at.button(key=_limit_button("cancel", project_id, "snapshot1")).click()
+    at.run()
+    assert not at.exception
+    assert "first 4" in _zone_rule_caption(at)
+    assert at.number_input(key=_key("red", project_id, "snapshot1")).value == 2.0
+    assert at.button(key=_limit_button("cancel", project_id, "snapshot1")).disabled
+
+
+def test_quality_invalid_sidecar_is_ignored(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, ref = make_contract_snapshot(root)
+    pid, sid = project["project_id"], ref["snapshot_id"]
+    sidecar = store.snapshot_path(pid, sid) / "zone_limits.json"
+    sidecar.write_text(json.dumps({"mode": "absolute", "direction": "above", "yellow": 3, "red": 1}))
+    at = _quality_app(pid, "Training Data")
+    assert not at.exception
+    assert "yellow at ≥ 0.4 g" in _zone_rule_caption(at)
+    assert not sidecar.exists()
 
 
 def test_quality_zone_labels_only_for_open_tab(monkeypatch, tmp_path):

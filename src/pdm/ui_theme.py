@@ -12,8 +12,6 @@ import re
 
 import streamlit as st
 
-from pdm import ui_copy
-
 THEMES = ("light", "dark")
 DEFAULT_THEME = "dark"
 
@@ -259,6 +257,6 @@ def render_theme_control(container=None) -> str:
         st.session_state[_WIDGET_KEY] = theme
     container.segmented_control(
         "Appearance", options=list(THEMES), format_func=str.title, key=_WIDGET_KEY,
-        required=True, on_change=_on_theme_change, help=ui_copy.APPEARANCE_HELP,
+        required=True, on_change=_on_theme_change, label_visibility="collapsed",
     )
     return current_theme()

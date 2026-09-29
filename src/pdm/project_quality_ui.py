@@ -1,16 +1,27 @@
 """Plain-language quality view for one immutable project snapshot."""
 from __future__ import annotations
 
+import json
+import math
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from pdm import project_zones
-from pdm.data.project_prepare import move_units, preview_move
+from pdm.data.project_prepare import (
+    load_zone_limits,
+    move_units,
+    preview_move,
+    save_zone_limits,
+)
 from pdm.project_chart_style import add_threshold_layers, style_signal_chart
 from pdm.signal_training import available_signal_engines
 from pdm.ui_copy import (
+    IMPORT_RED_CONDITION_HELP,
+    IMPORT_RED_LIMIT_HELP,
+    IMPORT_YELLOW_LIMIT_HELP,
     QUALITY_ADMITTED_ROWS_HELP,
     QUALITY_GAPS_HELP,
     QUALITY_INSPECT_UNIT_HELP,
@@ -37,13 +48,167 @@ PARTS = (("train", "Training Data"), ("validation", "Validation Data"), ("test",
 ZONE_NAMES = {"green": "Green", "yellow": "Yellow", "red": "Red", "unknown": "Not zoned"}
 PART_BY_NAME = {name: part for part, name in PARTS}
 MOVE_FLASH_KEY = "quality_move_flash"
+DIRECTIONS = {"above": "Above", "below": "Below"}
+DEFAULT_LIMITS = {"hse_filters": (300.0, 600.0)}
+
+
+def limits_key(project_id: str, snapshot_id: str) -> str:
+    """Session key for the last valid edited absolute rule of one snapshot."""
+    return f"quality_limits:{project_id}:{snapshot_id}"
+
+
+def _state_key(name: str, project_id: str, snapshot_id: str) -> str:
+    return f"quality_limit_{name}:{project_id}:{snapshot_id}"
+
+
+def valid_thresholds(direction: str, yellow: float, red: float) -> None:
+    if direction == "above" and yellow >= red:
+        raise ValueError("For an increasing warning signal, the yellow limit must be below red.")
+    if direction == "below" and yellow <= red:
+        raise ValueError("For a decreasing warning signal, the yellow limit must be above red.")
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
-def split_zone_counts(project_id: str, snapshot_id: str, part: str,
+def split_zone_counts(project_id: str, snapshot_id: str, part: str, rule_key: str,
                       _features: pd.DataFrame, _unit_ids: tuple[str, ...], _schema: dict) -> dict[str, int]:
-    """Snapshots are immutable, so (project, snapshot, part) fully identifies the counts."""
+    """Snapshot rows are immutable; ``rule_key`` covers edited or saved display limits."""
     return project_zones.zone_counts(_features, _unit_ids, _schema)
+
+
+def zone_schema(schema: dict, project_id: str, snapshot_id: str, saved_limits: dict | None = None) -> dict:
+    """Schema whose thresholds are this session's edit, else the saved display limits, else the import rule."""
+    rule = st.session_state.get(limits_key(project_id, snapshot_id)) or saved_limits
+    return {**schema, "thresholds": dict(rule)} if rule else schema
+
+
+def _widget_rule(project_id: str, snapshot_id: str) -> dict:
+    """Absolute rule from the limit widgets; raises ``ValueError`` with the user-facing message."""
+    state = st.session_state
+    try:
+        raw = state[_state_key("direction", project_id, snapshot_id)]
+        direction = raw if raw in DIRECTIONS else ("above" if str(raw).startswith("Signal rises") else "below")
+        yellow = float(state[_state_key("yellow", project_id, snapshot_id)])
+        red = float(state[_state_key("red", project_id, snapshot_id)])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Enter numeric yellow and red limits.") from exc
+    if not (math.isfinite(yellow) and math.isfinite(red)):
+        raise ValueError("Yellow and red limits must be finite numbers.")
+    valid_thresholds(direction, yellow, red)
+    return {"mode": "absolute", "direction": direction, "yellow": yellow, "red": red}
+
+
+def committed_rule(schema: dict, saved_limits: dict | None) -> dict | None:
+    """Last committed absolute display rule: the sidecar, else a valid absolute import rule."""
+    if saved_limits:
+        return saved_limits
+    imported = dict(schema.get("thresholds") or {})
+    if imported.get("mode", "absolute") == "absolute" and project_zones.has_valid_rule(schema) \
+            and imported.get("yellow") is not None and imported.get("red") is not None:
+        return imported
+    return None
+
+
+def _seed(schema: dict, committed: dict | None) -> tuple[str, float, float]:
+    if committed:
+        direction = committed.get("direction", "above")
+        return (direction if direction in DIRECTIONS else "above",
+                float(committed["yellow"]), float(committed["red"]))
+    yellow, red = DEFAULT_LIMITS.get(str(schema.get("source_kind") or ""), (1.0, 2.0))
+    return "above", float(yellow), float(red)
+
+
+def _same_limits(a: tuple[str, float, float], b: tuple[str, float, float]) -> bool:
+    return a[0] == b[0] and math.isclose(a[1], b[1], abs_tol=1e-12) and math.isclose(a[2], b[2], abs_tol=1e-12)
+
+
+def _on_limits_change(project_id: str, snapshot_id: str, committed: dict | None) -> None:
+    state = st.session_state
+    error_key = _state_key("error", project_id, snapshot_id)
+    state.pop(_state_key("status", project_id, snapshot_id), None)
+    try:
+        rule = _widget_rule(project_id, snapshot_id)
+    except ValueError as exc:
+        state[error_key] = str(exc)
+        return
+    state.pop(error_key, None)
+    values = (rule["direction"], rule["yellow"], rule["red"])
+    if committed and _same_limits(values, _seed({}, committed)):
+        state.pop(limits_key(project_id, snapshot_id), None)
+    else:
+        state[limits_key(project_id, snapshot_id)] = rule
+
+
+def _on_limits_save(project_id: str, snapshot_id: str) -> None:
+    state = st.session_state
+    status_key = _state_key("status", project_id, snapshot_id)
+    try:
+        rule = _widget_rule(project_id, snapshot_id)
+    except ValueError as exc:
+        state[_state_key("error", project_id, snapshot_id)] = str(exc)
+        return
+    try:
+        save_zone_limits(project_id, rule, expected_snapshot_id=snapshot_id)
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        state[status_key] = str(exc)
+        return
+    for key in (limits_key(project_id, snapshot_id), status_key, _state_key("error", project_id, snapshot_id)):
+        state.pop(key, None)
+
+
+def _on_limits_cancel(project_id: str, snapshot_id: str, schema: dict) -> None:
+    """Widget keys must be overwritten here: the render-time seed only fills missing keys."""
+    state = st.session_state
+    direction, yellow, red = _seed(schema, committed_rule(schema, load_zone_limits(project_id, snapshot_id)))
+    state[_state_key("direction", project_id, snapshot_id)] = direction
+    state[_state_key("yellow", project_id, snapshot_id)] = yellow
+    state[_state_key("red", project_id, snapshot_id)] = red
+    for name in ("error", "status"):
+        state.pop(_state_key(name, project_id, snapshot_id), None)
+    state.pop(limits_key(project_id, snapshot_id), None)
+
+
+def _render_limits(schema: dict, project_id: str, snapshot_id: str,
+                   saved_limits: dict | None, job_running: bool) -> None:
+    state = st.session_state
+    unit = str(schema.get("signal_unit") or "")
+    keys = {name: _state_key(name, project_id, snapshot_id) for name in ("direction", "yellow", "red")}
+    edited = state.get(limits_key(project_id, snapshot_id))
+    committed = committed_rule(schema, saved_limits)
+    seed = _seed(schema, committed)
+    if any(key not in state for key in keys.values()):
+        direction, yellow, red = _seed(schema, edited) if edited else seed
+        state[keys["direction"]] = direction
+        state[keys["yellow"]], state[keys["red"]] = yellow, red
+        state.pop(_state_key("error", project_id, snapshot_id), None)
+    args = (project_id, snapshot_id, committed)
+    suffix = f" ({unit})" if unit else ""
+    with st.container(border=True, key="pdm-quality-limits"):
+        st.radio("Limits", list(DIRECTIONS), format_func=DIRECTIONS.get, horizontal=True,
+                 key=keys["direction"], help=IMPORT_RED_CONDITION_HELP, on_change=_on_limits_change, args=args)
+        st.number_input(f"Yellow{suffix}", format="%.2f", step=0.01, key=keys["yellow"],
+                        help=IMPORT_YELLOW_LIMIT_HELP, on_change=_on_limits_change, args=args)
+        st.number_input(f"Red{suffix}", format="%.2f", step=0.01, key=keys["red"],
+                        help=IMPORT_RED_LIMIT_HELP, on_change=_on_limits_change, args=args)
+        error = state.get(_state_key("error", project_id, snapshot_id))
+        if error:
+            st.error(error)
+        status = state.get(_state_key("status", project_id, snapshot_id))
+        if status:
+            st.error(status)
+        if job_running:
+            st.caption("A background job is running. Save is available after it finishes.")
+        try:
+            current = (str(state[keys["direction"]]), float(state[keys["yellow"]]), float(state[keys["red"]]))
+            dirty = not _same_limits(current, seed)
+        except (KeyError, TypeError, ValueError):
+            dirty = True
+        dirty = dirty or edited is not None or bool(error)
+        cancel_col, save_col = st.columns(2, gap="small")
+        cancel_col.button("Cancel", key=f"quality_limit_cancel:{project_id}:{snapshot_id}", width="stretch",
+                          disabled=not dirty, on_click=_on_limits_cancel, args=(project_id, snapshot_id, schema))
+        save_col.button("Save", key=f"quality_limit_save:{project_id}:{snapshot_id}",
+                        width="stretch", disabled=edited is None or bool(error) or job_running,
+                        on_click=_on_limits_save, args=(project_id, snapshot_id))
 
 
 def unit_thresholds(labelled: pd.DataFrame, schema: dict) -> dict:
@@ -190,10 +355,16 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
     flash = st.session_state.pop(MOVE_FLASH_KEY, None)
     if flash:
         (st.success if flash[0] == "success" else st.warning)(flash[1])
+    project_id, snapshot_id = str(snapshot.get("project_id")), str(snapshot.get("snapshot_id"))
+    job_running = heavy_job_active()
+    job_active = storage_mode == "owned" and job_running
+    saved_limits = load_zone_limits(project_id, snapshot_id)
+    zones_schema = zone_schema(schema, project_id, snapshot_id, saved_limits)
+    rule_key = json.dumps(zones_schema.get("thresholds"), sort_keys=True, default=str)
     st.caption(QUALITY_TABS_CAPTION)
-    job_active = storage_mode == "owned" and heavy_job_active()
     summaries = {part: part_summary(features, split, part) for part, _ in PARTS}
-    zoned = project_zones.has_valid_rule(schema)
+    zoned = project_zones.has_valid_rule(zones_schema)
+    drew_limits = False
     tabs = st.tabs([name for _, name in PARTS], key="quality_tab", on_change="rerun")
     for tab, (part, name) in zip(tabs, PARTS, strict=True):
         summary = summaries[part]
@@ -204,8 +375,8 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
             c2.metric("Admitted rows", summary["rows"], help=QUALITY_ADMITTED_ROWS_HELP)
             c3.metric("Gaps", summary["gaps"], help=QUALITY_GAPS_HELP)
             if is_open and zoned and summary["rows"]:
-                counts = split_zone_counts(str(snapshot.get("project_id")), str(snapshot.get("snapshot_id")), part,
-                                           features, tuple(str(uid) for uid in split.get(part) or []), schema)
+                counts = split_zone_counts(project_id, snapshot_id, part, rule_key,
+                                           features, tuple(str(uid) for uid in split.get(part) or []), zones_schema)
                 st.caption(f"Zones: Green {counts['green']} · Yellow {counts['yellow']} · Red {counts['red']} · "
                            f"Not zoned {counts['unknown']} rows", help=QUALITY_ZONE_SUMMARY_HELP)
             if summary["time_start"] is not None:
@@ -235,11 +406,18 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
                 if not is_open:
                     continue
                 frame = summary["frame"].loc[summary["frame"]["unit_id"].astype(str) == selected]
-                labelled = project_zones.label_unit(frame, schema)
-                st.plotly_chart(zone_figure(labelled, schema, label, unit, theme), width="stretch", theme=None)
+                labelled = project_zones.label_unit(frame, zones_schema)
+                chart_col, limits_col = st.columns([4, 1], gap="small", vertical_alignment="top", wrap=False)
+                with chart_col:
+                    st.plotly_chart(zone_figure(labelled, zones_schema, label, unit, theme),
+                                    width="stretch", theme=None)
+                if is_open and not drew_limits:
+                    drew_limits = True
+                    with limits_col:
+                        _render_limits(schema, project_id, snapshot_id, saved_limits, job_running)
                 st.caption("Admitted measurements for the selected unit")
                 if zoned:
-                    st.caption(f"{project_zones.describe_rule(schema)} "
+                    st.caption(f"{project_zones.describe_rule(zones_schema)} "
                                f"{QUALITY_ZONE_MODEL_CAPTION.format(label=label)}")
                 else:
                     st.caption(QUALITY_NO_ZONES)
@@ -252,6 +430,9 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
                 display["Zone"] = labelled["zone"].map(ZONE_NAMES)
                 with st.container(height=240, border=True, key=f"quality_table_{part}"):
                     st.table(display, hide_index=True, border="horizontal")
+            elif is_open and not drew_limits:
+                drew_limits = True
+                _render_limits(schema, project_id, snapshot_id, saved_limits, job_running)
     ready, explanation = training_admission(features, split)
     if ready:
         try:

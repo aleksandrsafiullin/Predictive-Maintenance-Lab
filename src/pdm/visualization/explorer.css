@@ -43,17 +43,31 @@ body:has(.brain-lab-shell) [class*="st-key-pdm-empty-"] {gap: 8px;}
 body:has(.brain-lab-shell) [class*="st-key-pdm-empty-"] :is(h2, h3) {font-size: 17px; line-height: 24px; font-weight: 600; letter-spacing: -.01em; color: var(--pdm-text); padding: 0;}
 body:has(.brain-lab-shell) [class*="st-key-pdm-empty-"] [data-testid="stMarkdownContainer"] p {font-size: 14px; line-height: 21px; font-weight: 400; color: var(--pdm-text-secondary);}
 body:has(.brain-lab-shell) :is([class*="st-key-pdm-import-card-"], .st-key-pdm-import-signal, [class*="st-key-pdm-train-"]) :is(h2, h3) {padding: 0;}
+body:has(.brain-lab-shell) [data-testid="stHorizontalBlock"]:has(.st-key-pdm-quality-limits) {align-items: stretch !important;}
+body:has(.brain-lab-shell) [data-testid="stColumn"]:has(.st-key-pdm-quality-limits) {display: flex !important; flex-direction: column; align-self: stretch; flex: 0 0 220px !important; width: 220px !important; max-width: 220px !important;}
+body:has(.brain-lab-shell) [data-testid="stColumn"]:has(.st-key-pdm-quality-limits) [data-testid="stVerticalBlock"] {flex: 1 1 auto; display: flex; flex-direction: column; min-height: 100%;}
+body:has(.brain-lab-shell) [data-testid="stLayoutWrapper"]:has(> .st-key-pdm-quality-limits) {flex: 1 1 auto; display: flex; flex-direction: column; min-height: 100%;}
+body:has(.brain-lab-shell) .st-key-pdm-quality-limits {background: var(--pdm-surface); border: 1px solid var(--pdm-border); border-radius: 10px; padding: 8px 10px; gap: 4px; flex: 1 1 auto; min-height: 100%; box-sizing: border-box;}
+body:has(.brain-lab-shell) .st-key-pdm-quality-limits [data-testid="stWidgetLabel"] :is(p, label) {font-size: 12px; line-height: 16px;}
+body:has(.brain-lab-shell) .st-key-pdm-quality-limits [data-testid="stRadio"] {margin: 0;}
+body:has(.brain-lab-shell) .st-key-pdm-quality-limits [data-testid="stNumberInput"] {margin: 0;}
+body:has(.brain-lab-shell) .st-key-pdm-quality-limits > :is([data-testid="stHorizontalBlock"], [data-testid="stLayoutWrapper"]:has(> [data-testid="stHorizontalBlock"])) {margin-top: auto; flex: 0 0 auto;}
+body:has(.brain-lab-shell) .st-key-pdm-quality-limits [data-testid="stHorizontalBlock"] {gap: 6px; flex-wrap: nowrap;}
+body:has(.brain-lab-shell) .st-key-pdm-quality-limits [data-testid="stHorizontalBlock"] [data-testid="stColumn"] {min-width: 0;}
+body:has(.brain-lab-shell) .st-key-pdm-quality-limits [data-testid="stHorizontalBlock"] [data-testid="stVerticalBlock"] {flex: 0 1 auto; min-height: 0;}
+body:has(.brain-lab-shell) .st-key-pdm-quality-limits [data-testid="stButton"] button {min-height: 32px; height: 32px; padding: 0 8px;}
 body:has(.brain-lab-shell) [data-testid="stColumn"]:has([class*="st-key-pdm-import-card-"]) {display: flex; flex-direction: column;}
 body:has(.brain-lab-shell) [data-testid="stColumn"]:has([class*="st-key-pdm-import-card-"]) > [data-testid="stVerticalBlock"] {flex: 1 1 auto; align-self: stretch; height: 100%; display: flex; flex-direction: column;}
 body:has(.brain-lab-shell) [data-testid="stColumn"]:has([class*="st-key-pdm-import-card-"]) [data-testid="stLayoutWrapper"]:has(> [class*="st-key-pdm-import-card-"]) {flex: 1 1 auto; display: flex; flex-direction: column; height: 100%;}
 body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] {flex: 1 1 auto; height: auto; min-height: 100%; padding: 0 0 14px; gap: 0;}
-body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] > div:first-child {background: var(--pdm-control); border-bottom: 1px solid var(--pdm-border); border-radius: 11px 11px 0 0; padding: 8px 12px;}
-body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] > div:first-child :is(h2, h3) {font-size: 13px; line-height: 18px; font-weight: 600; margin: 0; text-align: center;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-head-"] {position: relative; background: var(--pdm-control); border-bottom: 1px solid var(--pdm-border); border-radius: 11px 11px 0 0; padding: 10px 12px; height: auto;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-head-"] [data-testid="stMarkdownContainer"] {margin: 0;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-head-"] :is(h2, h3) {font-size: 13px; line-height: 18px; font-weight: 600; margin: 0; text-align: center;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-head-"] [data-testid="stElementContainer"]:has([data-testid="stButton"]) {position: absolute; top: 0; right: 4px; bottom: 0; width: auto; margin: 0; display: flex; align-items: center;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-head-"] [data-testid="stButton"] button {min-height: 28px; height: 28px; padding: 0 8px; background: transparent; border-color: transparent; color: var(--pdm-accent-text);}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-head-"] [data-testid="stButton"] button p {font-size: 13px; line-height: 18px; color: var(--pdm-accent-text);}
 body:has(.brain-lab-shell) [class*="st-key-pdm-card-body-"] {padding: 12px 14px 2px;}
-body:has(.brain-lab-shell) [class*="st-key-pdm-card-body-"] > [data-testid="stElementContainer"]:has([data-testid="stButton"]) {width: 100%; display: flex; justify-content: center;}
 body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] > [data-testid="stLayoutWrapper"]:has([class*="st-key-pdm-card-source-"]) {margin-top: auto;}
-body:has(.brain-lab-shell) [class*="st-key-pdm-card-body-"] [data-testid="stButton"] button {min-height: 28px; height: 28px; padding: 0 8px; background: transparent; border-color: transparent; color: var(--pdm-accent-text);}
-body:has(.brain-lab-shell) [class*="st-key-pdm-card-body-"] [data-testid="stButton"] button p {font-size: 13px; line-height: 18px; color: var(--pdm-accent-text);}
 body:has(.brain-lab-shell) [class*="st-key-pdm-card-source-"] {margin-top: auto; padding: 10px 14px 0; border-top: 1px solid var(--pdm-border);}
 body:has(.brain-lab-shell) [data-testid="stLayoutWrapper"]:has(> [class*="st-key-pdm-project-row-"]) + [data-testid="stLayoutWrapper"] > [class*="st-key-pdm-project-row-"] {border-top: 1px solid var(--pdm-border-soft); padding-top: 12px;}
 
@@ -75,6 +89,17 @@ body:has(.brain-lab-shell) [data-testid="stSidebar"] [data-testid="stButton"] bu
 body:has(.brain-lab-shell) [data-testid="stSidebar"] [data-testid="stButton"] button[kind="primary"] [data-testid="stMarkdownContainer"] {color: var(--pdm-accent-text);}
 body:has(.brain-lab-shell) [data-testid="stSidebar"] :is([class*="st-key-project_nav-"], [class*="st-key-workflow_step_"]) button:disabled {opacity: 1; background: transparent; color: var(--pdm-muted); cursor: not-allowed;}
 body:has(.brain-lab-shell) [data-testid="stSidebar"] :is([class*="st-key-project_nav-"], [class*="st-key-workflow_step_"]) button:disabled * {color: var(--pdm-muted);}
+body:has(.brain-lab-shell) [data-testid="stSidebar"] [class*="st-key-pdm-workflow-rail"] [data-testid="stButton"] button {padding-left: 28px;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="stElementContainer"] {position: relative;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="stElementContainer"]::before {content: ""; position: absolute; left: 8px; top: 14px; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; border: 2px solid var(--pdm-border-strong); background: var(--lab-sidebar); z-index: 2; pointer-events: none;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="stElementContainer"]::after {content: ""; position: absolute; left: 11px; top: -5px; width: 2px; height: calc(100% + 5px); background: var(--pdm-border); z-index: 1; pointer-events: none;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="stElementContainer"]:first-child::after {top: 18px; height: calc(100% - 17px);}
+body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="stElementContainer"]:last-child::after {height: 23px;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="stElementContainer"]:has(~ [data-testid="stElementContainer"] button[kind="primary"])::after {background: var(--pdm-accent);}
+body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="stElementContainer"]:has(button[kind="primary"]):not(:first-child)::after {background: linear-gradient(var(--pdm-accent) 23px, var(--pdm-border) 23px);}
+body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="stElementContainer"]:has(~ [data-testid="stElementContainer"] button[kind="primary"])::before,
+body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="stElementContainer"]:has(button[kind="primary"])::before {background: var(--pdm-accent); border-color: var(--pdm-accent);}
+body:has(.brain-lab-shell) [class*="st-key-pdm-workflow-rail"] > [data-testid="stElementContainer"]:has(button[kind="primary"])::before {box-shadow: 0 0 0 3px color-mix(in srgb, var(--pdm-accent) 28%, transparent);}
 
 /* Buttons. */
 body:has(.brain-lab-shell) [data-testid="stButton"] button,

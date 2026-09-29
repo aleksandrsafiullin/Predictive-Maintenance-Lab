@@ -6,7 +6,7 @@ import streamlit as st
 import pdm.project_results_ui as results_ui
 
 
-def _forecast(project_id, run_id, unit_id, as_of_s):
+def _forecast(project_id, run_id, unit_id, as_of_s, thresholds=None):
     return {"project_id": project_id, "run_id": run_id, "snapshot_id": "snapshot1",
             "as_of_s": as_of_s, "observed_prefix": [],
             "points": [{"target_time_s": as_of_s + 1, "value": as_of_s + 0.5}],

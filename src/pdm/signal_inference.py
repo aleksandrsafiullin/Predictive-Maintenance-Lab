@@ -29,8 +29,13 @@ def _load_model(project_id: str, run_id: str, artifact_digest: str, root: str):
     return joblib.load(run["artifact_path"])
 
 
-def forecast_prefix(project_id: str, run_id: str, unit_id: str, as_of_s: float) -> dict:
-    """Score only rows at/before as_of; never feed hidden future observations."""
+def forecast_prefix(project_id: str, run_id: str, unit_id: str, as_of_s: float,
+                    thresholds: dict | None = None) -> dict:
+    """Score only rows at/before as_of; never feed hidden future observations.
+
+    ``thresholds`` replaces the run's saved zone rule for display and red-crossing
+    only; model inputs and forecast values do not depend on it.
+    """
     from pdm.projects import project_store
 
     if not np.isfinite(float(as_of_s)):
@@ -43,7 +48,8 @@ def forecast_prefix(project_id: str, run_id: str, unit_id: str, as_of_s: float) 
     prefix = unit[unit.timestamp_s.astype(float) <= float(as_of_s)].copy()
     observed = [{"timestamp_s": float(t), "signal": float(v)}
                 for t, v in zip(prefix.timestamp_s, prefix.signal, strict=True)]
-    threshold = _resolved_thresholds(run["schema"], prefix)
+    rule_schema = {**run["schema"], "thresholds": dict(thresholds)} if thresholds else run["schema"]
+    threshold = _resolved_thresholds(rule_schema, prefix)
     result = {"as_of_s": float(as_of_s), "observed_prefix": observed, "points": [],
               "thresholds": threshold, "crossing": {"status": "unavailable", "time_s": None},
               "project_id": project_id, "run_id": run_id, "snapshot_id": run["snapshot_id"],

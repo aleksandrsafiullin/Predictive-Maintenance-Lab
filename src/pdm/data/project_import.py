@@ -68,6 +68,63 @@ def _iter_source_files(spec: Mapping[str, Any]) -> list[tuple[Path, str]]:
     return files
 
 
+XJTU_BASELINE_THRESHOLDS: dict[str, Any] = {
+    "mode": "initial_baseline_multiple", "direction": "above", "yellow": None, "red": None,
+    "baseline_n": 5, "onset_sigma": 3.0, "onset_ratio": 1.25, "red_ratio": 2.0,
+    "baseline_statistic": "median of first five causal max-axis RMS measurements",
+    "yellow_formula": "max(median + onset_sigma * population_sd, onset_ratio * median)",
+    "red_formula": "red_ratio * median",
+}
+
+
+def _baseline_thresholds(source_kind: str, thresholds: Mapping[str, Any]) -> dict[str, Any]:
+    if source_kind != "xjtu_bearings":
+        raise ValueError("Only XJTU-SY bearings imports can use the initial-baseline rule")
+    if thresholds.get("direction", "above") != "above":
+        raise ValueError("The initial-baseline rule only supports a rising signal")
+    try:
+        baseline_n = thresholds.get("baseline_n", 5)
+        if isinstance(baseline_n, bool) or int(baseline_n) != baseline_n or int(baseline_n) < 1:
+            raise ValueError
+        params = {key: float(thresholds.get(key, XJTU_BASELINE_THRESHOLDS[key]))
+                  for key in ("onset_sigma", "onset_ratio", "red_ratio")}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Baseline rule needs a positive integer baseline_n and numeric ratios") from exc
+    if not all(math.isfinite(v) and v > 0 for v in params.values()):
+        raise ValueError("Baseline rule ratios must be finite and positive")
+    rule = {**XJTU_BASELINE_THRESHOLDS, "baseline_n": int(baseline_n), **params}
+    if rule["baseline_n"] != XJTU_BASELINE_THRESHOLDS["baseline_n"]:
+        rule["baseline_statistic"] = f"median of first {rule['baseline_n']} causal max-axis RMS measurements"
+    return rule
+
+
+def validate_thresholds(source_kind: str, thresholds: Any) -> dict[str, Any]:
+    """Canonical saved zone rule: explicit absolute limits, the XJTU initial-baseline rule,
+    or no rule at all for a generic CSV whose limits are set later on Data Quality."""
+    if source_kind == "generic_sensor_csv" and not thresholds:
+        return {}
+    if isinstance(thresholds, Mapping) and thresholds.get("mode") == "initial_baseline_multiple":
+        return _baseline_thresholds(source_kind, thresholds)
+    return validate_absolute_thresholds(thresholds)
+
+
+def validate_absolute_thresholds(thresholds: Any) -> dict[str, Any]:
+    if not isinstance(thresholds, Mapping) or thresholds.get("mode") != "absolute":
+        raise ValueError("Imported sources need explicitly declared absolute thresholds")
+    direction = thresholds.get("direction")
+    if direction not in {"above", "below"}:
+        raise ValueError("Threshold direction must be above or below")
+    try:
+        yellow, red = float(thresholds["yellow"]), float(thresholds["red"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Yellow and red limits must be numeric") from exc
+    if not all(math.isfinite(x) for x in (yellow, red)):
+        raise ValueError("Yellow and red limits must be finite")
+    if (direction == "above" and yellow >= red) or (direction == "below" and yellow <= red):
+        raise ValueError("Red limit must be more severe than yellow limit")
+    return {"mode": "absolute", "direction": direction, "yellow": yellow, "red": red}
+
+
 def _signal_schema(source_kind: str, source: Mapping[str, Any]) -> dict[str, Any]:
     defaults = {
         "xjtu_bearings": ("combined_rms", "Combined max-axis RMS", "g"),
@@ -86,20 +143,6 @@ def _signal_schema(source_kind: str, source: Mapping[str, Any]) -> dict[str, Any
     }
     if column.casefold() in reserved:
         raise ValueError(f"{column} is an identity, outcome, or evaluation field, not a sensor signal")
-    thresholds = source.get("thresholds")
-    if not isinstance(thresholds, Mapping) or thresholds.get("mode") != "absolute":
-        raise ValueError("Imported sources need explicitly declared absolute thresholds")
-    direction = thresholds.get("direction")
-    if direction not in {"above", "below"}:
-        raise ValueError("Threshold direction must be above or below")
-    try:
-        yellow, red = float(thresholds["yellow"]), float(thresholds["red"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("Yellow and red limits must be numeric") from exc
-    if not all(math.isfinite(x) for x in (yellow, red)):
-        raise ValueError("Yellow and red limits must be finite")
-    if (direction == "above" and yellow >= red) or (direction == "below" and yellow <= red):
-        raise ValueError("Red limit must be more severe than yellow limit")
     return {
         "source_kind": source_kind,
         "signal_column": column,
@@ -108,7 +151,7 @@ def _signal_schema(source_kind: str, source: Mapping[str, Any]) -> dict[str, Any
         "time_unit": "s",
         "input_columns": ["signal"],
         "output_domain": "real" if source_kind == "generic_sensor_csv" else "nonnegative",
-        "thresholds": {"mode": "absolute", "direction": direction, "yellow": yellow, "red": red},
+        "thresholds": validate_thresholds(source_kind, source.get("thresholds")),
     }
 
 

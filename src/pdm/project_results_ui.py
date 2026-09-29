@@ -1,6 +1,7 @@
 """One causal signal chart for a saved project signal run."""
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from datetime import datetime
 
@@ -8,6 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from pdm.data.project_prepare import load_zone_limits
 from pdm.project_chart_style import add_threshold_layers, style_signal_chart
 from pdm.projects import project_store
 from pdm.signal_inference import forecast_prefix
@@ -138,7 +140,8 @@ def _show_forecast_context(result: dict, schema: dict, interval_status: str | No
 
 @st.fragment(run_every=0.6)
 def _play_fragment(project_id: str, run_id: str, unit_id: str, snapshot: dict,
-                   interval_status: str | None = None, theme: str = "dark") -> None:
+                   interval_status: str | None = None, theme: str = "dark",
+                   zone_limits: dict | None = None) -> None:
     # Streamlit replaces fragment content on each timer tick. Keep the theme
     # marker inside that content so the body/sidebar CSS remains selected.
     apply_explorer_style(theme)
@@ -170,13 +173,14 @@ def _play_fragment(project_id: str, run_id: str, unit_id: str, snapshot: dict,
     as_of_s = clocks[state["cursor"]]
     time_label = f"{as_of_s / 60:g} min" if schema.get("source_kind") == "xjtu_bearings" else f"{as_of_s:g} s"
     st.caption(f"Measurements received through {time_label} · sample {state['cursor'] + 1} of {len(clocks)}")
-    forecast_key = (project_id, run_id, snapshot["snapshot_id"], unit_id, as_of_s)
+    forecast_key = (project_id, run_id, snapshot["snapshot_id"], unit_id, as_of_s,
+                    json.dumps(zone_limits, sort_keys=True))
     saved = st.session_state.get("project_last_forecast")
     if isinstance(saved, dict) and saved.get("key") == forecast_key:
         result = saved["result"]
     else:
         try:
-            result = forecast_prefix(project_id, run_id, unit_id, as_of_s)
+            result = forecast_prefix(project_id, run_id, unit_id, as_of_s, thresholds=zone_limits)
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
             st.error(f"Saved forecast cannot be opened: {exc}")
             return
@@ -238,7 +242,8 @@ def render_results(project_id: str, snapshot: dict, selected_run_id: str | None 
         st.session_state["result_active_pair"] = pair
     engine = manifest.get("engine_id") or manifest.get("engine") or "Saved model"
     st.caption(f"{engine} · held-out Test unit · signal forecast in {snapshot['schema'].get('signal_unit', 'native units')}")
-    _play_fragment(project_id, run_id, unit_id, snapshot, manifest.get("interval_status"), theme)
+    _play_fragment(project_id, run_id, unit_id, snapshot, manifest.get("interval_status"), theme,
+                   load_zone_limits(project_id, snapshot["snapshot_id"]))
     metrics = (manifest.get("metrics") or {}).get("test") or {}
     if metrics:
         st.subheader("Held-out Test summary")

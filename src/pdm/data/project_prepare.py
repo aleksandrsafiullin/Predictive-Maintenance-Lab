@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from pdm.data.generic_csv import read_generic_csv
+from pdm.data.project_import import XJTU_BASELINE_THRESHOLDS, validate_absolute_thresholds
 from pdm.io_util import atomic_write_json, read_json, sha256_file
 from pdm.projects import ProjectStore, _safe_id, project_store
 from pdm.splits import assert_split_coverage, split_hash
@@ -26,6 +27,7 @@ SNAPSHOT_FILES = (
     "data_report.json",
     "feature_schema.json",
 )
+ZONE_LIMITS_FILE = "zone_limits.json"
 SPLIT_NAMES = ("train", "validation", "test")
 SPLIT_LABELS = {"train": "Training Data", "validation": "Validation Data", "test": "Testing Data"}
 MANUAL_SPLIT_PROTOCOL = "whole_unit_project_v1_manual"
@@ -307,13 +309,7 @@ def _legacy_adapted(project: Mapping[str, Any]):
             "source_kind": "xjtu_bearings", "signal_column": "combined_rms",
             "signal_label": "Combined max-axis RMS", "signal_unit": "g", "time_unit": "s",
             "input_columns": ["signal"], "output_domain": "nonnegative",
-            "thresholds": {
-                "mode": "initial_baseline_multiple", "direction": "above", "yellow": None, "red": None,
-                "baseline_n": 5, "onset_sigma": 3.0, "onset_ratio": 1.25, "red_ratio": 2.0,
-                "baseline_statistic": "median of first five causal max-axis RMS measurements",
-                "yellow_formula": "max(median + onset_sigma * population_sd, onset_ratio * median)",
-                "red_formula": "red_ratio * median",
-            },
+            "thresholds": dict(XJTU_BASELINE_THRESHOLDS),
         }
     else:
         signal = features["differential_pressure"]
@@ -591,6 +587,9 @@ def move_units(
                 raise ValueError(LINKED_LEGACY_MOVE_ERROR)
             if record.get("active_snapshot_id") != expected_snapshot_id:
                 raise ValueError(STALE_SNAPSHOT_ERROR)
+            limits = read_zone_limits(parent["dir"])
+            if limits is not None:
+                atomic_write_json(staging / ZONE_LIMITS_FILE, limits)
             _publish_snapshot(staging, destination,
                               lambda: store._activate_snapshot_locked(registry, project_id, snapshot_id))
     except BaseException:
@@ -601,6 +600,79 @@ def move_units(
             "parent_snapshot_id": expected_snapshot_id, "dir": destination, "split": split,
             "report": payload["report"], "schema": parent["schema"],
             "fingerprint": payload["fingerprint"]}
+
+
+JOB_ACTIVE_LIMITS_ERROR = ("A background job is running, so this edit is not saved. "
+                           "Press Save after the job finishes.")
+
+
+def read_zone_limits(directory: Path) -> dict[str, Any] | None:
+    """Display limits saved beside a snapshot; outside SNAPSHOT_FILES and its fingerprint.
+
+    A sidecar that reads but fails validation is removed; a read error leaves it in place.
+    """
+    path = Path(directory) / ZONE_LIMITS_FILE
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        content = read_json(path)
+    except OSError:
+        return None
+    except ValueError:
+        pass
+    else:
+        try:
+            return validate_absolute_thresholds(content)
+        except (ValueError, TypeError):
+            pass
+    try:
+        if not path.is_symlink():
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return None
+
+
+def load_zone_limits(
+    project_id: str, snapshot_id: str, *, store: ProjectStore | None = None
+) -> dict[str, Any] | None:
+    store = store or project_store()
+    try:
+        directory = store.snapshot_path(project_id, snapshot_id)
+    except (OSError, ValueError, KeyError):
+        return None
+    return read_zone_limits(directory)
+
+
+def save_zone_limits(
+    project_id: str, thresholds: Mapping[str, Any], *, expected_snapshot_id: str,
+    store: ProjectStore | None = None,
+) -> dict[str, Any]:
+    """Save display limits for the active snapshot (same snapshot ID, registry untouched).
+
+    Training, runs and ``load_snapshot`` keep the import-time schema.
+    """
+    from pdm.worker import heavy_job_active
+
+    store = store or project_store()
+    rule = validate_absolute_thresholds(thresholds)
+    project = store.get(project_id)
+    if project["active_snapshot_id"] != expected_snapshot_id:
+        raise ValueError(STALE_SNAPSHOT_ERROR)
+    directory = store.snapshot_path(project_id, expected_snapshot_id)
+    if not directory.is_dir():
+        raise ValueError("Snapshot is missing")
+    if heavy_job_active():
+        raise RuntimeError(JOB_ACTIVE_LIMITS_ERROR)
+    with store.launch_lock():
+        if heavy_job_active():
+            raise RuntimeError(JOB_ACTIVE_LIMITS_ERROR)
+        record = store._entry(store._load(), project_id)
+        if record.get("active_snapshot_id") != expected_snapshot_id:
+            raise ValueError(STALE_SNAPSHOT_ERROR)
+        if read_zone_limits(directory) != rule:
+            atomic_write_json(directory / ZONE_LIMITS_FILE, rule)
+    return rule
 
 
 def load_snapshot(

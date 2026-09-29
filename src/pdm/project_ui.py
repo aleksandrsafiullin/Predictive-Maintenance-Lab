@@ -10,8 +10,20 @@ import streamlit as st
 
 from pdm.cli import spawn_worker
 from pdm.data.prepare import processed_ready
-from pdm.data.project_prepare import MANUAL_SPLIT_PROTOCOL, load_snapshot, prepare_project
-from pdm.project_quality_ui import PARTS, QUALITY_DESCRIPTION, part_summary, render_quality
+from pdm.data.project_import import XJTU_BASELINE_THRESHOLDS, validate_thresholds
+from pdm.data.project_prepare import (
+    MANUAL_SPLIT_PROTOCOL,
+    load_snapshot,
+    prepare_project,
+    read_zone_limits,
+)
+from pdm.io_util import read_json
+from pdm.project_quality_ui import (
+    PARTS,
+    QUALITY_DESCRIPTION,
+    part_summary,
+    render_quality,
+)
 from pdm.project_results_ui import render_results
 from pdm.project_training_ui import render_training
 from pdm.projects import project_store
@@ -20,8 +32,6 @@ from pdm.ui_copy import (
     CREATE_PROJECT_HELP,
     IMPORT_CARD_EMPTY,
     IMPORT_FOLDER_HELP,
-    IMPORT_RED_CONDITION_HELP,
-    IMPORT_RED_LIMIT_HELP,
     IMPORT_SIGNAL_COLUMN_HELP,
     IMPORT_SIGNAL_NAME_HELP,
     IMPORT_SIGNAL_UNIT_HELP,
@@ -36,7 +46,6 @@ from pdm.ui_copy import (
     IMPORT_VALIDATION_FROM_HELP,
     IMPORT_VALIDATION_WEIGHT_HELP,
     IMPORT_VIEW_HELP,
-    IMPORT_YELLOW_LIMIT_HELP,
     PROJECT_NAME_HELP,
     PROJECT_SOURCE_FORMAT_HELP,
     QUALITY_ADMITTED_ROWS_HELP,
@@ -56,6 +65,11 @@ SOURCE_KINDS = {
 HOLDOUT_SOURCES = {"Split from training": "auto", "Separate folder": "folder"}
 SPLIT_DEFAULTS = {"import_weight_train": 70, "import_weight_validation": 15, "import_weight_test": 15,
                   "import_seed": 42}
+FIRST_IMPORT_THRESHOLDS = {
+    "generic_sensor_csv": {},
+    "hse_filters": {"mode": "absolute", "direction": "above", "yellow": 300.0, "red": 600.0},
+    "xjtu_bearings": XJTU_BASELINE_THRESHOLDS,
+}
 
 
 def _reset_project_session() -> None:
@@ -171,7 +185,11 @@ def _open_quality_tab(name: str) -> None:
 
 def _card_counts(part: str, name: str, summaries: dict | None) -> None:
     counts = (summaries or {}).get("parts", {}).get(part)
-    st.subheader(name, anchor=False)
+    with st.container(key=f"pdm-card-head-{part}"):
+        st.subheader(name, anchor=False)
+        if counts:
+            st.button("View", key=f"import_view:{part}", type="tertiary", help=IMPORT_VIEW_HELP,
+                      on_click=_open_quality_tab, args=(name,), width="content")
     with st.container(key=f"pdm-card-body-{part}"):
         if not counts:
             st.markdown("**No data yet**")
@@ -181,8 +199,6 @@ def _card_counts(part: str, name: str, summaries: dict | None) -> None:
         units.metric("Units", counts["units"], help=QUALITY_UNITS_HELP)
         gaps.metric("Gaps", counts["gaps"], help=QUALITY_GAPS_HELP)
         rows.metric("Admitted rows", counts["rows"], help=QUALITY_ADMITTED_ROWS_HELP)
-        st.button("View", key=f"import_view:{part}", type="tertiary", help=IMPORT_VIEW_HELP,
-                  on_click=_open_quality_tab, args=(name,), width="content")
 
 
 def _holdout_source(label: str, key: str, help_text: str) -> str:
@@ -252,11 +268,36 @@ def _split_settings(any_auto: bool) -> tuple[int, int, int, int]:
     return train_pct, val_pct, test_pct, seed
 
 
-def _valid_thresholds(direction: str, yellow: float, red: float) -> None:
-    if direction == "above" and yellow >= red:
-        raise ValueError("For an increasing warning signal, the yellow limit must be below red.")
-    if direction == "below" and yellow <= red:
-        raise ValueError("For a decreasing warning signal, the yellow limit must be above red.")
+def _saved_schema(store, project: dict) -> dict:
+    """Schema of the snapshot being replaced, with its saved display limits if any.
+
+    Re-import defaults only; the worker re-validates what is sent.
+    """
+    sid = project.get("active_snapshot_id")
+    if project.get("state") != "ready" or not sid:
+        return {}
+    try:
+        directory = store.snapshot_path(project["project_id"], str(sid))
+        path = directory / "feature_schema.json"
+        schema = {} if path.is_symlink() else read_json(path)
+    except (OSError, ValueError, KeyError):
+        return {}
+    if not isinstance(schema, dict):
+        return {}
+    limits = read_zone_limits(directory)
+    return {**schema, "thresholds": limits} if limits else schema
+
+
+def _import_thresholds(kind: str, saved: dict, signal_column: str, signal_unit: str) -> dict:
+    """The replaced snapshot's rule for the same signal, else first-import defaults."""
+    same_signal = bool(saved) and (kind != "generic_sensor_csv" or (
+        saved.get("signal_column"), saved.get("signal_unit")) == (signal_column, signal_unit))
+    if same_signal:
+        try:
+            return validate_thresholds(kind, saved.get("thresholds"))
+        except ValueError:
+            pass
+    return dict(FIRST_IMPORT_THRESHOLDS.get(kind, {}))
 
 
 @st.fragment(run_every=1.5)
@@ -298,29 +339,25 @@ def _render_import(store, project: dict) -> None:
     if summaries and summaries.get("protocol") == MANUAL_SPLIT_PROTOCOL:
         st.caption("Current sets include manual moves from Data Quality. Importing again creates a fresh split.")
     train_pct, val_pct, test_pct, seed = _split_settings("auto" in {val_mode, test_mode})
+    saved = _saved_schema(store, project)
     with st.container(border=True, key="pdm-import-signal"):
-        st.subheader("Signal and limits", anchor=False)
+        st.subheader("Signal", anchor=False)
         if kind == "generic_sensor_csv":
             st.caption("Each CSV needs unit_id, timestamp_s, and the selected numeric signal. Time is in seconds. Other columns are descriptive in this first version.")
             s1, s2, s3 = st.columns(3)
-            signal_column = s1.text_input("Signal column", value="signal", help=IMPORT_SIGNAL_COLUMN_HELP)
-            signal_label = s2.text_input("Signal name", value="Signal", help=IMPORT_SIGNAL_NAME_HELP)
-            signal_unit = s3.text_input("Signal unit", value="unit", help=IMPORT_SIGNAL_UNIT_HELP)
+            signal_column = s1.text_input("Signal column", value=str(saved.get("signal_column") or "signal"),
+                                          help=IMPORT_SIGNAL_COLUMN_HELP)
+            signal_label = s2.text_input("Signal name", value=str(saved.get("signal_label") or "Signal"),
+                                         help=IMPORT_SIGNAL_NAME_HELP)
+            signal_unit = s3.text_input("Signal unit", value=str(saved.get("signal_unit") or "unit"),
+                                        help=IMPORT_SIGNAL_UNIT_HELP)
         elif kind == "xjtu_bearings":
             signal_column, signal_label, signal_unit = "combined_rms", "Combined max-axis RMS", "g"
             st.caption("XJTU-SY vibration fragments produce max-axis RMS acceleration in g. Acquisition time is recorded in seconds.")
         else:
             signal_column, signal_label, signal_unit = "differential_pressure", "Differential pressure", "Pa"
             st.caption("HSE differential pressure is measured in Pa and source Time is seconds. Official test RUL stays for evaluation only.")
-        direction_label = st.radio("Red condition", ["Signal rises above limits", "Signal falls below limits"], horizontal=True,
-                                   help=IMPORT_RED_CONDITION_HELP)
-        direction = "above" if direction_label.startswith("Signal rises") else "below"
-        c1, c2 = st.columns(2)
-        yellow = c1.number_input(f"Yellow limit ({signal_unit})", value=1.0 if direction == "above" else -1.0, format="%.6f",
-                                 help=IMPORT_YELLOW_LIMIT_HELP)
-        red = c2.number_input(f"Red limit ({signal_unit})", value=2.0 if direction == "above" else -2.0, format="%.6f",
-                              help=IMPORT_RED_LIMIT_HELP)
-        st.caption("Limits are instantaneous in the signal's native unit. Set these from your operating rules; the app does not infer fault limits.")
+        st.caption("Yellow and red limits are set on Data Quality after import.")
     status = status_for_project(pid)
     running = worker_alive() or status.get("status") in {"queued", "running", "training", "preparing", "stopping"}
     if running:
@@ -344,7 +381,7 @@ def _render_import(store, project: dict) -> None:
                 raise ValueError("Enter a valid signal column name.")
             if not signal_label.strip() or not signal_unit.strip():
                 raise ValueError("Signal name and unit are required.")
-            _valid_thresholds(direction, float(yellow), float(red))
+            thresholds = _import_thresholds(kind, saved, signal_column.strip(), signal_unit.strip())
             primary = _materialize_source(store, pid, primary, created_roots)
             validation = _materialize_source(store, pid, validation, created_roots)
             test = _materialize_source(store, pid, test, created_roots)
@@ -353,9 +390,7 @@ def _render_import(store, project: dict) -> None:
                       "weights": {"train": float(train_pct) / 100, "validation": float(val_pct) / 100,
                                   "test": float(test_pct) / 100},
                       "signal_column": signal_column.strip(), "signal_label": signal_label.strip(),
-                      "signal_unit": signal_unit.strip(),
-                      "thresholds": {"mode": "absolute", "direction": direction,
-                                     "yellow": float(yellow), "red": float(red)}}
+                      "signal_unit": signal_unit.strip(), "thresholds": thresholds}
             job_id = uuid.uuid4().hex
             spawn_worker({"kind": "project_import", "job_id": job_id, "project_id": pid, "source": source})
             launched = True
@@ -462,7 +497,8 @@ def main() -> None:
         if projects:
             options = [None, *by_id]
             chosen = st.selectbox("Project", options, index=options.index(selected_id),
-                                  format_func=lambda pid: "Choose a project" if pid is None else by_id[pid]["name"])
+                                  format_func=lambda pid: "Choose a project" if pid is None else by_id[pid]["name"],
+                                  label_visibility="collapsed")
             if chosen != selected_id:
                 _reset_project_session()
                 if chosen:
@@ -486,15 +522,16 @@ def main() -> None:
                                  for row in list_project_runs(selected_id))
             except (OSError, ValueError, KeyError, RuntimeError):
                 runs_ready = False
-        for name in STEPS:
-            enabled = name == "Projects" or bool(selected) and (
-                name in {"Import data", "Data Quality"} or
-                name == "Training" and snapshot_ready and not importing_current or
-                name == "Results" and runs_ready and not importing_current)
-            if st.button(name, key=f"project_nav:{name}", disabled=not enabled,
-                         type="primary" if step == name else "secondary", width="stretch"):
-                st.session_state["project_step"] = name
-                st.rerun()
+        with st.container(key="pdm-workflow-rail"):
+            for name in STEPS:
+                enabled = name == "Projects" or bool(selected) and (
+                    name in {"Import data", "Data Quality"} or
+                    name == "Training" and snapshot_ready and not importing_current or
+                    name == "Results" and runs_ready and not importing_current)
+                if st.button(name, key=f"project_nav:{name}", disabled=not enabled,
+                             type="primary" if step == name else "secondary", width="stretch"):
+                    st.session_state["project_step"] = name
+                    st.rerun()
     if selected and step in {"Data Quality", "Training", "Results"}:
         try:
             selected = _maybe_wrap_legacy(selected)
