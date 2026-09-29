@@ -219,6 +219,21 @@ class ProjectStore:
             self._save(registry)
             return copy.deepcopy(updated)
 
+    def _activate_snapshot_locked(
+        self, registry: dict[str, Any], project_id: str, snapshot_id: str
+    ) -> dict[str, Any]:
+        """Activate a published snapshot and clear the run selection.
+
+        Caller must hold ``launch_lock()`` and pass the registry it loaded under
+        that lock. This method takes no lock itself (the lock is not re-entrant).
+        """
+        _safe_id(snapshot_id, "active_snapshot_id")
+        record = self._entry(registry, project_id)
+        updated = {**record, "active_snapshot_id": snapshot_id, "selected_run_id": None, "state": "ready"}
+        registry["projects"][project_id] = updated
+        self._save(registry)
+        return copy.deepcopy(updated)
+
     def project_path(self, project_id: str) -> Path:
         self.get(project_id)
         path = self._owned_path(project_id)

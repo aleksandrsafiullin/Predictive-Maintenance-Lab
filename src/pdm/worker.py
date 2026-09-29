@@ -13,6 +13,7 @@ from pdm.paths import worker_dir
 
 _CURRENT_PROJECT_JOB: dict | None = None
 _PROJECT_TERMINAL = {"completed", "failed", "cancelled"}
+ACTIVE_JOB_STATES = frozenset({"queued", "starting", "running", "training", "preparing", "stopping"})
 
 
 def status_path() -> Path:
@@ -134,6 +135,15 @@ def worker_alive() -> bool:
         return True
     except (OSError, ValueError, AttributeError, TypeError, OverflowError):
         return False
+
+
+def heavy_job_active(project_id: str | None = None) -> bool:
+    """True while any worker job is live or pending.
+
+    Global on purpose: the single worker blocks every project, so ``project_id``
+    never narrows the answer.
+    """
+    return worker_alive() or read_status().get("status") in ACTIVE_JOB_STATES
 
 
 def write_status(payload: dict) -> None:

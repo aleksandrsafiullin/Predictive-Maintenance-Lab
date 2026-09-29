@@ -6,19 +6,84 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from pdm.project_chart_style import style_signal_chart
+from pdm import project_zones
+from pdm.data.project_prepare import move_units, preview_move
+from pdm.project_chart_style import add_threshold_layers, style_signal_chart
 from pdm.signal_training import available_signal_engines
 from pdm.ui_copy import (
     QUALITY_ADMITTED_ROWS_HELP,
     QUALITY_GAPS_HELP,
     QUALITY_INSPECT_UNIT_HELP,
+    QUALITY_MOVE_DONE,
+    QUALITY_MOVE_FIXED_HSE,
+    QUALITY_MOVE_JOB_ACTIVE,
+    QUALITY_MOVE_LEGACY,
+    QUALITY_MOVE_PREVIEW,
+    QUALITY_MOVE_SUBMIT_HELP,
+    QUALITY_MOVE_TEST_OPTIMISM,
+    QUALITY_MOVE_TO_HELP,
+    QUALITY_MOVE_UNITS_HELP,
+    QUALITY_NO_ZONES,
     QUALITY_TABS_CAPTION,
     QUALITY_UNITS_HELP,
+    QUALITY_ZONE_MODEL_CAPTION,
+    QUALITY_ZONE_SUMMARY_HELP,
 )
-from pdm.ui_theme import page_header, tokens
+from pdm.ui_theme import page_header, tokens, zone_colors
+from pdm.worker import heavy_job_active
 
 QUALITY_DESCRIPTION = "Each set contains whole physical units. Rows from one unit stay in one set."
 PARTS = (("train", "Training Data"), ("validation", "Validation Data"), ("test", "Testing Data"))
+ZONE_NAMES = {"green": "Green", "yellow": "Yellow", "red": "Red", "unknown": "Not zoned"}
+PART_BY_NAME = {name: part for part, name in PARTS}
+MOVE_FLASH_KEY = "quality_move_flash"
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def split_zone_counts(project_id: str, snapshot_id: str, part: str,
+                      _features: pd.DataFrame, _unit_ids: tuple[str, ...], _schema: dict) -> dict[str, int]:
+    """Snapshots are immutable, so (project, snapshot, part) fully identifies the counts."""
+    return project_zones.zone_counts(_features, _unit_ids, _schema)
+
+
+def unit_thresholds(labelled: pd.DataFrame, schema: dict) -> dict:
+    rule = schema.get("thresholds") or {}
+    prefix = labelled
+    if rule.get("mode") == "initial_baseline_multiple":
+        prefix = labelled.iloc[:int(rule.get("baseline_n", 5))]
+    return project_zones.resolve_thresholds(schema, prefix)
+
+
+def zone_figure(labelled: pd.DataFrame, schema: dict, label: str, unit: str, theme: str) -> go.Figure:
+    fig = go.Figure()
+    x, y = gap_safe_trace(labelled)
+    if not project_zones.has_valid_rule(schema):
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers", name=label,
+                                 line={"color": tokens(theme)["series_observed"], "width": 2}, marker={"size": 4}))
+        fig.update_layout(height=280, margin={"l": 20, "r": 20, "t": 15, "b": 25},
+                          xaxis_title="Time (s)", yaxis_title=f"{label} ({unit})", showlegend=False)
+        return style_signal_chart(fig, theme)
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=label, showlegend=False, hoverinfo="skip",
+                             line={"color": tokens(theme)["series_observed"], "width": 2}))
+    colors = zone_colors(theme)
+    suffix = f" {unit}" if unit else ""
+    for zone in project_zones.ZONES:
+        rows = labelled.loc[labelled["zone"] == zone]
+        if rows.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=rows["timestamp_s"].tolist(), y=rows["signal"].tolist(), mode="markers",
+            name=f"{ZONE_NAMES[zone]} · {len(rows)}", marker={"size": 6, "color": colors[zone]},
+            hovertemplate=(f"Time %{{x:g}} s<br>{label} %{{y:g}}{suffix}"
+                           f"<br>Zone: {ZONE_NAMES[zone]}<extra></extra>")))
+    thresholds = unit_thresholds(labelled, schema)
+    if thresholds.get("status") == "available":
+        values = [float(v) for v in labelled["signal"] if np.isfinite(v)]
+        add_threshold_layers(fig, thresholds, values, theme)
+    fig.update_layout(height=300, margin={"l": 20, "r": 20, "t": 30, "b": 25},
+                      xaxis_title="Time (s)", yaxis_title=f"{label} ({unit})",
+                      showlegend=True, legend={"orientation": "h", "y": 1.12, "x": 0})
+    return style_signal_chart(fig, theme)
 
 
 def gap_safe_trace(frame: pd.DataFrame) -> tuple[list[float | None], list[float | None]]:
@@ -60,7 +125,61 @@ def training_admission(features: pd.DataFrame, split: dict) -> tuple[bool, str]:
     return True, "Train, Validation, and Test have admitted measurements. Training uses Train units; Validation selects the model; Test is held out until evaluation."
 
 
-def render_quality(snapshot: dict, theme: str = "dark") -> bool:
+def _do_move(project_id: str, snapshot_id: str, part: str) -> None:
+    """Button callback: runs before widgets re-render, so their keys can be dropped here."""
+    units = list(st.session_state.get(f"quality_move_units:{part}") or [])
+    name = str(st.session_state.get(f"quality_move_to:{part}") or "")
+    destination = PART_BY_NAME.get(name)
+    if destination is None:
+        st.session_state[MOVE_FLASH_KEY] = ("warning", "Choose the set to move the units to.")
+        return
+    try:
+        move_units(project_id, units, destination, expected_snapshot_id=snapshot_id)
+    except (ValueError, RuntimeError, OSError) as exc:
+        st.session_state[MOVE_FLASH_KEY] = ("warning", str(exc))
+        return
+    for key in list(st.session_state):
+        if str(key).startswith(("quality_move_units:", "quality_move_to:", "quality_unit_")):
+            st.session_state.pop(key, None)
+    st.session_state[MOVE_FLASH_KEY] = ("success", QUALITY_MOVE_DONE.format(n=len(units), name=name))
+
+
+def _render_move(snapshot: dict, part: str, storage_mode: str, job_active: bool) -> None:
+    with st.expander("Move units", expanded=False):
+        if storage_mode != "owned":
+            st.info(QUALITY_MOVE_LEGACY)
+            return
+        split = snapshot["split"]
+        fixed = set(preview_move(snapshot, (), "train")["fixed_units"])
+        movable = sorted(str(uid) for uid in split.get(part) or [] if str(uid) not in fixed)
+        if part == "test" and fixed:
+            st.caption(QUALITY_MOVE_FIXED_HSE.format(n=len(fixed)))
+        key = f"quality_move_units:{part}"
+        if key in st.session_state:
+            st.session_state[key] = [uid for uid in st.session_state[key] if uid in movable]
+        chosen = st.multiselect("Units to move", movable, key=key,
+                                disabled=job_active, help=QUALITY_MOVE_UNITS_HELP)
+        targets = [name for other, name in PARTS if other != part]
+        target = st.selectbox("Move to", targets, key=f"quality_move_to:{part}",
+                              disabled=job_active, help=QUALITY_MOVE_TO_HELP)
+        if part == "test" or target == "Testing Data":
+            st.caption(QUALITY_MOVE_TEST_OPTIMISM)
+        problem = None
+        if chosen:
+            preview = preview_move(snapshot, chosen, PART_BY_NAME[target])
+            problem = preview["problem"]
+            if problem:
+                st.warning(problem)
+            else:
+                st.caption(QUALITY_MOVE_PREVIEW.format(**preview["counts"]))
+        if job_active:
+            st.caption(QUALITY_MOVE_JOB_ACTIVE)
+        st.button("Move selected units", disabled=not chosen or bool(problem) or job_active,
+                  key=f"quality_move:{part}", help=QUALITY_MOVE_SUBMIT_HELP, on_click=_do_move,
+                  args=(str(snapshot["project_id"]), str(snapshot["snapshot_id"]), part))
+
+
+def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "owned") -> bool:
     features = snapshot["features"]
     split = snapshot["split"]
     schema = snapshot["schema"]
@@ -68,16 +187,27 @@ def render_quality(snapshot: dict, theme: str = "dark") -> bool:
     label = str(schema.get("signal_label") or schema.get("signal_column") or "Signal")
     unit = str(schema.get("signal_unit") or "")
     page_header("Data Quality", QUALITY_DESCRIPTION)
+    flash = st.session_state.pop(MOVE_FLASH_KEY, None)
+    if flash:
+        (st.success if flash[0] == "success" else st.warning)(flash[1])
     st.caption(QUALITY_TABS_CAPTION)
+    job_active = storage_mode == "owned" and heavy_job_active()
     summaries = {part: part_summary(features, split, part) for part, _ in PARTS}
-    tabs = st.tabs([name for _, name in PARTS])
+    zoned = project_zones.has_valid_rule(schema)
+    tabs = st.tabs([name for _, name in PARTS], key="quality_tab", on_change="rerun")
     for tab, (part, name) in zip(tabs, PARTS, strict=True):
         summary = summaries[part]
+        is_open = tab.open is not False
         with tab:
             c1, c2, c3 = st.columns(3)
             c1.metric("Units", summary["units"], help=QUALITY_UNITS_HELP)
             c2.metric("Admitted rows", summary["rows"], help=QUALITY_ADMITTED_ROWS_HELP)
             c3.metric("Gaps", summary["gaps"], help=QUALITY_GAPS_HELP)
+            if is_open and zoned and summary["rows"]:
+                counts = split_zone_counts(str(snapshot.get("project_id")), str(snapshot.get("snapshot_id")), part,
+                                           features, tuple(str(uid) for uid in split.get(part) or []), schema)
+                st.caption(f"Zones: Green {counts['green']} · Yellow {counts['yellow']} · Red {counts['red']} · "
+                           f"Not zoned {counts['unknown']} rows", help=QUALITY_ZONE_SUMMARY_HELP)
             if summary["time_start"] is not None:
                 st.caption(f"Observed time: {summary['time_start']:g}–{summary['time_end']:g} s. "
                            f"{label}: {summary['signal_min']:g}–{summary['signal_max']:g} {unit}.")
@@ -97,26 +227,29 @@ def render_quality(snapshot: dict, theme: str = "dark") -> bool:
                 st.write(f"Rejected or missing signal rows: {rejected}; remaining missing signal values: {summary['missing_signal']}.")
             if summary["gaps"]:
                 st.caption("Gaps split the history. Training and forecasts do not cross them.")
+            _render_move(snapshot, part, storage_mode, job_active)
             ids = sorted(str(uid) for uid in split.get(part) or [])
             if ids:
                 selected = st.selectbox(f"Inspect {name} unit", ids, key=f"quality_unit_{part}",
                                         help=QUALITY_INSPECT_UNIT_HELP)
-                frame = summary["frame"].loc[summary["frame"]["unit_id"].astype(str) == selected].sort_values("timestamp_s")
-                fig = go.Figure()
-                x, y = gap_safe_trace(frame)
-                fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers",
-                                         name=label, line={"color": tokens(theme)["series_observed"], "width": 2},
-                                         marker={"size": 4}))
-                fig.update_layout(height=280, margin={"l": 20, "r": 20, "t": 15, "b": 25},
-                                  xaxis_title="Time (s)", yaxis_title=f"{label} ({unit})", showlegend=False)
-                st.plotly_chart(style_signal_chart(fig, theme), width="stretch", theme=None)
+                if not is_open:
+                    continue
+                frame = summary["frame"].loc[summary["frame"]["unit_id"].astype(str) == selected]
+                labelled = project_zones.label_unit(frame, schema)
+                st.plotly_chart(zone_figure(labelled, schema, label, unit, theme), width="stretch", theme=None)
                 st.caption("Admitted measurements for the selected unit")
-                display = frame[["timestamp_s", "signal"]].rename(columns={
+                if zoned:
+                    st.caption(f"{project_zones.describe_rule(schema)} "
+                               f"{QUALITY_ZONE_MODEL_CAPTION.format(label=label)}")
+                else:
+                    st.caption(QUALITY_NO_ZONES)
+                display = labelled[["timestamp_s", "signal"]].rename(columns={
                     "timestamp_s": "Time (s)", "signal": f"{label} ({unit})",
                 })
                 display["Record position"] = ["Start of record" if index == 0 else
                                                "Gap before" if gap else "Continuous"
-                                               for index, gap in enumerate(frame["gap_before"].fillna(False))]
+                                               for index, gap in enumerate(labelled["gap_before"])]
+                display["Zone"] = labelled["zone"].map(ZONE_NAMES)
                 with st.container(height=240, border=True, key=f"quality_table_{part}"):
                     st.table(display, hide_index=True, border="horizontal")
     ready, explanation = training_admission(features, split)

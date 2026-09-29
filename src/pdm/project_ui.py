@@ -10,14 +10,15 @@ import streamlit as st
 
 from pdm.cli import spawn_worker
 from pdm.data.prepare import processed_ready
-from pdm.data.project_prepare import load_snapshot, prepare_project
-from pdm.project_quality_ui import QUALITY_DESCRIPTION, render_quality
+from pdm.data.project_prepare import MANUAL_SPLIT_PROTOCOL, load_snapshot, prepare_project
+from pdm.project_quality_ui import PARTS, QUALITY_DESCRIPTION, part_summary, render_quality
 from pdm.project_results_ui import render_results
 from pdm.project_training_ui import render_training
 from pdm.projects import project_store
 from pdm.signal_training import list_project_runs
 from pdm.ui_copy import (
     CREATE_PROJECT_HELP,
+    IMPORT_CARD_EMPTY,
     IMPORT_FOLDER_HELP,
     IMPORT_RED_CONDITION_HELP,
     IMPORT_RED_LIMIT_HELP,
@@ -26,17 +27,22 @@ from pdm.ui_copy import (
     IMPORT_SIGNAL_UNIT_HELP,
     IMPORT_SOURCE_MODE_HELP,
     IMPORT_SPLIT_SEED_HELP,
+    IMPORT_SPLIT_SETTINGS_HELP,
     IMPORT_SPLIT_WEIGHTS_CAPTION,
     IMPORT_SUBMIT_HELP,
-    IMPORT_TEST_MODE_HELP,
+    IMPORT_TEST_FROM_HELP,
     IMPORT_TEST_WEIGHT_HELP,
     IMPORT_TRAIN_WEIGHT_HELP,
-    IMPORT_VALIDATION_MODE_HELP,
+    IMPORT_VALIDATION_FROM_HELP,
     IMPORT_VALIDATION_WEIGHT_HELP,
+    IMPORT_VIEW_HELP,
     IMPORT_YELLOW_LIMIT_HELP,
     PROJECT_NAME_HELP,
     PROJECT_SOURCE_FORMAT_HELP,
+    QUALITY_ADMITTED_ROWS_HELP,
     QUALITY_CONTINUE_HELP,
+    QUALITY_GAPS_HELP,
+    QUALITY_UNITS_HELP,
 )
 from pdm.ui_theme import empty_state, page_header, render_theme_control
 from pdm.worker import read_status, status_for_project, worker_alive
@@ -47,13 +53,17 @@ SOURCE_KINDS = {
     "xjtu_bearings": "XJTU-SY bearings",
     "hse_filters": "HSE filters",
 }
+HOLDOUT_SOURCES = {"Split from training": "auto", "Separate folder": "folder"}
+SPLIT_DEFAULTS = {"import_weight_train": 70, "import_weight_validation": 15, "import_weight_test": 15,
+                  "import_seed": 42}
 
 
 def _reset_project_session() -> None:
     for key in list(st.session_state):
         if str(key).startswith(("project_play:", "play_slider:", "play_toggle:", "play_reset:",
-                                 "result_run:", "result_unit:", "quality_unit_", "folder:", "path:",
-                                 "source_mode:", "validation_mode", "test_mode")):
+                                 "result_run:", "result_unit:", "quality_unit_", "quality_move", "folder:", "path:",
+                                 "source_mode:", "validation_mode", "test_mode", "quality_tab",
+                                 "import_weight_", "import_seed", "import_split_settings", "import_view:")):
             st.session_state.pop(key, None)
     st.session_state.pop("project_last_forecast", None)
     st.session_state.pop("result_active_pair", None)
@@ -138,25 +148,108 @@ def _materialize_source(store, project_id: str, source: dict | None,
     return source
 
 
-def _source_widgets(store, project: dict) -> tuple[dict | None, dict | None, dict | None, str, str]:
+def _auto_shares(weights: dict, val_mode: str, test_mode: str) -> dict[str, float]:
+    automatic = ["train"] + [name for name, mode in (("validation", val_mode), ("test", test_mode)) if mode == "auto"]
+    total = sum(float(weights[name]) for name in automatic)
+    return {name: float(weights[name]) / total for name in automatic}
+
+
+@st.cache_data(show_spinner=False)
+def _snapshot_summaries(project_id: str, snapshot_id: str) -> dict:
+    snapshot = load_snapshot(project_id, snapshot_id)
+    parts = {}
+    for part, _ in PARTS:
+        summary = part_summary(snapshot["features"], snapshot["split"], part)
+        parts[part] = {"units": summary["units"], "rows": summary["rows"], "gaps": summary["gaps"]}
+    return {"parts": parts, "protocol": str(snapshot["split"].get("protocol") or "")}
+
+
+def _open_quality_tab(name: str) -> None:
+    st.session_state["quality_tab"] = name
+    st.session_state["project_step"] = "Data Quality"
+
+
+def _card_counts(part: str, name: str, summaries: dict | None) -> None:
+    counts = (summaries or {}).get("parts", {}).get(part)
+    st.subheader(name, anchor=False)
+    with st.container(key=f"pdm-card-body-{part}"):
+        if not counts:
+            st.markdown("**No data yet**")
+            st.caption(IMPORT_CARD_EMPTY)
+            return
+        units, gaps, rows = st.columns([5, 5, 8], gap="small")
+        units.metric("Units", counts["units"], help=QUALITY_UNITS_HELP)
+        gaps.metric("Gaps", counts["gaps"], help=QUALITY_GAPS_HELP)
+        rows.metric("Admitted rows", counts["rows"], help=QUALITY_ADMITTED_ROWS_HELP)
+        st.button("View", key=f"import_view:{part}", type="tertiary", help=IMPORT_VIEW_HELP,
+                  on_click=_open_quality_tab, args=(name,), width="content")
+
+
+def _holdout_source(label: str, key: str, help_text: str) -> str:
+    if st.session_state.get(key) not in HOLDOUT_SOURCES:
+        st.session_state.pop(key, None)
+    return HOLDOUT_SOURCES[st.selectbox(f"{label} data from", list(HOLDOUT_SOURCES), key=key, help=help_text)]
+
+
+def _import_cards(store, project: dict, summaries: dict | None
+                  ) -> tuple[dict | None, dict | None, dict | None, str, str]:
     pid = project["project_id"]
     kind = project["source_kind"]
-    with st.container(border=True, key="pdm-import-training"):
-        st.subheader("Training source", anchor=False)
-        st.caption(f"Source: {SOURCE_KINDS.get(kind, kind)} · Validation and Testing can each be automatic or a separate folder.")
-        primary = _source_input(store, pid, "Training", f"{pid}:primary")
-    with st.container(border=True, key="pdm-import-holdout"):
-        st.subheader("Validation and Testing", anchor=False)
-        c1, c2 = st.columns(2)
-        with c1:
-            val_mode = st.radio("Validation", ["Automatic holdout", "Separate folder"], key="validation_mode",
-                                help=IMPORT_VALIDATION_MODE_HELP)
-            validation = _source_input(store, pid, "Validation", f"{pid}:validation") if val_mode == "Separate folder" else None
-        with c2:
-            test_mode = st.radio("Testing", ["Automatic holdout", "Separate folder"], key="test_mode",
-                                 help=IMPORT_TEST_MODE_HELP)
-            test = _source_input(store, pid, "Testing", f"{pid}:testing") if test_mode == "Separate folder" else None
-    return primary, validation, test, "folder" if val_mode == "Separate folder" else "auto", "folder" if test_mode == "Separate folder" else "auto"
+    names = dict(PARTS)
+    weights = {part: st.session_state.get(f"import_weight_{part}", SPLIT_DEFAULTS[f"import_weight_{part}"])
+               for part in names}
+    columns = st.columns(3, gap="medium")
+    with columns[0], st.container(border=True, key="pdm-import-card-train"):
+        _card_counts("train", names["train"], summaries)
+        with st.container(key="pdm-card-source-train"):
+            st.caption(f"Source: {SOURCE_KINDS.get(kind, kind)}")
+            primary = _source_input(store, pid, "Training", f"{pid}:primary")
+    with columns[1], st.container(border=True, key="pdm-import-card-validation"):
+        _card_counts("validation", names["validation"], summaries)
+        with st.container(key="pdm-card-source-validation"):
+            val_mode = _holdout_source("Validation", "validation_mode", IMPORT_VALIDATION_FROM_HELP)
+            validation_slot = st.container()
+    with columns[2], st.container(border=True, key="pdm-import-card-test"):
+        _card_counts("test", names["test"], summaries)
+        with st.container(key="pdm-card-source-test"):
+            test_mode = _holdout_source("Testing", "test_mode", IMPORT_TEST_FROM_HELP)
+            hse_test_auto = kind == "hse_filters" and test_mode == "auto"
+            shares = _auto_shares(weights, val_mode, "folder" if hse_test_auto else test_mode)
+            if hse_test_auto:
+                st.caption("Official HSE test units (Test_Data_CSV.csv) in the Training folder stay in Testing.")
+            elif test_mode == "auto":
+                st.caption("Automatically split from training data")
+                st.caption(f"{round(100 * shares['test'])}% of the training pool")
+            test = _source_input(store, pid, "Testing", f"{pid}:testing") if test_mode == "folder" else None
+    with validation_slot:
+        if val_mode == "auto":
+            st.caption("Automatically split from training data")
+            st.caption(f"{round(100 * shares['validation'])}% of the training pool")
+            validation = None
+        else:
+            validation = _source_input(store, pid, "Validation", f"{pid}:validation")
+    return primary, validation, test, val_mode, test_mode
+
+
+def _split_settings(any_auto: bool) -> tuple[int, int, int, int]:
+    values = {key: st.session_state.get(key, default) for key, default in SPLIT_DEFAULTS.items()}
+    disabled = not any_auto
+    c1, c2 = st.columns([1, 4], vertical_alignment="center")
+    c2.caption(f"{values['import_weight_train']} / {values['import_weight_validation']} / "
+               f"{values['import_weight_test']} · seed {values['import_seed']}")
+    if disabled:
+        st.caption("Both holdouts use separate folders; split settings do not apply.")
+    with c1.popover("Split settings", key="import_split_settings", help=IMPORT_SPLIT_SETTINGS_HELP):
+        st.caption(IMPORT_SPLIT_WEIGHTS_CAPTION)
+        train_pct = st.number_input("Train weight (%)", min_value=1, max_value=98, value=70, disabled=disabled,
+                                    key="import_weight_train", help=IMPORT_TRAIN_WEIGHT_HELP)
+        val_pct = st.number_input("Validation weight (%)", min_value=1, max_value=98, value=15, disabled=disabled,
+                                  key="import_weight_validation", help=IMPORT_VALIDATION_WEIGHT_HELP)
+        test_pct = st.number_input("Test weight (%)", min_value=1, max_value=98, value=15, disabled=disabled,
+                                   key="import_weight_test", help=IMPORT_TEST_WEIGHT_HELP)
+        seed = st.number_input("Split seed", min_value=0, max_value=2**31 - 1, value=42, disabled=disabled,
+                               key="import_seed", help=IMPORT_SPLIT_SEED_HELP)
+    return train_pct, val_pct, test_pct, seed
 
 
 def _valid_thresholds(direction: str, yellow: float, red: float) -> None:
@@ -191,18 +284,20 @@ def _render_import(store, project: dict) -> None:
     page_header("Import data", "Choose sensor files by folder. For very large data, enter a folder path on this computer.")
     kind = project["source_kind"]
     _import_status(pid)
-    primary, validation, test, val_mode, test_mode = _source_widgets(store, project)
-    with st.expander("Automatic split weights · 70 / 15 / 15", expanded=False):
-        st.caption(IMPORT_SPLIT_WEIGHTS_CAPTION)
-        c1, c2, c3 = st.columns(3)
-        train_pct = c1.number_input("Train weight (%)", min_value=1, max_value=98, value=70,
-                                    help=IMPORT_TRAIN_WEIGHT_HELP)
-        val_pct = c2.number_input("Validation weight (%)", min_value=1, max_value=98, value=15,
-                                  help=IMPORT_VALIDATION_WEIGHT_HELP)
-        test_pct = c3.number_input("Test weight (%)", min_value=1, max_value=98, value=15,
-                                   help=IMPORT_TEST_WEIGHT_HELP)
-        seed = st.number_input("Split seed", min_value=0, max_value=2**31 - 1, value=42,
-                               help=IMPORT_SPLIT_SEED_HELP)
+    summaries, load_error = None, None
+    if project.get("state") == "ready" and project.get("active_snapshot_id"):
+        try:
+            summaries = _snapshot_summaries(pid, str(project["active_snapshot_id"]))
+        except Exception as exc:
+            load_error = str(exc)
+    if summaries:
+        st.caption("Counts are the saved snapshot.")
+    primary, validation, test, val_mode, test_mode = _import_cards(store, project, summaries)
+    if load_error:
+        st.caption(f"Saved data could not be read: {load_error}")
+    if summaries and summaries.get("protocol") == MANUAL_SPLIT_PROTOCOL:
+        st.caption("Current sets include manual moves from Data Quality. Importing again creates a fresh split.")
+    train_pct, val_pct, test_pct, seed = _split_settings("auto" in {val_mode, test_mode})
     with st.container(border=True, key="pdm-import-signal"):
         st.subheader("Signal and limits", anchor=False)
         if kind == "generic_sensor_csv":
@@ -417,7 +512,7 @@ def main() -> None:
                     if importing_current:
                         st.caption("Showing the previous saved data while the replacement import is checked.")
                 snapshot = load_snapshot(selected_id)
-                ready = render_quality(snapshot, theme)
+                ready = render_quality(snapshot, theme, storage_mode=selected.get("storage_mode", "owned"))
                 if ready and st.button("Continue to Training", type="primary", disabled=importing_current,
                                        help=QUALITY_CONTINUE_HELP):
                     st.session_state["project_step"] = "Training"

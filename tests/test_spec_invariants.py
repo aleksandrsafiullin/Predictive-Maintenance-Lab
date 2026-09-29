@@ -226,6 +226,32 @@ def test_split_duplicate_unit_ids_rejected(tiny_bearing_tables):
         assert_split_coverage(dup_table, split_ok)
 
 
+def test_moved_project_snapshot_keeps_whole_unit_split(tmp_path, monkeypatch):
+    from pdm.data.project_prepare import load_snapshot, move_units
+    from tests.project_contract import make_contract_snapshot
+
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_args, **_kwargs: False)
+    store, project, parent = make_contract_snapshot(tmp_path / "projects")
+    pid = project["project_id"]
+    moved = sorted(parent["split"]["train"])[:2]
+    ref = move_units(pid, moved, "test", expected_snapshot_id=parent["snapshot_id"], store=store)
+    loaded = load_snapshot(pid, ref["snapshot_id"], store=store)
+    split = loaded["split"]
+    groups = ("train", "validation", "test")
+    for i, a in enumerate(groups):
+        for b in groups[i + 1:]:
+            assert not set(split[a]) & set(split[b])
+    all_units = set(loaded["units"]["unit_id"].astype(str))
+    assert set().union(*(split[name] for name in groups)) == all_units
+    membership = {uid: name for name in groups for uid in split[name]}
+    rows = loaded["features"]["unit_id"].astype(str)
+    assert rows.map(membership).notna().all()
+    for name in groups:
+        assert int(rows.isin(split[name]).sum()) == loaded["report"]["by_split"][name]["rows"]
+    assert all(membership[uid] == "test" for uid in moved)
+    assert_split_coverage(loaded["units"].copy(), split)
+
+
 def test_filters_unassigned_rejected(tiny_filter_tables):
     _, units = tiny_filter_tables
     split = filters_split(units)
@@ -4274,3 +4300,25 @@ def test_replay_log_has_no_future_rows():
     other = filter_replay_alert_log(alerts, unit_id="B", replay_time_s=t)
     assert set(other["unit_id"].astype(str)) == {"B"}
     assert 30.0 not in set(other["timestamp_s"])
+
+
+@pytest.mark.parametrize("thresholds", [
+    {"mode": "absolute", "direction": "above", "yellow": 0.4, "red": 0.8},
+    {"mode": "initial_baseline_multiple", "direction": "above", "baseline_n": 3},
+])
+def test_project_zone_labels_ignore_truth_and_split_columns(thresholds):
+    from pdm.project_zones import label_unit
+
+    # Synthetic unit; labels may read only the observed signal stream.
+    unit = pd.DataFrame({
+        "unit_id": ["U"] * 6, "timestamp_s": np.arange(6, dtype=float) * 60.0,
+        "signal": [0.3, 0.35, 0.5, 0.9, 0.2, 1.1],
+        "gap_before": [True, False, False, True, False, False],
+    })
+    schema = {"thresholds": thresholds}
+    noisy = unit.assign(rul=np.arange(6)[::-1] * 60.0, event_time_s=360.0, event_observed=1,
+                        split="test", horizontal_rms=9.0)
+    pd.testing.assert_frame_equal(label_unit(unit, schema), label_unit(noisy, schema))
+    noisy["rul"] = 0.0
+    noisy["split"] = "train"
+    pd.testing.assert_frame_equal(label_unit(unit, schema), label_unit(noisy, schema))

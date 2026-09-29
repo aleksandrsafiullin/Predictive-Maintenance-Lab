@@ -35,15 +35,26 @@ body:has(.pdm-project-workflow) [data-testid="stHeaderActionElements"] {display:
 /* Page header description and empty-state cards (design-spec §3, §5). */
 body:has(.brain-lab-shell) [data-testid="stMarkdownContainer"] p.pdm-page-desc {font-size: 15px; line-height: 22px; font-weight: 400; color: var(--pdm-text-secondary); max-width: 720px; margin: 0 0 16px;}
 /* Streamlit 1.63 draws a bordered container on the keyed stVerticalBlock itself (no BorderWrapper). */
-body:has(.brain-lab-shell) :is([class*="st-key-pdm-empty-"], [class*="st-key-pdm-import-"], .st-key-pdm-project-list) {background: var(--pdm-surface); border: 1px solid var(--pdm-border); border-radius: 12px; padding: 24px;}
-body:has(.brain-lab-shell[data-theme="light"]) :is([class*="st-key-pdm-empty-"], [class*="st-key-pdm-import-"], .st-key-pdm-project-list) {box-shadow: 0 1px 2px color-mix(in srgb, var(--pdm-text) 4%, transparent);}
+body:has(.brain-lab-shell) :is([class*="st-key-pdm-empty-"], [class*="st-key-pdm-import-card-"], .st-key-pdm-import-signal, .st-key-pdm-project-list) {background: var(--pdm-surface); border: 1px solid var(--pdm-border); border-radius: 12px; padding: 24px;}
+body:has(.brain-lab-shell[data-theme="light"]) :is([class*="st-key-pdm-empty-"], [class*="st-key-pdm-import-card-"], .st-key-pdm-import-signal, .st-key-pdm-project-list) {box-shadow: 0 1px 2px color-mix(in srgb, var(--pdm-text) 4%, transparent);}
 body:has(.brain-lab-shell) [data-testid="stForm"] [class*="st-key-pdm-train-"] {background: transparent; border: 0; border-radius: 0; padding: 0; box-shadow: none;}
 body:has(.brain-lab-shell) [data-testid="stForm"] [data-testid="stLayoutWrapper"]:has(> [class*="st-key-pdm-train-"]) + [data-testid="stLayoutWrapper"] > [class*="st-key-pdm-train-"] {border-top: 1px solid var(--pdm-border-soft); padding-top: 16px;}
 body:has(.brain-lab-shell) [class*="st-key-pdm-empty-"] {gap: 8px;}
 body:has(.brain-lab-shell) [class*="st-key-pdm-empty-"] :is(h2, h3) {font-size: 17px; line-height: 24px; font-weight: 600; letter-spacing: -.01em; color: var(--pdm-text); padding: 0;}
 body:has(.brain-lab-shell) [class*="st-key-pdm-empty-"] [data-testid="stMarkdownContainer"] p {font-size: 14px; line-height: 21px; font-weight: 400; color: var(--pdm-text-secondary);}
-body:has(.brain-lab-shell) [class*="st-key-pdm-import-"] :is(h2, h3),
-body:has(.brain-lab-shell) [class*="st-key-pdm-train-"] :is(h2, h3) {padding: 0;}
+body:has(.brain-lab-shell) :is([class*="st-key-pdm-import-card-"], .st-key-pdm-import-signal, [class*="st-key-pdm-train-"]) :is(h2, h3) {padding: 0;}
+body:has(.brain-lab-shell) [data-testid="stColumn"]:has([class*="st-key-pdm-import-card-"]) {display: flex; flex-direction: column;}
+body:has(.brain-lab-shell) [data-testid="stColumn"]:has([class*="st-key-pdm-import-card-"]) > [data-testid="stVerticalBlock"] {flex: 1 1 auto; align-self: stretch; height: 100%; display: flex; flex-direction: column;}
+body:has(.brain-lab-shell) [data-testid="stColumn"]:has([class*="st-key-pdm-import-card-"]) [data-testid="stLayoutWrapper"]:has(> [class*="st-key-pdm-import-card-"]) {flex: 1 1 auto; display: flex; flex-direction: column; height: 100%;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] {flex: 1 1 auto; height: auto; min-height: 100%; padding: 0 0 14px; gap: 0;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] > div:first-child {background: var(--pdm-control); border-bottom: 1px solid var(--pdm-border); border-radius: 11px 11px 0 0; padding: 8px 12px;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] > div:first-child :is(h2, h3) {font-size: 13px; line-height: 18px; font-weight: 600; margin: 0; text-align: center;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-body-"] {padding: 12px 14px 2px;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-body-"] > [data-testid="stElementContainer"]:has([data-testid="stButton"]) {width: 100%; display: flex; justify-content: center;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] > [data-testid="stLayoutWrapper"]:has([class*="st-key-pdm-card-source-"]) {margin-top: auto;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-body-"] [data-testid="stButton"] button {min-height: 28px; height: 28px; padding: 0 8px; background: transparent; border-color: transparent; color: var(--pdm-accent-text);}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-body-"] [data-testid="stButton"] button p {font-size: 13px; line-height: 18px; color: var(--pdm-accent-text);}
+body:has(.brain-lab-shell) [class*="st-key-pdm-card-source-"] {margin-top: auto; padding: 10px 14px 0; border-top: 1px solid var(--pdm-border);}
 body:has(.brain-lab-shell) [data-testid="stLayoutWrapper"]:has(> [class*="st-key-pdm-project-row-"]) + [data-testid="stLayoutWrapper"] > [class*="st-key-pdm-project-row-"] {border-top: 1px solid var(--pdm-border-soft); padding-top: 12px;}
 
 /* Sidebar group labels (captions outside expanders) and nav rows. */
@@ -335,6 +346,11 @@ body:has(.brain-lab-shell) [data-testid="stMetricLabel"] p {color:var(--pdm-mute
 body:has(.brain-lab-shell) [data-testid="stMetricValue"],
 body:has(.brain-lab-shell) [data-testid="stMetricValue"] :is(div, p) {color:var(--pdm-text); font-size:28px; line-height:32px; font-weight:600; letter-spacing:-.02em; font-variant-numeric:tabular-nums;}
 body:has(.brain-lab-shell) [data-testid="stMetricDelta"] {font-size:12px; line-height:16px;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] [data-testid="stMetric"] {background:transparent; border:0; border-radius:0; padding:0; box-shadow:none;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] [data-testid="stMetricLabel"],
+body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] [data-testid="stMetricLabel"] p {white-space:nowrap; overflow:visible; text-overflow:clip; height:auto; font-size:11px; line-height:14px;}
+body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] [data-testid="stMetricValue"],
+body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] [data-testid="stMetricValue"] :is(div, p) {font-size:22px; line-height:26px;}
 body:has(.brain-lab-shell) [data-testid="stPlotlyChart"] {background:var(--pdm-surface); border:1px solid var(--pdm-border); border-radius:12px; overflow:hidden;}
 body:has(.brain-lab-shell) [data-testid="stHorizontalBlock"] {align-items:stretch;}
 body:has(.brain-lab-shell) [data-testid="stVerticalBlockBorderWrapper"] {border:1px solid var(--pdm-border); background:var(--pdm-surface); border-radius:12px;}

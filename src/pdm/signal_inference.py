@@ -9,45 +9,10 @@ import torch
 
 from pdm.data.project_prepare import load_snapshot
 from pdm.models.signal_recurrent import SignalRecurrent
+from pdm.project_zones import is_beyond, resolve_thresholds
 from pdm.signal_training import _predict, _segments, load_signal_run
 
-
-def _resolved_thresholds(schema: dict, prefix) -> dict:
-    rule = dict(schema.get("thresholds") or {})
-    mode = rule.get("mode", "absolute")
-    direction = rule.get("direction", "above")
-    if direction not in {"above", "below"}:
-        return {"mode": mode, "direction": direction, "yellow": None, "red": None,
-                "status": "unavailable", "reason": "Unsupported threshold direction"}
-    if mode == "absolute":
-        try:
-            red = float(rule["red"])
-        except (KeyError, TypeError, ValueError):
-            red = None
-        try:
-            yellow = float(rule["yellow"]) if rule.get("yellow") is not None else None
-        except (TypeError, ValueError):
-            yellow = None
-        if red is None or not np.isfinite(red) or (yellow is not None and not np.isfinite(yellow)):
-            return {"mode": mode, "direction": direction, "yellow": None, "red": None,
-                    "status": "unavailable", "reason": "No valid saved signal thresholds"}
-        return {"mode": mode, "direction": direction, "yellow": yellow, "red": red,
-                "status": "available", "reason": None}
-    if mode == "initial_baseline_multiple":
-        n = int(rule.get("baseline_n", 5))
-        if len(prefix) < n:
-            return {"mode": mode, "direction": direction, "yellow": None, "red": None,
-                    "status": "unavailable", "reason": "Waiting for the initial causal baseline"}
-        first = prefix.iloc[:n].signal.to_numpy(float)
-        baseline = float(np.median(first))
-        yellow = max(baseline + float(rule.get("onset_sigma", 3.0)) * float(np.std(first)),
-                     float(rule.get("onset_ratio", 1.25)) * baseline)
-        red = float(rule.get("red_ratio", 2.0)) * baseline
-        return {"mode": mode, "direction": direction, "yellow": yellow, "red": red,
-                "status": "available", "reason": None, "baseline": baseline,
-                "baseline_n": n}
-    return {"mode": mode, "direction": direction, "yellow": None, "red": None,
-            "status": "unavailable", "reason": "Unsupported saved threshold rule"}
+_resolved_thresholds = resolve_thresholds
 
 
 @lru_cache(maxsize=12)
@@ -113,8 +78,8 @@ def forecast_prefix(project_id: str, run_id: str, unit_id: str, as_of_s: float) 
     result["status"] = "available" if points else "unavailable"
     result["reason"] = None if points else "No supported forecast points"
     current = float(prefix.signal.iloc[-1])
-    already_red = (current >= threshold["red"] if threshold["direction"] == "above"
-                   else current <= threshold["red"]) if threshold["status"] == "available" else False
+    already_red = (bool(is_beyond(current, threshold["red"], threshold["direction"]))
+                   if threshold["status"] == "available" else False)
     if already_red:
         result["crossing"] = {"status": "already_red", "time_s": issued}
     elif threshold["status"] != "available":
@@ -123,8 +88,7 @@ def forecast_prefix(project_id: str, run_id: str, unit_id: str, as_of_s: float) 
         result["crossing"] = {"status": "unavailable", "time_s": None}
     else:
         red = threshold["red"]
-        hit = next((point for point in points if (point["value"] >= red if threshold["direction"] == "above"
-                                                  else point["value"] <= red)), None)
+        hit = next((point for point in points if is_beyond(point["value"], red, threshold["direction"])), None)
         result["crossing"] = {"status": "predicted" if hit else "none_within_horizon",
                               "time_s": hit["target_time_s"] if hit else None}
     return result

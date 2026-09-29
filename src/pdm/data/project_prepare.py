@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 import numpy as np
 import pandas as pd
@@ -26,6 +26,13 @@ SNAPSHOT_FILES = (
     "data_report.json",
     "feature_schema.json",
 )
+SPLIT_NAMES = ("train", "validation", "test")
+SPLIT_LABELS = {"train": "Training Data", "validation": "Validation Data", "test": "Testing Data"}
+MANUAL_SPLIT_PROTOCOL = "whole_unit_project_v1_manual"
+LINKED_LEGACY_MOVE_ERROR = ("This project uses the published split of its source dataset. "
+                            "Create a new project to change the split.")
+JOB_ACTIVE_MOVE_ERROR = "Wait for the current job to finish before changing sets."
+STALE_SNAPSHOT_ERROR = "The data changed since this page loaded. Reload Data Quality and try again."
 
 
 def allocate_project_split(units: pd.DataFrame, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -364,8 +371,49 @@ def prepare_project(
     assert_split_coverage(units.copy(), split)
     if should_stop and should_stop():
         raise InterruptedError("Project job cancelled")
+
+    def write_data(staging: Path) -> None:
+        features.to_parquet(staging / "features.parquet", index=False)
+        units.to_parquet(staging / "units.parquet", index=False)
+        atomic_write_json(staging / "feature_schema.json", schema)
+
+    report = {
+        "project_id": project_id, "snapshot_id": None,
+        "source_kind": project["source_kind"], "source_digest": source_digest,
+        "n_units": len(units), "n_rows": len(features),
+        "split_counts": split["realized_counts"], "by_split": _by_split(features, units, split),
+        "quality": quality,
+        "outcome_semantics": "unlabelled_observations" if project["source_kind"] == "generic_sensor_csv" else "source_specific",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    base = store.project_path(project_id) / "snapshots"
+    staging, snapshot_id, payload = _stage_snapshot(
+        base, project_id, write_data=write_data, split=split, report=report,
+        fingerprint={"source_digest": source_digest, "source_manifest_id": source_manifest_id},
+    )
+    try:
+        if should_stop and should_stop():
+            raise InterruptedError("Project job cancelled")
+        destination = store.snapshot_path(project_id, snapshot_id)
+    except Exception:
+        shutil.rmtree(staging)
+        raise
+
+    def activate() -> None:
+        if should_stop and should_stop():
+            raise InterruptedError("Project job cancelled")
+        store.update(project_id, source_manifest=manifest, active_snapshot_id=snapshot_id,
+                     selected_run_id=None, state="ready")
+
+    _publish_snapshot(staging, destination, activate)
+    return {"project_id": project_id, "snapshot_id": snapshot_id, "dir": destination,
+            "split": split, "report": payload["report"], "schema": schema,
+            "fingerprint": payload["fingerprint"]}
+
+
+def _by_split(features: pd.DataFrame, units: pd.DataFrame, split: Mapping[str, Any]) -> dict[str, dict[str, int]]:
     by_split = {}
-    for group_name in ("train", "validation", "test"):
+    for group_name in SPLIT_NAMES:
         selected = units[units["unit_id"].astype(str).isin(split[group_name])]
         by_split[group_name] = {
             "units": len(selected),
@@ -373,48 +421,186 @@ def prepare_project(
             "rejected_signal_rows": int(selected.get("rejected_signal_rows", pd.Series(dtype=int)).sum()),
             "gap_boundaries": int(selected.get("gap_boundaries", pd.Series(dtype=int)).sum()),
         }
+    return by_split
+
+
+def _stage_snapshot(
+    base: Path, project_id: str, *, write_data: Callable[[Path], None],
+    split: Mapping[str, Any], report: Mapping[str, Any], fingerprint: Mapping[str, Any],
+) -> tuple[Path, str, dict[str, Any]]:
+    """Write a complete snapshot into a private staging dir under ``base``.
+
+    Takes no registry lock. On failure the staging dir is removed.
+    ``write_data`` writes features.parquet, units.parquet and feature_schema.json.
+    """
     snapshot_id = uuid.uuid4().hex
-    base = store.project_path(project_id) / "snapshots"
     staging = Path(tempfile.mkdtemp(prefix=".snapshot-", dir=base))
-    destination = store.snapshot_path(project_id, snapshot_id)
     try:
-        features.to_parquet(staging / "features.parquet", index=False)
-        units.to_parquet(staging / "units.parquet", index=False)
+        write_data(staging)
         atomic_write_json(staging / "split.json", split)
-        atomic_write_json(staging / "feature_schema.json", schema)
-        report = {
-            "project_id": project_id, "snapshot_id": snapshot_id,
-            "source_kind": project["source_kind"], "source_digest": source_digest,
-            "n_units": len(units), "n_rows": len(features),
-            "split_counts": split["realized_counts"], "by_split": by_split, "quality": quality,
-            "outcome_semantics": "unlabelled_observations" if project["source_kind"] == "generic_sensor_csv" else "source_specific",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        atomic_write_json(staging / "data_report.json", report)
+        full_report = {**report, "snapshot_id": snapshot_id}
+        atomic_write_json(staging / "data_report.json", full_report)
         hashes = {filename: sha256_file(staging / filename) for filename in SNAPSHOT_FILES}
-        fingerprint = {
+        full_fingerprint = {
             "schema_version": 1, "project_id": project_id, "snapshot_id": snapshot_id,
-            "source_digest": source_digest, "source_manifest_id": source_manifest_id,
-            "split_hash": split_hash(split), "file_hashes": hashes,
+            **fingerprint, "split_hash": split_hash(split), "file_hashes": hashes,
         }
-        atomic_write_json(staging / "processed_fingerprint.json", fingerprint)
-        if should_stop and should_stop():
-            raise InterruptedError("Project job cancelled")
+        atomic_write_json(staging / "processed_fingerprint.json", full_fingerprint)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return staging, snapshot_id, {"report": full_report, "fingerprint": full_fingerprint}
+
+
+def _publish_snapshot(staging: Path, destination: Path, activate: Callable[[], Any]) -> None:
+    """Rename a staged snapshot into place, then run ``activate``.
+
+    Never takes or assumes the registry lock; ``activate`` decides how the
+    project record is written. Any failure leaves neither dir behind.
+    """
+    try:
         staging.rename(destination)
-        try:
-            if should_stop and should_stop():
-                raise InterruptedError("Project job cancelled")
-            store.update(project_id, source_manifest=manifest, active_snapshot_id=snapshot_id,
-                         selected_run_id=None, state="ready")
-        except Exception:
-            shutil.rmtree(destination)
-            raise
-    except Exception:
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    try:
+        activate()
+    except BaseException:
+        shutil.rmtree(destination)
+        raise
+
+
+def _copy_snapshot_file(source: Path, target: Path) -> None:
+    shutil.copyfile(source, target)
+
+
+def _fixed_test_units(snapshot: Mapping[str, Any]) -> list[str]:
+    units = snapshot.get("units")
+    if units is None or "source_group" not in getattr(units, "columns", ()):
+        return []
+    return sorted(units.loc[units["source_group"].astype(str).eq("author_test"), "unit_id"].astype(str).tolist())
+
+
+def preview_move(snapshot: Mapping[str, Any], unit_ids, destination: str) -> dict[str, Any]:
+    """Validate a whole-unit move against a snapshot without any I/O."""
+    if destination not in SPLIT_NAMES:
+        raise ValueError(f"Unknown set: {destination}")
+    split = snapshot["split"]
+    current = {uid: name for name in SPLIT_NAMES for uid in map(str, split[name])}
+    counts = {name: len(split[name]) for name in SPLIT_NAMES}
+    fixed = _fixed_test_units(snapshot)
+    moved = list(dict.fromkeys(map(str, unit_ids or ())))
+
+    def result(problem: str | None, projected: dict[str, int] | None = None) -> dict[str, Any]:
+        return {"counts": projected or counts, "problem": problem, "fixed_units": fixed}
+
+    if not moved:
+        return result("Choose at least one unit.")
+    unknown = next((uid for uid in moved if uid not in current), None)
+    if unknown is not None:
+        return result(f"Unknown unit: {unknown}.")
+    already = next((uid for uid in moved if current[uid] == destination), None)
+    if already is not None:
+        return result(f"{already} is already in {SPLIT_LABELS[destination]}.")
+    if destination != "test" and set(moved) & set(fixed):
+        return result("Official HSE test units stay in Testing Data.")
+    projected = dict(counts)
+    for uid in moved:
+        projected[current[uid]] -= 1
+        projected[destination] += 1
+    empty = next((name for name in SPLIT_NAMES if projected[name] == 0), None)
+    if empty is not None:
+        return result(f"{SPLIT_LABELS[empty]} would have no units. Keep at least one unit in each set.", projected)
+    return result(None, projected)
+
+
+def move_units(
+    project_id: str, unit_ids, destination: Literal["train", "validation", "test"], *,
+    expected_snapshot_id: str, store: ProjectStore | None = None,
+) -> dict[str, Any]:
+    """Move whole physical units by publishing a new immutable snapshot.
+
+    The parent snapshot and its runs are left untouched. Staging happens
+    outside the registry lock; the lock covers only the job re-check, the
+    stale-snapshot compare, the rename and the registry write.
+    """
+    from pdm.worker import heavy_job_active
+
+    store = store or project_store()
+    _safe_id(expected_snapshot_id, "snapshot ID")
+    project = store.get(project_id)
+    if project["storage_mode"] != "owned":
+        raise ValueError(LINKED_LEGACY_MOVE_ERROR)
+    if project["active_snapshot_id"] != expected_snapshot_id:
+        raise ValueError(STALE_SNAPSHOT_ERROR)
+    if heavy_job_active():
+        raise RuntimeError(JOB_ACTIVE_MOVE_ERROR)
+    parent = load_snapshot(project_id, expected_snapshot_id, store=store)
+    problem = preview_move(parent, unit_ids, destination)["problem"]
+    if problem:
+        raise ValueError(problem)
+
+    moved = sorted(set(map(str, unit_ids)))
+    old_split = parent["split"]
+    origin = {uid: name for name in SPLIT_NAMES for uid in map(str, old_split[name]) if uid in moved}
+    split = dict(old_split)
+    for name in SPLIT_NAMES:
+        kept = [uid for uid in map(str, old_split[name]) if uid not in origin]
+        split[name] = sorted(kept + moved) if name == destination else sorted(kept)
+    now = datetime.now(timezone.utc).isoformat()
+    split.update(
+        protocol=MANUAL_SPLIT_PROTOCOL,
+        parent_snapshot_id=expected_snapshot_id,
+        realized_counts={name: len(split[name]) for name in SPLIT_NAMES},
+        manual_moves=[*old_split.get("manual_moves", []),
+                      {"unit_ids": moved, "from": {uid: origin[uid] for uid in moved},
+                       "to": destination, "at": now}],
+    )
+    assert_split_coverage(parent["units"].copy(), split)
+    report = {
+        **parent["report"], "snapshot_id": None, "parent_snapshot_id": expected_snapshot_id,
+        "split_counts": split["realized_counts"],
+        "by_split": _by_split(parent["features"], parent["units"], split),
+        "created_at": now,
+    }
+    old_fingerprint = parent["fingerprint"]
+    copied = ("features.parquet", "units.parquet", "feature_schema.json")
+
+    def write_data(staging: Path) -> None:
+        for filename in copied:
+            _copy_snapshot_file(parent["dir"] / filename, staging / filename)
+
+    base = store.project_path(project_id) / "snapshots"
+    staging, snapshot_id, payload = _stage_snapshot(
+        base, project_id, write_data=write_data, split=split, report=report,
+        fingerprint={"source_digest": old_fingerprint.get("source_digest"),
+                     "source_manifest_id": old_fingerprint.get("source_manifest_id"),
+                     "parent_snapshot_id": expected_snapshot_id},
+    )
+    try:
+        new_hashes = payload["fingerprint"]["file_hashes"]
+        if any(new_hashes[name] != old_fingerprint["file_hashes"][name] for name in copied):
+            raise ValueError("Snapshot copy does not match its parent")
+        destination = store.snapshot_path(project_id, snapshot_id)
+        with store.launch_lock():
+            if heavy_job_active():
+                raise RuntimeError(JOB_ACTIVE_MOVE_ERROR)
+            registry = store._load()
+            record = store._entry(registry, project_id)
+            if record.get("storage_mode") != "owned":
+                raise ValueError(LINKED_LEGACY_MOVE_ERROR)
+            if record.get("active_snapshot_id") != expected_snapshot_id:
+                raise ValueError(STALE_SNAPSHOT_ERROR)
+            _publish_snapshot(staging, destination,
+                              lambda: store._activate_snapshot_locked(registry, project_id, snapshot_id))
+    except BaseException:
         if staging.exists():
             shutil.rmtree(staging)
         raise
-    return {"project_id": project_id, "snapshot_id": snapshot_id, "dir": destination,
-            "split": split, "report": report, "schema": schema, "fingerprint": fingerprint}
+    return {"project_id": project_id, "snapshot_id": snapshot_id,
+            "parent_snapshot_id": expected_snapshot_id, "dir": destination, "split": split,
+            "report": payload["report"], "schema": parent["schema"],
+            "fingerprint": payload["fingerprint"]}
 
 
 def load_snapshot(

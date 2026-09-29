@@ -8,7 +8,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from pdm.project_chart_style import style_signal_chart
+from pdm.project_chart_style import add_threshold_layers, style_signal_chart
 from pdm.projects import project_store
 from pdm.signal_inference import forecast_prefix
 from pdm.signal_training import list_project_runs, load_signal_run
@@ -35,7 +35,7 @@ def replay_figure(result: dict, schema: dict, theme: str = "dark") -> go.Figure:
     unit = str(schema.get("signal_unit") or "")
     t = tokens(theme)
     actual_color, forecast_color = t["series_observed"], t["series_forecast"]
-    yellow_color, red_color = t["zone_yellow"], t["zone_red"]
+    red_color = t["zone_red"]
     observed = _records(result.get("observed_prefix"))
     all_points = _records(result.get("points"))
     points = [row for row in all_points if row.get("value") is not None]
@@ -65,29 +65,8 @@ def replay_figure(result: dict, schema: dict, theme: str = "dark") -> go.Figure:
                                      line={"color": t["series_band_line"], "width": 1},
                                      name="Pointwise lower quantile", connectgaps=False))
     thresholds = result.get("thresholds") or schema.get("thresholds") or {}
-    if isinstance(thresholds, Mapping):
-        yellow, red = thresholds.get("yellow"), thresholds.get("red")
-        if thresholds.get("status", "available") == "available" and yellow is not None and red is not None:
-            values = [float(v) for v in observed_y if v is not None] + [float(row["value"]) for row in points]
-            low = min([float(yellow), float(red), *values])
-            high = max([float(yellow), float(red), *values])
-            padding = max((high - low) * 0.12, 0.01)
-            yellow_fill, red_fill = t["zone_yellow_fill"], t["zone_red_fill"]
-            if thresholds.get("direction", "above") == "below":
-                fig.add_hrect(y0=low - padding, y1=float(red), fillcolor=red_fill, line_width=0)
-                fig.add_hrect(y0=float(red), y1=float(yellow), fillcolor=yellow_fill, line_width=0)
-            else:
-                fig.add_hrect(y0=float(yellow), y1=float(red), fillcolor=yellow_fill, line_width=0)
-                fig.add_hrect(y0=float(red), y1=high + padding, fillcolor=red_fill, line_width=0)
-        for key, color in (("yellow", yellow_color), ("red", red_color)):
-            trace = thresholds.get(f"{key}_trace")
-            if isinstance(trace, list) and trace:
-                fig.add_trace(go.Scatter(x=[r.get("timestamp_s") for r in trace],
-                                         y=[r.get("value") for r in trace], mode="lines",
-                                         line={"color": color, "width": 1, "dash": "dash", "shape": "hv"}, name=f"{key.title()} limit"))
-            elif thresholds.get("status", "available") == "available" and thresholds.get(key) is not None:
-                fig.add_hline(y=float(thresholds[key]), line_color=color, line_width=1, line_dash="dash",
-                              annotation_text=f"{key.title()} limit")
+    values = [float(v) for v in observed_y if v is not None] + [float(row["value"]) for row in points]
+    add_threshold_layers(fig, thresholds, values, theme)
     crossing = result.get("crossing") or {}
     if crossing.get("time_s") is not None:
         point = next((r for r in points if float(r["target_time_s"]) == float(crossing["time_s"])), None)

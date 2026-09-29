@@ -72,6 +72,10 @@ def _job_status(project_id: str) -> None:
 def render_training(project_id: str, snapshot: dict) -> None:
     page_header("Training", "Choose one signal model and its settings. Training uses Train units, Validation selects the saved model, and Test remains held out until evaluation.")
     _job_status(project_id)
+    runs = list_project_runs(project_id)
+    stale = sum(1 for row in runs if row.get("snapshot_id") != snapshot["snapshot_id"])
+    if stale:
+        st.caption(ui_copy.TRAIN_STALE_RUNS_CAPTION.format(n=stale))
     capabilities = available_signal_engines(project_id, snapshot["snapshot_id"])
     available = [entry for entry in capabilities if entry.get("available")]
     if not available:
@@ -138,7 +142,6 @@ def render_training(project_id: str, snapshot: dict) -> None:
             st.rerun()
         except (OSError, ValueError, RuntimeError) as exc:
             st.error(f"Training could not start: {exc}")
-    runs = list_project_runs(project_id)
     compatible = [row for row in runs if row.get("snapshot_id") == snapshot["snapshot_id"]]
     if compatible:
         st.success(f"{len(compatible)} saved signal run{'s' if len(compatible) != 1 else ''} for this data snapshot.")

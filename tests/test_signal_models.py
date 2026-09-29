@@ -135,6 +135,33 @@ def test_masks_targets_at_gaps_and_unknown_horizons(contract):
     assert not np.any(np.isnan(isolated["x"]))
 
 
+def test_results_already_red_matches_project_zone_label(contract):
+    from pdm.project_zones import label_unit
+
+    _, project, snapshot = contract
+    pid, sid = project["project_id"], snapshot["snapshot_id"]
+    history = 4
+    run = train_signal_run(pid, sid, "gru", {"history_length": history, "horizons_s": [10.0],
+                                            "epochs": 1, "hidden_size": 8})
+    data = load_snapshot(pid, sid)
+    checked, red_seen = 0, 0
+    for uid in map(str, data["split"]["test"]):
+        unit = data["features"][data["features"].unit_id.astype(str) == uid].sort_values("timestamp_s")
+        gaps = unit.gap_before.fillna(False).to_numpy(bool)
+        for end in range(1, len(unit) + 1):
+            last_gap = int(np.flatnonzero(gaps[:end])[-1]) if gaps[:end].any() else 0
+            if end - last_gap < history:
+                continue
+            prefix = unit.iloc[:end]
+            forecast = forecast_prefix(pid, run["run_id"], uid, float(prefix.timestamp_s.iloc[-1]))
+            assert forecast["points"]
+            is_red = label_unit(prefix, run["schema"])["zone"].iloc[-1] == "red"
+            assert (forecast["crossing"]["status"] == "already_red") == is_red
+            checked += 1
+            red_seen += int(is_red)
+    assert checked > 0 and red_seen > 0
+
+
 def test_run_rejects_changed_artifact_and_cross_project_binding(contract, tmp_path, monkeypatch):
     store, project, snapshot = contract
     pid, sid = project["project_id"], snapshot["snapshot_id"]
@@ -147,6 +174,31 @@ def test_run_rejects_changed_artifact_and_cross_project_binding(contract, tmp_pa
     artifact.write_bytes(artifact.read_bytes() + b"tamper")
     with pytest.raises(ValueError, match="hash"):
         load_signal_run(pid, run["run_id"])
+
+
+def test_train_after_move_fits_scaler_on_new_train_units(contract, monkeypatch):
+    # Protocol invariant only (epochs=1); not a model-quality claim.
+    from pdm.data.project_prepare import move_units
+
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_args, **_kwargs: False)
+    store, project, snapshot = contract
+    pid, old_sid = project["project_id"], snapshot["snapshot_id"]
+    params = {"epochs": 1, "history_length": 2, "hidden_size": 4, "horizons_s": [10.0], "seed": 3}
+    old_run = train_signal_run(pid, old_sid, "gru", params)
+    parent_train = sorted(snapshot["split"]["train"])
+    assert old_run["scaler"]["fit_units"] == parent_train
+
+    moved = move_units(pid, [parent_train[0]], "validation", expected_snapshot_id=old_sid, store=store)
+    new_split = load_snapshot(pid, moved["snapshot_id"])["split"]
+    assert load_signal_run(pid, old_run["run_id"])["snapshot_id"] == old_sid
+    with pytest.raises(ValueError, match="Selected run"):
+        store.update(pid, selected_run_id=old_run["run_id"])
+
+    run = train_signal_run(pid, moved["snapshot_id"], "gru", params)
+    assert run["snapshot_id"] == moved["snapshot_id"]
+    assert run["scaler"]["fit_units"] == sorted(new_split["train"])
+    assert run["scaler"]["fit_units"] != parent_train
+    assert parent_train[0] not in run["scaler"]["fit_units"]
 
 
 @pytest.mark.parametrize("name", ["manifest.json", "training_contract.json", "model.pt"])

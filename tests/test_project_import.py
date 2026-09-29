@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+import textwrap
+import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -7,7 +13,8 @@ import pandas as pd
 import pytest
 
 from pdm.data.project_import import import_project
-from pdm.data.project_prepare import load_snapshot, prepare_project
+from pdm.data.project_prepare import load_snapshot, move_units, prepare_project, preview_move
+from pdm.io_util import sha256_file
 from pdm.projects import ProjectStore
 from tests.project_contract import make_contract_snapshot
 
@@ -273,3 +280,292 @@ def test_replacement_import_activates_source_and_snapshot_together(tmp_path: Pat
     after = store.get(pid)
     assert after["source_manifest"]["manifest_id"] == second["manifest_id"]
     assert after["active_snapshot_id"] == new_ref["snapshot_id"] != old_ref["snapshot_id"]
+
+
+@pytest.fixture
+def idle_worker(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_args, **_kwargs: False)
+
+
+def _dir_hashes(directory: Path) -> dict[str, str]:
+    return {path.name: sha256_file(path) for path in sorted(directory.iterdir())}
+
+
+def _snapshot_dirs(store: ProjectStore, pid: str) -> list[str]:
+    return sorted(path.name for path in (store.project_path(pid) / "snapshots").iterdir())
+
+
+def test_move_units_publishes_new_snapshot_and_keeps_old(tmp_path: Path, idle_worker):
+    store, project, parent = make_contract_snapshot(tmp_path / "projects")
+    pid, old_id = project["project_id"], parent["snapshot_id"]
+    old_hashes = _dir_hashes(parent["dir"])
+    old_split = parent["split"]
+    moved = sorted(old_split["train"])[:2]
+    ref = move_units(pid, list(reversed(moved)), "test", expected_snapshot_id=old_id, store=store)
+
+    assert _dir_hashes(parent["dir"]) == old_hashes
+    assert load_snapshot(pid, old_id, store=store)["split"] == old_split
+    record = store.get(pid)
+    assert record["active_snapshot_id"] == ref["snapshot_id"] != old_id
+    assert record["selected_run_id"] is None and record["state"] == "ready"
+    assert ref["parent_snapshot_id"] == old_id
+    loaded = load_snapshot(pid, store=store)
+    split = loaded["split"]
+    assert split["train"] == sorted(set(old_split["train"]) - set(moved))
+    assert split["test"] == sorted([*old_split["test"], *moved])
+    assert split["validation"] == sorted(old_split["validation"])
+    for a, b in (("train", "validation"), ("train", "test"), ("validation", "test")):
+        assert not set(split[a]) & set(split[b])
+    assert split["realized_counts"] == {name: len(split[name]) for name in ("train", "validation", "test")}
+    assert split["protocol"] == "whole_unit_project_v1_manual"
+    assert split["parent_snapshot_id"] == old_id
+    for key in ("seed", "desired_weights", "manual_modes"):
+        assert split[key] == old_split[key]
+    [entry] = split["manual_moves"]
+    assert entry["unit_ids"] == moved and entry["to"] == "test"
+    assert entry["from"] == {uid: "train" for uid in moved}
+    assert entry["at"].endswith("+00:00")
+    for name in ("features.parquet", "units.parquet", "feature_schema.json"):
+        assert sha256_file(ref["dir"] / name) == old_hashes[name]
+    report = loaded["report"]
+    assert report["snapshot_id"] == ref["snapshot_id"] and report["parent_snapshot_id"] == old_id
+    assert report["split_counts"] == split["realized_counts"]
+    assert report["by_split"]["test"]["units"] == len(split["test"])
+    assert sum(part["rows"] for part in report["by_split"].values()) == len(loaded["features"])
+    for key in ("quality", "source_digest", "outcome_semantics"):
+        assert report[key] == parent["report"][key]
+    fingerprint = loaded["fingerprint"]
+    assert fingerprint["parent_snapshot_id"] == old_id
+    assert fingerprint["source_digest"] == parent["fingerprint"]["source_digest"]
+    assert fingerprint["source_manifest_id"] == parent["fingerprint"]["source_manifest_id"]
+    assert fingerprint["split_hash"] != parent["fingerprint"]["split_hash"]
+
+    # A second move appends to the parent's history.
+    back = move_units(pid, [moved[0]], "train", expected_snapshot_id=ref["snapshot_id"], store=store)
+    assert [m["to"] for m in back["split"]["manual_moves"]] == ["test", "train"]
+    assert back["split"]["manual_moves"][1]["from"] == {moved[0]: "test"}
+
+
+def test_move_units_refuses_empty_set_unknown_and_same_set(tmp_path: Path, idle_worker):
+    store, project, parent = make_contract_snapshot(tmp_path / "projects")
+    pid, sid = project["project_id"], parent["snapshot_id"]
+    split = parent["split"]
+    before = store.get(pid)
+    cases = [
+        ([], "train", "Choose at least one unit."),
+        (["ghost"], "train", "Unknown unit: ghost."),
+        ([split["train"][0]], "train", f"{split['train'][0]} is already in Training Data."),
+        (list(split["test"]), "train", "Testing Data would have no units. Keep at least one unit in each set."),
+    ]
+    for units, destination, message in cases:
+        assert preview_move(parent, units, destination)["problem"] == message
+        with pytest.raises(ValueError) as caught:
+            move_units(pid, units, destination, expected_snapshot_id=sid, store=store)
+        assert str(caught.value) == message
+    assert store.get(pid) == before
+    assert _snapshot_dirs(store, pid) == [sid]
+    ok = preview_move(parent, [split["train"][0]], "validation")
+    assert ok["problem"] is None
+    assert ok["counts"]["train"] == len(split["train"]) - 1
+    assert ok["counts"]["validation"] == len(split["validation"]) + 1
+
+
+def test_move_units_stale_snapshot_race(tmp_path: Path, idle_worker, monkeypatch: pytest.MonkeyPatch):
+    store, project, parent = make_contract_snapshot(tmp_path / "projects")
+    pid, sid = project["project_id"], parent["snapshot_id"]
+    unit = parent["split"]["train"][0]
+    first = move_units(pid, [unit], "validation", expected_snapshot_id=sid, store=store)
+    with pytest.raises(ValueError) as caught:
+        move_units(pid, [unit], "validation", expected_snapshot_id=sid, store=store)
+    assert str(caught.value) == "The data changed since this page loaded. Reload Data Quality and try again."
+    assert _snapshot_dirs(store, pid) == sorted([sid, first["snapshot_id"]])
+
+    # A concurrent publish while this move is staging is caught inside the lock.
+    import pdm.data.project_prepare as prepare
+
+    real_copy = prepare._copy_snapshot_file
+    competing = "competingsnapshot"
+
+    def racing_copy(source: Path, target: Path) -> None:
+        if store.get(pid)["active_snapshot_id"] != competing:
+            store.update(pid, active_snapshot_id=competing, selected_run_id=None)
+        real_copy(source, target)
+
+    monkeypatch.setattr(prepare, "_copy_snapshot_file", racing_copy)
+    with pytest.raises(ValueError, match="The data changed since this page loaded"):
+        move_units(pid, [unit], "train", expected_snapshot_id=first["snapshot_id"], store=store)
+    assert _snapshot_dirs(store, pid) == sorted([sid, first["snapshot_id"]])
+    assert store.get(pid)["active_snapshot_id"] == competing
+
+
+def test_move_units_rollback_on_activation_failure(tmp_path: Path, idle_worker, monkeypatch: pytest.MonkeyPatch):
+    store, project, parent = make_contract_snapshot(tmp_path / "projects")
+    pid, sid = project["project_id"], parent["snapshot_id"]
+    before = store.get(pid)
+
+    def broken(self, registry, project_id, snapshot_id):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ProjectStore, "_activate_snapshot_locked", broken)
+    with pytest.raises(OSError, match="disk full"):
+        move_units(pid, [parent["split"]["train"][0]], "test", expected_snapshot_id=sid, store=store)
+    assert _snapshot_dirs(store, pid) == [sid]
+    assert store.get(pid) == before
+    load_snapshot(pid, sid, store=store)
+
+
+def _hse_project(tmp_path: Path) -> tuple[ProjectStore, str, dict]:
+    store = ProjectStore(tmp_path / "projects")
+    pid = store.create("HSE", "hse_filters")["project_id"]
+    primary = tmp_path / "primary"
+    validation = tmp_path / "validation"
+    _write_filter(primary / "Train_Data_CSV.csv", [1, 2, 3, 4], base=100)
+    _write_filter(primary / "Test_Data_CSV.csv", [1], base=200, official_test=True)
+    _write_filter(validation / "Train_Data_CSV.csv", [1], base=300)
+    spec = {
+        "primary": {"mode": "folder", "path": str(primary)},
+        "validation_mode": "folder", "validation": {"mode": "folder", "path": str(validation)},
+        "signal_unit": "Pa",
+        "thresholds": {"mode": "absolute", "direction": "above", "yellow": 300, "red": 600},
+    }
+    manifest = import_project(pid, spec, store=store)
+    return store, pid, prepare_project(pid, manifest["manifest_id"], store=store)
+
+
+def test_move_units_refuses_hse_author_test_leaving_test(tmp_path: Path, idle_worker):
+    store, pid, parent = _hse_project(tmp_path)
+    sid = parent["snapshot_id"]
+    loaded = load_snapshot(pid, sid, store=store)
+    assert preview_move(loaded, ["Train_1"], "test")["fixed_units"] == ["Test_1"]
+    for destination in ("train", "validation"):
+        assert preview_move(loaded, ["Test_1"], destination)["problem"] == "Official HSE test units stay in Testing Data."
+        with pytest.raises(ValueError) as caught:
+            move_units(pid, ["Test_1"], destination, expected_snapshot_id=sid, store=store)
+        assert str(caught.value) == "Official HSE test units stay in Testing Data."
+    moved = move_units(pid, ["Train_1"], "test", expected_snapshot_id=sid, store=store)
+    assert moved["split"]["test"] == ["Test_1", "Train_1"]
+    with pytest.raises(ValueError, match="Official HSE test units"):
+        move_units(pid, ["Test_1", "Train_1"], "train", expected_snapshot_id=moved["snapshot_id"], store=store)
+
+
+def test_move_units_refuses_linked_legacy(tmp_path: Path, idle_worker):
+    store, project, parent = make_contract_snapshot(tmp_path / "projects")
+    pid, sid = project["project_id"], parent["snapshot_id"]
+    registry = store._load()
+    registry["projects"][pid]["storage_mode"] = "linked_legacy"
+    store._save(registry)
+    with pytest.raises(ValueError) as caught:
+        move_units(pid, [parent["split"]["train"][0]], "test", expected_snapshot_id=sid, store=store)
+    assert str(caught.value) == ("This project uses the published split of its source dataset. "
+                                 "Create a new project to change the split.")
+    assert _snapshot_dirs(store, pid) == [sid]
+
+
+def test_move_units_refuses_while_heavy_job_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    store, project, parent = make_contract_snapshot(tmp_path / "projects")
+    pid, sid = project["project_id"], parent["snapshot_id"]
+    before = store.get(pid)
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_args, **_kwargs: True)
+    with pytest.raises(RuntimeError) as caught:
+        move_units(pid, [parent["split"]["train"][0]], "test", expected_snapshot_id=sid, store=store)
+    assert str(caught.value) == "Wait for the current job to finish before changing sets."
+
+    # A job that starts while the move is staging is caught inside the lock.
+    calls = iter([False, True])
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_args, **_kwargs: next(calls))
+    with pytest.raises(RuntimeError, match="Wait for the current job"):
+        move_units(pid, [parent["split"]["train"][0]], "test", expected_snapshot_id=sid, store=store)
+    assert store.get(pid) == before
+    assert _snapshot_dirs(store, pid) == [sid]
+
+
+def test_move_units_does_not_deadlock_or_hold_lock_while_copying(
+    tmp_path: Path, idle_worker, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "projects"
+    store, project, parent = make_contract_snapshot(root)
+    pid, sid = project["project_id"], parent["snapshot_id"]
+    unit = parent["split"]["train"][0]
+    child = textwrap.dedent("""
+        import json, sys, time
+        import pdm.worker
+        pdm.worker.heavy_job_active = lambda *args, **kwargs: False
+        from pdm.data.project_prepare import move_units
+        from pdm.projects import ProjectStore
+        root, pid, sid, unit = sys.argv[1:5]
+        store = ProjectStore(root)
+        start = time.perf_counter()
+        ref = move_units(pid, [unit], "validation", expected_snapshot_id=sid, store=store)
+        print(json.dumps({"elapsed": time.perf_counter() - start, "snapshot_id": ref["snapshot_id"]}))
+    """)
+    done = subprocess.run([sys.executable, "-c", child, str(root), pid, sid, unit],
+                          capture_output=True, text=True, timeout=30, check=True)
+    result = json.loads(done.stdout.strip().splitlines()[-1])
+    assert result["elapsed"] < 5
+    assert store.get(pid)["active_snapshot_id"] == result["snapshot_id"]
+
+    import pdm.data.project_prepare as prepare
+
+    real_copy = prepare._copy_snapshot_file
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking_copy(source: Path, target: Path) -> None:
+        entered.set()
+        release.wait(10)
+        real_copy(source, target)
+
+    monkeypatch.setattr(prepare, "_copy_snapshot_file", blocking_copy)
+    outcome: dict = {}
+
+    def run_move() -> None:
+        try:
+            outcome["ref"] = move_units(pid, [unit], "train", expected_snapshot_id=result["snapshot_id"], store=store)
+        except BaseException as exc:  # noqa: BLE001
+            outcome["error"] = exc
+
+    mover = threading.Thread(target=run_move, daemon=True)
+    mover.start()
+    try:
+        assert entered.wait(5)
+        got: dict = {}
+        reader = threading.Thread(target=lambda: got.update(record=store.get(pid)), daemon=True)
+        start = time.perf_counter()
+        reader.start()
+        reader.join(1)
+        assert not reader.is_alive(), "store.get blocked while move_units copied parquet"
+        assert time.perf_counter() - start < 1
+        assert got["record"]["active_snapshot_id"] == result["snapshot_id"]
+    finally:
+        release.set()
+        mover.join(10)
+    assert "error" not in outcome
+    assert store.get(pid)["active_snapshot_id"] == outcome["ref"]["snapshot_id"]
+
+
+def test_preview_move_without_units_frame(tmp_path: Path):
+    snapshot = {"split": {"train": ["a", "b"], "validation": ["c"], "test": ["d"]}}
+    result = preview_move(snapshot, ["a"], "test")
+    assert result == {"counts": {"train": 1, "validation": 1, "test": 2}, "problem": None, "fixed_units": []}
+    no_group = {**snapshot, "units": pd.DataFrame({"unit_id": ["a", "b", "c", "d"]})}
+    assert preview_move(no_group, ["d"], "train")["fixed_units"] == []
+    assert preview_move(no_group, ["d"], "train")["problem"] == (
+        "Testing Data would have no units. Keep at least one unit in each set.")
+
+
+def test_move_units_old_run_not_selectable_on_new_snapshot(tmp_path: Path, idle_worker):
+    store, project, parent = make_contract_snapshot(tmp_path / "projects")
+    pid, old_id = project["project_id"], parent["snapshot_id"]
+    run_dir = store.run_path(pid, "run1")
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text(json.dumps(
+        {"project_id": pid, "snapshot_id": old_id, "run_id": "run1",
+         "task": "signal_forecast", "status": "completed"}))
+    assert store.update(pid, selected_run_id="run1")["selected_run_id"] == "run1"
+    ref = move_units(pid, [parent["split"]["train"][0]], "test", expected_snapshot_id=old_id, store=store)
+    record = store.get(pid)
+    assert record["active_snapshot_id"] == ref["snapshot_id"]
+    assert record["selected_run_id"] is None
+    with pytest.raises(ValueError, match="Selected run"):
+        store.update(pid, selected_run_id="run1")
+    assert (run_dir / "manifest.json").is_file()
+    load_snapshot(pid, old_id, store=store)

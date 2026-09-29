@@ -128,6 +128,20 @@ def test_worker_alive_invalid_pid_file(monkeypatch, tmp_path, contents):
     assert worker_alive() is False
 
 
+@pytest.mark.parametrize(("status", "alive", "expected"), [
+    *[(state, False, True) for state in ("queued", "starting", "running", "training", "preparing", "stopping")],
+    *[(state, False, False) for state in ("completed", "failed", "cancelled", "not_ready")],
+    ("completed", True, True),
+])
+def test_heavy_job_active_is_global_worker_predicate(monkeypatch, status, alive, expected):
+    import pdm.worker as worker
+
+    monkeypatch.setattr(worker, "worker_alive", lambda: alive)
+    monkeypatch.setattr(worker, "read_status", lambda: {"status": status, "project_id": "other"})
+    assert worker.heavy_job_active() is expected
+    assert worker.heavy_job_active("this-project") is expected
+
+
 def test_worker_alive_posix_current_pid(monkeypatch, tmp_path):
     import pdm.worker as worker
 
@@ -354,6 +368,9 @@ def test_import_and_quality_controls_expose_help(monkeypatch, tmp_path):
     assert not at.exception
     inspect = [w for w in at.selectbox if w.label.startswith("Inspect ")]
     assert inspect and all(_help_of(w) for w in inspect)
+    moves = [*at.multiselect, *(w for w in at.selectbox if w.label == "Move to"),
+             *(b for b in at.button if b.label == "Move selected units")]
+    assert len(moves) == 9 and all(_help_of(w) for w in moves)
     assert len(at.metric) and all(_help_of(m) for m in at.metric)
     assert _help_of(next(b for b in at.button if b.label == "Continue to Training"))
     assert ui_copy.QUALITY_TABS_CAPTION in [c.value for c in at.caption]
@@ -846,7 +863,7 @@ def test_product_tables_use_st_table(monkeypatch, tmp_path):
     assert len(at.table) >= 1
     assert len(at.dataframe) == 0
     first = at.table[0].value
-    assert list(first.columns) == ["Time (s)", "Vibration (g)", "Record position"]
+    assert list(first.columns) == ["Time (s)", "Vibration (g)", "Record position", "Zone"]
     assert list(first["Record position"]) == ["Start of record", "Gap before"]
     for name in ("project_quality_ui.py", "project_results_ui.py"):
         assert "st.dataframe" not in (project_root() / "src" / "pdm" / name).read_text(encoding="utf-8")
