@@ -12,9 +12,10 @@ from pdm import project_zones
 from pdm.data.project_prepare import load_snapshot, load_zone_limits, move_units, save_zone_limits
 from pdm.paths import project_root
 from pdm.project_quality_ui import gap_safe_trace, limits_key, part_summary
-from pdm.project_training_ui import _parse_horizons
+from pdm.project_training_ui import _default_profile, _parse_horizons
 from pdm.project_ui import _auto_shares, _open_step, _stage_uploads
 from pdm.projects import project_store
+from pdm.signal_training import average_training_duration_s
 from pdm.ui_copy import QUALITY_NO_ZONES
 from tests.project_contract import make_contract_snapshot
 
@@ -946,6 +947,7 @@ def test_training_page_mentions_runs_from_previous_snapshot(monkeypatch, tmp_pat
 
 
 def test_saved_snapshot_offers_one_signal_engine_and_horizon_controls(monkeypatch, tmp_path):
+    monkeypatch.setattr("pdm.signal_training.source_unavailable_reason", lambda: None)
     root = tmp_path / "projects"
     monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
     _, project, _ = make_contract_snapshot(root)
@@ -955,10 +957,64 @@ def test_saved_snapshot_offers_one_signal_engine_and_horizon_controls(monkeypatc
     at.run()
     assert not at.exception
     model = next(widget for widget in at.selectbox if widget.label == "Model")
-    assert list(model.options) == ["GRU", "LSTM", "Quantile boosting"]
+    assert list(model.options) == ["GRU", "LSTM", "Quantile boosting", "Fly brain · Full MaleCNS"]
     assert any(widget.label == "Forecast horizons (seconds)" for widget in at.text_input)
     assert any(button.label == "Train model" for button in at.button)
     assert not any(widget.label == "Report view" for widget in at.radio)
+    model.select("full_cns").run()
+    assert not at.exception
+    assert any("original directed connections" in block.value for block in at.info)
+    assert not any(widget.label in {"Hidden units", "Training epochs", "Boosting iterations"}
+                   for widget in at.number_input)
+
+
+def test_model_defaults_cover_direct_horizons_without_looking_at_test():
+    rows = [{"unit_id": uid, "timestamp_s": step * i, "signal": float(i), "gap_before": i == 0}
+            for uid in ("train1", "train2", "val1", "val2", "test1")
+            for i in range(800 if uid in {"train2", "val2"} else 300)
+            for step in ([60.0] if uid.startswith(("train", "val")) else [1.0])]
+    frame = pd.DataFrame(rows)
+    snapshot = {"features": frame, "split": {"train": ["train1", "train2"],
+                                             "validation": ["val1", "val2"], "test": ["test1"]},
+                "schema": {"source_kind": "xjtu_bearings"}}
+    profiles = {engine: _default_profile(snapshot, engine)[0]
+                for engine in ("gru", "lstm", "quantile_boosting", "full_cns")}
+    assert all(profile["horizons_s"][-1] == 549 * 60 for profile in profiles.values())
+    assert all(len(profile["horizons_s"]) <= 24 for profile in profiles.values())
+    assert profiles["gru"]["residual_forecast"] and profiles["lstm"]["residual_forecast"]
+    assert profiles["gru"]["history_length"] != profiles["lstm"]["history_length"]
+    assert profiles["quantile_boosting"]["max_iter"] == 120
+    assert profiles["full_cns"]["history_length"] == 20
+    changed = frame.copy()
+    changed.loc[changed.unit_id == "test1", "timestamp_s"] *= 1000
+    assert _default_profile({**snapshot, "features": changed}, "gru")[0] == profiles["gru"]
+
+    filter_frame = frame.loc[frame.unit_id != "test1"].copy()
+    filter_frame["timestamp_s"] /= 600
+    filter_snapshot = {**snapshot, "features": filter_frame, "schema": {"source_kind": "hse_filters"}}
+    profile, coverage = _default_profile(filter_snapshot, "gru")
+    assert profile["horizons_s"][-1] == pytest.approx(54.9)
+    assert coverage[-1]["validation_units"] == 1
+
+
+def test_average_length_is_not_claimed_when_no_validation_target_exists():
+    frame = pd.DataFrame([{"unit_id": uid, "timestamp_s": float(i * 60),
+                           "signal": float(i), "gap_before": i == 0}
+                          for uid in ("train1", "val1") for i in range(400)])
+    snapshot = {"features": frame, "split": {"train": ["train1"], "validation": ["val1"]},
+                "schema": {"source_kind": "xjtu_bearings"}}
+    profile, coverage = _default_profile(snapshot, "gru")
+    assert profile["horizons_s"][-1] < 399 * 60
+    assert all(row["horizon_s"] < 399 * 60 for row in coverage)
+
+
+def test_average_train_duration_excludes_gaps_and_held_out_test():
+    features = pd.DataFrame({"unit_id": ["train"] * 6 + ["test"] * 2,
+                             "timestamp_s": [0, 1, 2, 100, 101, 102, 0, 10000],
+                             "signal": [1.0] * 8,
+                             "gap_before": [True, False, False, True, False, False, True, False]})
+    snapshot = {"features": features, "split": {"train": ["train"], "test": ["test"]}}
+    assert average_training_duration_s(snapshot) == 4.0
 
 
 def test_quality_gap_count_excludes_unit_start():
@@ -969,6 +1025,51 @@ def test_quality_gap_count_excludes_unit_start():
     summary = part_summary(frame, {"train": ["A", "B"]}, "train")
     assert summary["gaps"] == 1
     assert gap_safe_trace(frame[frame.unit_id == "A"])[0] == [0.0, 1.0, None, 2.0]
+
+
+def test_full_cns_training_dispatch_and_saved_results(monkeypatch, tmp_path, signal_cns_fixture):
+    import os
+    from types import SimpleNamespace
+
+    from pdm.io_util import read_json
+    from pdm.worker import job_path, run_job, status_for_project
+
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    worker_root = tmp_path / "worker"
+    worker_root.mkdir()
+    monkeypatch.setattr("pdm.worker.worker_dir", lambda: worker_root)
+    monkeypatch.setattr("pdm.cli.worker_dir", lambda: worker_root)
+    monkeypatch.setattr("pdm.visualization.live.clear_live_activity", lambda: None)
+    _no_job(monkeypatch)
+    _, project, snapshot = make_contract_snapshot(root)
+    queued = []
+
+    def launch():
+        queued.append(read_json(job_path()))
+        return SimpleNamespace(pid=os.getpid())
+
+    # Exercise real UI -> spawn_worker validation -> queued job -> worker -> Results.
+    # Only process creation and the costly biological graph are replaced here.
+    monkeypatch.setattr("pdm.cli._launch_worker_process", launch)
+    at = _app()
+    at.session_state["project_id"] = project["project_id"]
+    at.session_state["project_step"] = "Training"
+    at.run()
+    next(widget for widget in at.selectbox if widget.label == "Model").select("full_cns").run()
+    next(button for button in at.button if button.label == "Train model").click().run()
+    assert not at.exception and len(queued) == 1
+    assert queued[0]["engine_id"] == "full_cns"
+    assert set(queued[0]["params"]) == {"history_length", "horizons_s", "seed"}
+    assert queued[0]["snapshot_id"] == snapshot["snapshot_id"]
+    assert status_for_project(project["project_id"])["status"] == "queued"
+    run_job(queued[0])
+    assert status_for_project(project["project_id"])["status"] == "completed"
+    at.session_state["project_step"] = "Results"
+    at.run()
+    assert not at.exception and not at.error
+    assert any("3 neurons · 4 directed connections · 10 synaptic contacts" in c for c in _captions(at))
+    assert any("test-fixture-only" in c for c in _captions(at))
 
 
 def test_replacement_import_locks_training_until_complete(monkeypatch, tmp_path):

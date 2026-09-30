@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -38,6 +39,26 @@ def test_signal_heads_are_numeric_and_have_finite_gradients():
         assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
 
 
+def test_residual_recurrent_head_preserves_last_value_and_legacy_head():
+    signal = torch.tensor([[[2.0], [3.0], [4.0]]])
+    legacy = SignalRecurrent("gru", 1, 8, 3)
+    residual = SignalRecurrent("gru", 1, 8, 3, residual_forecast=True)
+    residual.load_state_dict(legacy.state_dict())
+    assert torch.allclose(residual(signal), legacy(signal) + 4.0)
+
+
+def test_window_targets_require_one_matching_future_timestamp():
+    features = pd.DataFrame({"unit_id": ["A"] * 5,
+                             "timestamp_s": [0.0, 1.0, 2.0, 2.0000001, 3.0],
+                             "signal": [0.0, 1.0, 2.0, 2.1, 3.0],
+                             "gap_before": [True, False, False, False, False]})
+    params = {"history_length": 2, "horizons_s": [1.0], "target_tolerance_s": 0.01}
+    windows = _windows(features, ["A"], params)
+    assert 1.0 not in windows["as_of_s"]  # two possible targets around 2 seconds
+    assert windows["as_of_s"] == [2.0, 2.0000001]
+    assert windows["y"][:, 0].tolist() == [3.0, 3.0]
+
+
 def test_quantile_prediction_keeps_signed_domain():
     class NegativeModel:
         def __init__(self, value):
@@ -56,8 +77,10 @@ def test_quantile_prediction_keeps_signed_domain():
     assert all(value[0, 0] == 0.0 for value in bounded)
 
 
-@pytest.mark.parametrize("engine", ["gru", "lstm", "quantile_boosting"])
-def test_saved_signal_run_reloads_and_prefix_ignores_future_rows(contract, monkeypatch, engine):
+@pytest.mark.parametrize("engine", ["gru", "lstm", "quantile_boosting", "full_cns"])
+def test_saved_signal_run_reloads_and_prefix_ignores_future_rows(contract, monkeypatch, engine, request):
+    if engine == "full_cns":
+        request.getfixturevalue("signal_cns_fixture")
     store, project, snapshot = contract
     pid, sid = project["project_id"], snapshot["snapshot_id"]
     choices = {row["engine_id"]: row for row in available_signal_engines(pid, sid)}
@@ -78,10 +101,13 @@ def test_saved_signal_run_reloads_and_prefix_ignores_future_rows(contract, monke
     unit = data["features"][data["features"].unit_id == uid].sort_values("timestamp_s")
     as_of = float(unit.timestamp_s.iloc[8])
     original = forecast_prefix(pid, manifest["run_id"], uid, as_of)
+    extended = forecast_prefix(pid, manifest["run_id"], uid, as_of, rollout_steps=12)
+    assert len(extended["points"]) > len(original["points"])
     assert original["status"] == "available"
     assert original["points"] and all(p["target_time_s"] > as_of for p in original["points"])
     assert original["calibration_status"] == ("unvalidated_pointwise_quantiles" if engine == "quantile_boosting"
                                                else "unavailable")
+    assert original["red_entry_corridor"]["status"] == "unavailable"
     assert all(row["timestamp_s"] <= as_of for row in original["observed_prefix"])
     if engine == "quantile_boosting":
         assert all(p["lower"] is not None and p["upper"] is not None for p in original["points"])
@@ -99,6 +125,8 @@ def test_saved_signal_run_reloads_and_prefix_ignores_future_rows(contract, monke
     replay = inference.forecast_prefix(pid, manifest["run_id"], uid, as_of)
     assert replay["points"] == original["points"]
     assert replay["crossing"] == original["crossing"]
+    extended_replay = inference.forecast_prefix(pid, manifest["run_id"], uid, as_of, rollout_steps=12)
+    assert extended_replay == extended
     assert any(float(v) < 0 for v in data["features"].signal)
 
 

@@ -1,6 +1,6 @@
 # Full MaleCNS model
 
-The primary Neural Activity Explorer uses every classified neuron from the local MaleCNS v1.0 release. It is a computational reservoir with biological connectivity, not a reconstruction of a living fly's electrophysiology.
+The research Neural Activity Explorer uses every classified neuron from the local MaleCNS v1.0 release. It is a computational reservoir with biological connectivity, not a reconstruction of a living fly's electrophysiology. The current Projects workflow exposes the same full topology through a [numeric signal adapter](full_cns_signal.md); the RUL training and visualization protocol below describes the historical research path.
 
 ## Reproduce
 

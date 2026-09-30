@@ -110,10 +110,11 @@ def spawn_worker(job: dict) -> subprocess.Popen:
             raise ValueError("Project job requires project_id")
         if job["kind"] == "project_import" and not isinstance(job.get("source"), dict):
             raise ValueError("Project import requires a source specification")
-        if job["kind"] == "project_train" and (
-            job.get("engine_id") not in {"gru", "lstm", "quantile_boosting"} or not isinstance(job.get("params"), dict)
-        ):
-            raise ValueError("Project training requires one supported engine and parameter mapping")
+        if job["kind"] == "project_train":
+            from pdm.signal_training import ENGINES
+
+            if job.get("engine_id") not in ENGINES or not isinstance(job.get("params"), dict):
+                raise ValueError("Project training requires one supported engine and parameter mapping")
         job.setdefault("job_id", uuid.uuid4().hex)
         if not isinstance(job["job_id"], str) or not job["job_id"]:
             raise ValueError("Project job requires a job ID")

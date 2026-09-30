@@ -24,7 +24,7 @@ from pdm.project_quality_ui import (
     part_summary,
     render_quality,
 )
-from pdm.project_results_ui import render_results
+from pdm.project_results_ui import cancel_replay_forecast, render_results
 from pdm.project_training_ui import render_training
 from pdm.projects import project_store
 from pdm.signal_training import list_project_runs
@@ -73,6 +73,7 @@ FIRST_IMPORT_THRESHOLDS = {
 
 
 def _reset_project_session() -> None:
+    cancel_replay_forecast()
     for key in list(st.session_state):
         if str(key).startswith(("project_play:", "play_slider:", "play_toggle:", "play_reset:",
                                  "result_run:", "result_unit:", "quality_unit_", "quality_move", "folder:", "path:",
@@ -510,6 +511,8 @@ def main() -> None:
             st.caption("No projects yet")
         st.caption("WORKFLOW")
         step = st.session_state.get("project_step", "Projects")
+        if step != "Results":
+            cancel_replay_forecast()
         snapshot_ready = bool(selected and selected.get("state") == "ready" and selected.get("active_snapshot_id"))
         runs_ready = False
         if snapshot_ready:

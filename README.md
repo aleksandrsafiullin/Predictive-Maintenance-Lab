@@ -4,6 +4,8 @@ A local laboratory for **sensor-signal forecasting**, with independent projects 
 
 See the [project workflow guide](docs/create_ml_workflow.md) for folder formats, automatic/manual splits, model settings, playback and recoverable deletion. The public datasets and earlier research below remain available without copying their raw files into each project.
 
+**Fly brain · Full MaleCNS** is available in Training alongside GRU, LSTM and Quantile boosting when the official local connection and annotation files are present. It computes every classified neuron using the public directed graph; only the numeric signal readout is trained. See [source, computation and restoration](docs/full_cns_signal.md).
+
 | Dataset | Public source | Signal and sampling | Split |
 |---|---|---|---|
 | Bearings / XJTU-SY | [Dataset authors](https://biaowang.tech/xjtu-sy-bearing-datasets/) | Horizontal and vertical acceleration RMS from a 1.28-second vibration fragment recorded once per minute | 9 train / 3 validation / 3 test units |

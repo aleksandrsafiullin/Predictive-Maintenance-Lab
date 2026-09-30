@@ -7,11 +7,13 @@ from types import SimpleNamespace
 import pytest
 
 from pdm.cli import spawn_worker
-from pdm.io_util import atomic_write_json
+from pdm.io_util import atomic_write_json, read_json
 from pdm.projects import ProjectStore
+from pdm.signal_training import ENGINES
 from pdm.worker import (
     _cleanup_project_uploads,
     _project_stopped,
+    job_path,
     read_status,
     request_stop,
     run_job,
@@ -60,6 +62,35 @@ def test_plain_stop_targets_active_project_job(worker_store):
     request_stop()
     assert _project_stopped("active")
     assert read_status()["pid"] == os.getpid()
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_every_signal_engine_passes_real_launch_validation(worker_store, monkeypatch, engine):
+    _, project, _ = worker_store
+    launched = []
+
+    def launch():
+        launched.append(read_json(job_path()))
+        return SimpleNamespace(pid=os.getpid())
+
+    monkeypatch.setattr("pdm.cli._launch_worker_process", launch)
+    params = {"history_length": 20, "horizons_s": [60.0, 120.0, 180.0], "seed": 42}
+    spawn_worker({"kind": "project_train", "project_id": project["project_id"],
+                  "snapshot_id": "snapshot-a", "engine_id": engine, "params": params})
+    assert len(launched) == 1
+    assert launched[0]["engine_id"] == engine and launched[0]["params"] == params
+    state = status_for_project(project["project_id"])
+    assert state["status"] == "queued" and state["job_id"] == launched[0]["job_id"]
+
+
+@pytest.mark.parametrize("engine,params", [("unsupported", {}), ("full_cns", None), ("gru", [])])
+def test_launch_rejects_unsupported_engine_or_missing_parameter_mapping(worker_store, monkeypatch, engine, params):
+    _, project, _ = worker_store
+    monkeypatch.setattr("pdm.cli._launch_worker_process", lambda: pytest.fail("Invalid job launched"))
+    with pytest.raises(ValueError, match="supported engine and parameter mapping"):
+        spawn_worker({"kind": "project_train", "project_id": project["project_id"],
+                      "engine_id": engine, "params": params})
+    assert not job_path().exists()
 
 
 def test_crashed_worker_status_reconciles_and_unblocks_next_launch(worker_store, monkeypatch):

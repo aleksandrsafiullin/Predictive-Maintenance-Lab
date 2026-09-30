@@ -142,8 +142,12 @@ LEGACY_OPEN_PROJECT_HELP = "Pick an imported dataset to continue with. Opening i
 
 # Training
 TRAIN_MODEL_HELP = (
-    "The forecasting method. GRU and LSTM are neural networks that learn patterns over time; Quantile boosting "
-    "is a fast tree method that also gives a rough 5–95% range (not calibrated). Try GRU first."
+    "GRU and LSTM learn time patterns. Quantile boosting uses trees and gives a rough 5–95% range (not calibrated). "
+    "Fly brain uses the full public MaleCNS connection map with a trained signal readout."
+)
+TRAIN_FULL_CNS_CAPTION = (
+    "Uses all classified MaleCNS v1.0 neurons and original directed connections. Synapse counts are scaled "
+    "for a fixed reservoir; its dynamics are mathematical, not measured fly activity. Training may be slow."
 )
 TRAIN_MODEL_CAPTION = (
     "The model forecasts the signal itself in its native unit, not the remaining life of the unit."
@@ -153,8 +157,8 @@ TRAIN_HISTORY_HELP = (
     "needs longer unbroken records; too long and training finds no usable windows."
 )
 TRAIN_HORIZONS_HELP = (
-    "How far ahead to forecast, in seconds, separated by commas. Use multiples of your sampling interval "
-    "(default: 1×, 2×, 3×); a horizon with no matching measurement cannot be trained."
+    "Comma-separated seconds, preferably multiples of the sampling interval. Each time is a direct model "
+    "output and needs a matching future measurement in both Train and Validation."
 )
 TRAIN_SEED_HELP = (
     "Fixes the random start and shuffling. Same data and seed give repeatable results; change it to check that "
@@ -166,7 +170,7 @@ TRAIN_EPOCHS_HELP = (
 )
 TRAIN_HIDDEN_HELP = (
     "Size of the model's memory. Larger can learn more complex patterns but trains slower and may memorize "
-    "small datasets. 32 is a good start."
+    "small datasets. The current starting value is 64."
 )
 TRAIN_BATCH_HELP = (
     "How many examples the model looks at before each update. Smaller is noisier but updates more often; "

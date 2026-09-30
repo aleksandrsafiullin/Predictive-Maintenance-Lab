@@ -6,6 +6,31 @@ import pytest
 
 
 @pytest.fixture
+def signal_cns_fixture(monkeypatch):
+    """Tiny mocked connectome for protocol tests, never biological evidence."""
+    from scipy import sparse
+
+    from pdm.models.full_cns import FullCNSReservoir
+    from pdm.models.signal_full_cns import SignalFullCNS
+
+    def build(_seed):
+        body = FullCNSReservoir(
+            np.array([[.3], [-.2], [.1]], np.float32),
+            sparse.csr_matrix(np.array([[0, 0, .3], [.2, 0, 0], [0, .4, .1]], np.float32)),
+            np.zeros(3, np.float32), ["11", "22", "33"],
+            {"graph_hash": "test-fixture-only", "dataset": "test fixture (not biological data)",
+             "n_nodes": 3, "n_edges": 4, "n_synapses": 10,
+             "graph_mode": "real_connectome", "is_synthetic": False, "node_sampling": False},
+            pool_index=np.array([0, 0, 1]),
+        )
+        return SignalFullCNS(body)
+
+    monkeypatch.setattr("pdm.signal_training.build_signal_full_cns", build)
+    monkeypatch.setattr("pdm.signal_training.source_unavailable_reason", lambda: None)
+    return build
+
+
+@pytest.fixture
 def tiny_bearing_tables():
     """Labeled synthetic fixture, not the XJTU-SY dataset."""
     rows = []

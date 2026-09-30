@@ -14,14 +14,20 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
 from torch.nn import functional as F
 
 from pdm.data.project_prepare import load_snapshot
 from pdm.io_util import atomic_write_json, read_json, sha256_file
+from pdm.models.signal_full_cns import (
+    ENGINE_LABEL,
+    build_signal_full_cns,
+    source_unavailable_reason,
+)
 from pdm.models.signal_recurrent import SignalRecurrent
 from pdm.projects import project_store
 
-ENGINES = ("gru", "lstm", "quantile_boosting")
+ENGINES = ("gru", "lstm", "quantile_boosting", "full_cns")
 SCHEMA_VERSION = "project_signal_forecast_v1"
 
 
@@ -33,7 +39,7 @@ def _params(engine_id: str, params: dict | None, features: pd.DataFrame) -> dict
     if engine_id not in ENGINES:
         raise ValueError(f"Unsupported signal engine: {engine_id}")
     raw = dict(params or {})
-    allowed = {"history_length", "horizons_s", "epochs", "hidden_size", "batch_size", "seed", "max_iter", "learning_rate"}
+    allowed = {"history_length", "horizons_s", "epochs", "hidden_size", "batch_size", "seed", "max_iter", "learning_rate", "residual_forecast"}
     unknown = set(raw) - allowed
     if unknown:
         raise ValueError(f"Unknown signal training parameters: {sorted(unknown)}")
@@ -58,12 +64,17 @@ def _params(engine_id: str, params: dict | None, features: pd.DataFrame) -> dict
         "seed": int(raw.get("seed", 42)),
         "max_iter": int(raw.get("max_iter", 40)),
         "learning_rate": float(raw.get("learning_rate", 0.001)),
+        "residual_forecast": raw.get("residual_forecast", engine_id in {"gru", "lstm"}),
         "target_tolerance_s": max(0.000001, min(step * 0.01, 0.01)),
     }
     if not (2 <= config["history_length"] <= 256 and 1 <= config["epochs"] <= 500
             and 4 <= config["hidden_size"] <= 512 and 1 <= config["batch_size"] <= 4096
             and 2 <= config["max_iter"] <= 1000 and 0 < config["learning_rate"] <= 0.1):
         raise ValueError("Signal model parameters are outside supported ranges")
+    if not isinstance(config["residual_forecast"], bool):
+        raise ValueError("Residual forecast must be true or false")
+    if engine_id == "full_cns":
+        return {key: config[key] for key in ("history_length", "horizons_s", "seed", "target_tolerance_s")}
     return config
 
 
@@ -98,6 +109,16 @@ def _segments(features: pd.DataFrame, unit_id: str) -> list[pd.DataFrame]:
     return [unit.iloc[start:end].reset_index(drop=True) for start, end in zip(starts, [*starts[1:], len(unit)], strict=True)]
 
 
+def average_training_duration_s(snapshot: dict) -> float:
+    """Mean observed continuous duration of each Train unit, excluding gaps and Test."""
+    durations = []
+    for uid in snapshot["split"]["train"]:
+        segments = _segments(snapshot["features"], str(uid))
+        durations.append(sum(float(part.timestamp_s.iloc[-1] - part.timestamp_s.iloc[0])
+                             for part in segments if len(part) > 1))
+    return float(np.mean(durations)) if durations else 0.0
+
+
 def _windows(features: pd.DataFrame, ids: list[str], params: dict) -> dict[str, Any]:
     history = params["history_length"]
     horizons = params["horizons_s"]
@@ -107,12 +128,17 @@ def _windows(features: pd.DataFrame, ids: list[str], params: dict) -> dict[str, 
         for segment in _segments(features, str(uid)):
             ts = segment.timestamp_s.to_numpy(float)
             signal = segment.signal.to_numpy(float)
+            targets = np.full((len(ts), len(horizons)), np.nan, dtype=np.float32)
+            for j, horizon in enumerate(horizons):
+                desired = ts + horizon
+                left = np.searchsorted(ts, desired - tolerance, side="left")
+                right = np.searchsorted(ts, desired + tolerance, side="right")
+                matched = (right - left == 1) & (left < len(ts))
+                candidates = np.flatnonzero(matched)
+                matched[candidates] &= ts[left[candidates]] > ts[candidates]
+                targets[matched, j] = signal[left[matched]]
             for end in range(history - 1, len(segment)):
-                target = np.full(len(horizons), np.nan, dtype=np.float32)
-                for j, horizon in enumerate(horizons):
-                    candidates = np.flatnonzero((ts > ts[end]) & (np.abs(ts - (ts[end] + horizon)) <= tolerance))
-                    if len(candidates) == 1:
-                        target[j] = signal[candidates[0]]
+                target = targets[end]
                 mask = np.isfinite(target)
                 if not mask.any():
                     continue
@@ -169,11 +195,16 @@ def _metrics(pred: np.ndarray, data: dict, horizons: list[float]) -> dict:
             "by_horizon": rows, "by_unit": per_unit}
 
 
-def _predict(model: Any, engine_id: str, data: dict, scaler: dict) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+def _predict(model: Any, engine_id: str, data: dict, scaler: dict, *, should_stop=None) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     if not len(data["x"]):
         shape = data["y"].shape
         return np.empty(shape), None, None
     x = (data["x"] - scaler["mean"]) / scaler["std"]
+    if engine_id == "full_cns":
+        point = model.predict(x, should_stop=should_stop) * scaler["std"] + scaler["mean"]
+        if scaler.get("output_domain") == "nonnegative":
+            point = np.maximum(point, 0.0)
+        return point, None, None
     if engine_id in {"gru", "lstm"}:
         model.eval()
         with torch.no_grad():
@@ -216,18 +247,65 @@ def available_signal_engines(project_id: str, snapshot_id: str | None = None) ->
         {"engine_id": "quantile_boosting", "label": "Quantile boosting", "available": reason is None, "reason": reason,
          "params": ["history_length", "horizons_s", "max_iter", "seed"]},
     ]
-    for engine_id, label in (("fly", "Fly reservoir"), ("random", "Random reservoir"),
-                             ("full_cns", "Full MaleCNS")):
+    full_cns_reason = reason or source_unavailable_reason()
+    base.append({"engine_id": "full_cns", "label": ENGINE_LABEL,
+                 "available": full_cns_reason is None, "reason": full_cns_reason,
+                 "params": ["history_length", "horizons_s", "seed"]})
+    for engine_id, label in (("fly", "Fly reservoir (sampled)"), ("random", "Random reservoir")):
         base.append({"engine_id": engine_id, "label": label, "available": False,
                      "reason": "This research engine has no validated numeric signal head for project replay.",
                      "params": []})
     return base
 
 
+def _fit_full_cns(train, validation, params, scaler, should_stop, status_cb):
+    if should_stop():
+        raise InterruptedError("Full MaleCNS signal training cancelled")
+    status_cb({"stage": "preparing", "message": "Verifying and loading the full MaleCNS connectome"})
+    model = build_signal_full_cns(params["seed"])
+    designs = []
+    for label, frame in (("Train", train), ("Validation", validation)):
+        x = (frame["x"] - scaler["mean"]) / scaler["std"]
+        def progress(done, total, label=label):
+            status_cb({"stage": "training", "message": f"Full MaleCNS · {label} windows {done}/{total}"})
+        designs.append(model.transform(x, should_stop=should_stop, status_cb=progress))
+    train_design, val_design = designs
+    model.design_mean = train_design.mean(axis=0)
+    model.design_std = np.maximum(train_design.std(axis=0), 1e-6)
+    standardized = (train_design - model.design_mean) / model.design_std
+    y = (train["y"] - scaler["mean"]) / scaler["std"]
+    best_heads, best_pred, best_mae, scores = None, None, float("inf"), []
+    for alpha in (0.001, 0.01, 0.1, 1.0, 10.0, 100.0):
+        heads = []
+        for j in range(len(params["horizons_s"])):
+            if should_stop():
+                raise InterruptedError("Full MaleCNS signal training cancelled")
+            active = train["mask"][:, j]
+            weights = _weights(np.asarray(train["unit_id"])[active].tolist())
+            head = Ridge(alpha=alpha, solver="cholesky")
+            head.fit(standardized[active], y[active, j], sample_weight=weights)
+            heads.append(head)
+        model.heads = heads
+        pred = model.predict_design(val_design) * scaler["std"] + scaler["mean"]
+        if scaler.get("output_domain") == "nonnegative":
+            pred = np.maximum(pred, 0.0)
+        metric = _metrics(pred, validation, params["horizons_s"])["mae"]
+        if metric is None or not np.isfinite(metric):
+            raise ValueError("Validation has no finite Full MaleCNS signal score")
+        scores.append({"ridge_alpha": alpha, "unit_equal_mae": metric})
+        if metric < best_mae:
+            best_heads, best_pred, best_mae = heads, pred.copy(), metric
+    model.heads = best_heads
+    selection = {"criterion": "validation_unit_equal_mae", "candidates": scores,
+                 "selected_ridge_alpha": next(row["ridge_alpha"] for row in scores if row["unit_equal_mae"] == best_mae)}
+    return model, selection, best_pred
+
+
 def _fit_recurrent(engine_id: str, train: dict, validation: dict, params: dict, scaler: dict,
                    should_stop: Callable[[], bool], status_cb: Callable[[dict], None]) -> SignalRecurrent:
     torch.manual_seed(params["seed"])
-    model = SignalRecurrent(engine_id, 1, params["hidden_size"], len(params["horizons_s"]))
+    model = SignalRecurrent(engine_id, 1, params["hidden_size"], len(params["horizons_s"]),
+                            residual_forecast=params.get("residual_forecast", False))
     optimizer = torch.optim.AdamW(model.parameters(), lr=params["learning_rate"])
     x_train = torch.from_numpy(((train["x"] - scaler["mean"]) / scaler["std"]).astype(np.float32))
     y_train = torch.from_numpy(((train["y"] - scaler["mean"]) / scaler["std"]).astype(np.float32))
@@ -332,20 +410,26 @@ def train_signal_run(project_id: str, snapshot_id: str | None, engine_id: str, p
     scaler = {"mean": float(np.mean(train_values)), "std": float(max(np.std(train_values), 1e-6)),
               "fit_units": sorted(map(str, split["train"])),
               "output_domain": data["schema"].get("output_domain", "real")}
-    if engine_id in {"gru", "lstm"}:
+    val_pred = None
+    if engine_id == "full_cns":
+        model, selection, val_pred = _fit_full_cns(train, val, config, scaler, stop, report)
+        artifact_name = "model.joblib"
+    elif engine_id in {"gru", "lstm"}:
         model = _fit_recurrent(engine_id, train, val, config, scaler, stop, report)
         artifact_name = "model.pt"
         selection = {"criterion": "validation_unit_equal_mae", "selected_checkpoint": "best_epoch"}
     else:
         model, selection = _fit_boosting(train, val, config, scaler, stop, report)
         artifact_name = "model.joblib"
-    val_pred, _, _ = _predict(model, engine_id, val, scaler)
+    if val_pred is None:
+        val_pred, _, _ = _predict(model, engine_id, val, scaler)
     val_metrics = _metrics(val_pred, val, config["horizons_s"])
     if stop():
         raise InterruptedError("Signal training cancelled before test evaluation")
     # The test data are first touched after model selection has finished.
     test = _windows(data["features"], split["test"], config)
-    test_pred, _, _ = _predict(model, engine_id, test, scaler)
+    report({"stage": "evaluating", "message": "Evaluating the frozen signal model on held-out Test"})
+    test_pred, _, _ = _predict(model, engine_id, test, scaler, should_stop=stop)
     test_metrics = _metrics(test_pred, test, config["horizons_s"])
     if stop():
         raise InterruptedError("Signal training cancelled before run publication")
@@ -363,6 +447,8 @@ def train_signal_run(project_id: str, snapshot_id: str | None, engine_id: str, p
         contract = {"project_id": project_id, "snapshot_id": data["snapshot_id"],
                     "engine_id": engine_id, "params": config, "schema": data["schema"],
                     "snapshot_fingerprint_sha256": _digest(fingerprint), "scaler": scaler}
+        if engine_id == "full_cns":
+            contract["connectome"] = model.provenance
         atomic_write_json(run_dir / "training_contract.json", contract)
         manifest = {
             "schema_version": SCHEMA_VERSION, "task": "signal_forecast", "status": "completed",
@@ -376,6 +462,8 @@ def train_signal_run(project_id: str, snapshot_id: str | None, engine_id: str, p
             "interval_status": "unvalidated_pointwise_quantiles" if engine_id == "quantile_boosting" else "unavailable",
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        if engine_id == "full_cns":
+            manifest["connectome"] = model.provenance
         atomic_write_json(run_dir / "manifest.json", manifest)
         if stop():
             raise InterruptedError("Signal training cancelled before run selection")
@@ -434,4 +522,11 @@ def load_signal_run(project_id: str, run_id: str) -> dict:
     for key in ("project_id", "snapshot_id", "engine_id", "params", "schema", "snapshot_fingerprint_sha256", "scaler"):
         if contract.get(key) != manifest.get(key):
             raise ValueError(f"Signal run {key} differs from saved training contract")
+    if manifest.get("engine_id") == "full_cns":
+        provenance = contract.get("connectome")
+        if not provenance or provenance != manifest.get("connectome"):
+            raise ValueError("Signal run connectome differs from saved training contract")
+        if (provenance.get("graph_mode") != "real_connectome" or provenance.get("is_synthetic") is not False
+                or provenance.get("node_sampling") is not False or not provenance.get("graph_hash")):
+            raise ValueError("Signal run requires a complete real MaleCNS connectome")
     return {**manifest, "dir": directory, "artifact_path": directory / manifest["artifact"]}
