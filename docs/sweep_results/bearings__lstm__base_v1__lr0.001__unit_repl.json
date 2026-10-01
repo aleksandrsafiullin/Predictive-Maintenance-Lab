@@ -1,0 +1,24 @@
+{
+  "label": "bearings/lstm/base_v1/lr0.001/unit_repl",
+  "dataset_id": "bearings",
+  "architecture": "lstm",
+  "feature_recipe": "base_v1",
+  "learning_rate": 0.001,
+  "sampling": "unit_replacement",
+  "near_weight": 0.0,
+  "max_epochs_limit": 30,
+  "status": "completed",
+  "run_id": "bearings_lstm_20261001_084427_ef93c3",
+  "best_epoch": 17,
+  "best_metric": 7482.742128,
+  "elapsed_s": 26.6,
+  "selection_metric_name": "near_30m_mae_s",
+  "selection_metric_unit": "seconds",
+  "val_mae_events": 20165.098,
+  "n_val_event_units": 3,
+  "log_tail": [
+    "bearings_lstm_20261001_084427_ef93c3 epoch 25/30 val=7921.893818 best=17 lr=0.00025 unique=2949/6852",
+    "bearings_lstm_20261001_084427_ef93c3 epoch 26/30 val=7591.058869 best=17 lr=0.00025 unique=2961/6852",
+    "bearings_lstm_20261001_084427_ef93c3 epoch 27/30 val=7548.860718 best=17 lr=0.00025 unique=2942/6852"
+  ]
+}

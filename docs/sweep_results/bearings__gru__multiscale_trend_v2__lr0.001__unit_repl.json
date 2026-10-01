@@ -1,0 +1,24 @@
+{
+  "label": "bearings/gru/multiscale_trend_v2/lr0.001/unit_repl",
+  "dataset_id": "bearings",
+  "architecture": "gru",
+  "feature_recipe": "multiscale_trend_v2",
+  "learning_rate": 0.001,
+  "sampling": "unit_replacement",
+  "near_weight": 0.0,
+  "max_epochs_limit": 30,
+  "status": "completed",
+  "run_id": "bearings_gru_20261001_084427_db0d94",
+  "best_epoch": 2,
+  "best_metric": 10553.251796,
+  "elapsed_s": 17.4,
+  "selection_metric_name": "near_30m_mae_s",
+  "selection_metric_unit": "seconds",
+  "val_mae_events": 22316.4247,
+  "n_val_event_units": 3,
+  "log_tail": [
+    "bearings_gru_20261001_084427_db0d94 epoch 10/30 val=11676.173367 best=2 lr=0.0005 unique=2939/6852",
+    "bearings_gru_20261001_084427_db0d94 epoch 11/30 val=12423.719085 best=2 lr=0.0005 unique=2903/6852",
+    "bearings_gru_20261001_084427_db0d94 epoch 12/30 val=12021.249806 best=2 lr=0.0005 unique=2949/6852"
+  ]
+}

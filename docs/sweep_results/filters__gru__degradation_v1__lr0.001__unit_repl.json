@@ -1,0 +1,24 @@
+{
+  "label": "filters/gru/degradation_v1/lr0.001/unit_repl",
+  "dataset_id": "filters",
+  "architecture": "gru",
+  "feature_recipe": "degradation_v1",
+  "learning_rate": 0.001,
+  "sampling": "unit_replacement",
+  "near_weight": 0.0,
+  "max_epochs_limit": 30,
+  "status": "completed",
+  "run_id": "filters_gru_20261001_083536_67f1ce",
+  "best_epoch": 1,
+  "best_metric": 0.296631,
+  "elapsed_s": 82.4,
+  "selection_metric_name": "survival_nll",
+  "selection_metric_unit": "NLL",
+  "val_mae_events": 8.5125,
+  "n_val_event_units": 1,
+  "log_tail": [
+    "filters_gru_20261001_083536_67f1ce epoch 9/30 val=0.555084 best=1 lr=0.0005 unique=19096/32279",
+    "filters_gru_20261001_083536_67f1ce epoch 10/30 val=0.608336 best=1 lr=0.0005 unique=19067/32279",
+    "filters_gru_20261001_083536_67f1ce epoch 11/30 val=0.644487 best=1 lr=0.0005 unique=19125/32279"
+  ]
+}

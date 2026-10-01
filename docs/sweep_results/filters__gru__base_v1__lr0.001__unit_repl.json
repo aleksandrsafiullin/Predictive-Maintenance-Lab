@@ -1,0 +1,24 @@
+{
+  "label": "filters/gru/base_v1/lr0.001/unit_repl",
+  "dataset_id": "filters",
+  "architecture": "gru",
+  "feature_recipe": "base_v1",
+  "learning_rate": 0.001,
+  "sampling": "unit_replacement",
+  "near_weight": 0.0,
+  "max_epochs_limit": 30,
+  "status": "completed",
+  "run_id": "filters_gru_20261001_083536_987d8f",
+  "best_epoch": 2,
+  "best_metric": 0.303806,
+  "elapsed_s": 87.1,
+  "selection_metric_name": "survival_nll",
+  "selection_metric_unit": "NLL",
+  "val_mae_events": 9.5342,
+  "n_val_event_units": 1,
+  "log_tail": [
+    "filters_gru_20261001_083536_987d8f epoch 10/30 val=0.574894 best=2 lr=0.0005 unique=19067/32279",
+    "filters_gru_20261001_083536_987d8f epoch 11/30 val=0.595834 best=2 lr=0.0005 unique=19125/32279",
+    "filters_gru_20261001_083536_987d8f epoch 12/30 val=0.700523 best=2 lr=0.0005 unique=19071/32279"
+  ]
+}

@@ -2,10 +2,10 @@
   "datasets": {
     "filters": {
       "dataset_id": "filters",
-      "obtained_at": "2026-09-10T10:38:05Z",
+      "obtained_at": "2026-10-01T08:30:33Z",
       "source": {
         "kind": "kagglehub",
-        "path": "/Users/aks/.cache/kagglehub/datasets/prognosticshse/preventive-to-predicitve-maintenance/versions/8",
+        "path": "/home/ubuntu/.cache/kagglehub/datasets/prognosticshse/preventive-to-predicitve-maintenance/versions/8",
         "url": "https://www.kaggle.com/datasets/prognosticshse/preventive-to-predicitve-maintenance",
         "version_dir": "8"
       },
@@ -55,19 +55,22 @@
     },
     "bearings": {
       "dataset_id": "bearings",
-      "obtained_at": "2026-09-10T10:48:33Z",
+      "obtained_at": "2026-10-01T08:33:15Z",
       "source": {
         "kind": "huggingface_author_zip_mirror",
         "author_page": "https://biaowang.tech/xjtu-sy-bearing-datasets/",
-        "url": "https://huggingface.co/datasets/DavidNguyen/XJTU-SY_Bearing_Datasets/resolve/main/XJTU-SY_Bearing_Datasets.zip",
-        "note": "Official Google Drive from biaowang.tech was not used for the completed download; this is XJTU-SY_Bearing_Datasets.zip matching the author package (15 bearings, 9216 CSV fragments)."
+        "google_drive_folder_id": "1_ycmG46PARiykt82ShfnFfyQsaXv3_VK",
+        "url": "https://huggingface.co/datasets/DavidNguyen/XJTU-SY_Bearing_Datasets/resolve/main/XJTU-SY_Bearing_Datasets.zip?download=true",
+        "note": "Official Google Drive from biaowang.tech was unavailable; downloaded XJTU-SY_Bearing_Datasets.zip from a public copy of the author package.",
+        "errors": [
+          "Google Drive (author link) failed: download_folder() got an unexpected keyword argument 'remaining_ok'"
+        ]
       },
       "use": "validation of prognostics algorithms; citation requested by author",
       "files": [
         {
           "relpath": "XJTU-SY_Bearing_Datasets.zip",
-          "bytes": 5447931446,
-          "sha256": "3cc815649a315ac7da202980c489f33db44ca2db0317bbe3bcb9dcf415375e10"
+          "bytes": 5447931446
         }
       ]
     }

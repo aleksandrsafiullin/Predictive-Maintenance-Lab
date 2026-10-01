@@ -1,0 +1,24 @@
+{
+  "label": "bearings/gru/base_v1/lr0.001/full_pass",
+  "dataset_id": "bearings",
+  "architecture": "gru",
+  "feature_recipe": "base_v1",
+  "learning_rate": 0.001,
+  "sampling": "full_pass",
+  "near_weight": 0.0,
+  "max_epochs_limit": 30,
+  "status": "completed",
+  "run_id": "bearings_gru_20261001_084455_421850",
+  "best_epoch": 30,
+  "best_metric": 5137.926406,
+  "elapsed_s": 37.1,
+  "selection_metric_name": "near_30m_mae_s",
+  "selection_metric_unit": "seconds",
+  "val_mae_events": 18504.1052,
+  "n_val_event_units": 3,
+  "log_tail": [
+    "bearings_gru_20261001_084455_421850 epoch 28/30 val=5406.870992 best=25 lr=0.0005 unique=6852/6852",
+    "bearings_gru_20261001_084455_421850 epoch 29/30 val=5601.192807 best=25 lr=0.0005 unique=6852/6852",
+    "bearings_gru_20261001_084455_421850 epoch 30/30 val=5137.926406 best=30 lr=0.0005 unique=6852/6852"
+  ]
+}

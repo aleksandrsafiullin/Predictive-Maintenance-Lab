@@ -1,0 +1,24 @@
+{
+  "label": "bearings/lstm/degradation_v1/lr0.001/full_pass",
+  "dataset_id": "bearings",
+  "architecture": "lstm",
+  "feature_recipe": "degradation_v1",
+  "learning_rate": 0.001,
+  "sampling": "full_pass",
+  "near_weight": 0.0,
+  "max_epochs_limit": 30,
+  "status": "completed",
+  "run_id": "bearings_lstm_20261001_084505_dceb20",
+  "best_epoch": 15,
+  "best_metric": 7226.930587,
+  "elapsed_s": 23.5,
+  "selection_metric_name": "near_30m_mae_s",
+  "selection_metric_unit": "seconds",
+  "val_mae_events": 24960.4846,
+  "n_val_event_units": 3,
+  "log_tail": [
+    "bearings_lstm_20261001_084505_dceb20 epoch 23/30 val=8466.365405 best=15 lr=0.00025 unique=6852/6852",
+    "bearings_lstm_20261001_084505_dceb20 epoch 24/30 val=8028.131714 best=15 lr=0.00025 unique=6852/6852",
+    "bearings_lstm_20261001_084505_dceb20 epoch 25/30 val=8753.530806 best=15 lr=0.00025 unique=6852/6852"
+  ]
+}

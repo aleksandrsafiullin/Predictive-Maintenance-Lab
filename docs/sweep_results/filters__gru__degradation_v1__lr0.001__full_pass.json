@@ -1,0 +1,24 @@
+{
+  "label": "filters/gru/degradation_v1/lr0.001/full_pass",
+  "dataset_id": "filters",
+  "architecture": "gru",
+  "feature_recipe": "degradation_v1",
+  "learning_rate": 0.001,
+  "sampling": "full_pass",
+  "near_weight": 0.0,
+  "max_epochs_limit": 30,
+  "status": "completed",
+  "run_id": "filters_gru_20261001_083708_cab469",
+  "best_epoch": 1,
+  "best_metric": 0.273192,
+  "elapsed_s": 86.7,
+  "selection_metric_name": "survival_nll",
+  "selection_metric_unit": "NLL",
+  "val_mae_events": 11.0104,
+  "n_val_event_units": 1,
+  "log_tail": [
+    "filters_gru_20261001_083708_cab469 epoch 9/30 val=0.565313 best=1 lr=0.0005 unique=32279/32279",
+    "filters_gru_20261001_083708_cab469 epoch 10/30 val=0.603149 best=1 lr=0.0005 unique=32279/32279",
+    "filters_gru_20261001_083708_cab469 epoch 11/30 val=0.840382 best=1 lr=0.0005 unique=32279/32279"
+  ]
+}
