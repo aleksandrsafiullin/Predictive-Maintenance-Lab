@@ -1,0 +1,24 @@
+{
+  "label": "filters/gru/multiscale_no_age_v2/lr0.001/unit_repl",
+  "dataset_id": "filters",
+  "architecture": "gru",
+  "feature_recipe": "multiscale_no_age_v2",
+  "learning_rate": 0.001,
+  "sampling": "unit_replacement",
+  "near_weight": 0.0,
+  "max_epochs_limit": 30,
+  "status": "completed",
+  "run_id": "filters_gru_20261001_083641_b7aefb",
+  "best_epoch": 1,
+  "best_metric": 0.289315,
+  "elapsed_s": 89.6,
+  "selection_metric_name": "survival_nll",
+  "selection_metric_unit": "NLL",
+  "val_mae_events": 6.5414,
+  "n_val_event_units": 1,
+  "log_tail": [
+    "filters_gru_20261001_083641_b7aefb epoch 9/30 val=0.473680 best=1 lr=0.0005 unique=19096/32279",
+    "filters_gru_20261001_083641_b7aefb epoch 10/30 val=0.487505 best=1 lr=0.0005 unique=19067/32279",
+    "filters_gru_20261001_083641_b7aefb epoch 11/30 val=0.468813 best=1 lr=0.0005 unique=19125/32279"
+  ]
+}

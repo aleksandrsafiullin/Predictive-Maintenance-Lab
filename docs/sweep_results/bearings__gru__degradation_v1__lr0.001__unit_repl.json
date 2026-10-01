@@ -1,0 +1,24 @@
+{
+  "label": "bearings/gru/degradation_v1/lr0.001/unit_repl",
+  "dataset_id": "bearings",
+  "architecture": "gru",
+  "feature_recipe": "degradation_v1",
+  "learning_rate": 0.001,
+  "sampling": "unit_replacement",
+  "near_weight": 0.0,
+  "max_epochs_limit": 30,
+  "status": "completed",
+  "run_id": "bearings_gru_20261001_084427_c0e338",
+  "best_epoch": 11,
+  "best_metric": 5963.819311,
+  "elapsed_s": 28.1,
+  "selection_metric_name": "near_30m_mae_s",
+  "selection_metric_unit": "seconds",
+  "val_mae_events": 18777.9129,
+  "n_val_event_units": 3,
+  "log_tail": [
+    "bearings_gru_20261001_084427_c0e338 epoch 19/30 val=7038.144533 best=11 lr=0.0005 unique=2922/6852",
+    "bearings_gru_20261001_084427_c0e338 epoch 20/30 val=6797.181321 best=11 lr=0.0005 unique=2920/6852",
+    "bearings_gru_20261001_084427_c0e338 epoch 21/30 val=6609.724058 best=11 lr=0.0005 unique=2888/6852"
+  ]
+}
