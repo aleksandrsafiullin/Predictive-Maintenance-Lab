@@ -566,7 +566,6 @@ def screen_data(dataset_id: str) -> None:
     if dataset_id == "filters":
         _render_filters_time_note()
     state = _data_state(dataset_id)
-    st.write("Data state:", state)
     raw = dataset_raw(dataset_id)
     has_raw = raw.is_dir() and any(p.is_file() for p in raw.rglob("*"))
     with st.expander("Prepare snapshot", expanded=state != "ready"):
@@ -656,10 +655,8 @@ def screen_data(dataset_id: str) -> None:
         st.dataframe(counts_tbl, width="stretch", hide_index=True)
         excluded = wc.get("excluded") or {}
         st.caption(
-            f"Cached counts for history_length={hist_len} from prepare (dataset config). "
-            "Eligible windows match training windowing at that length. "
-            "Post-event is t ≥ event_time (observed) or t ≥ observation_end (censored). "
-            "This screen reads data_report.json and does not rebuild windows."
+            f"Window counts for history_length={hist_len}. "
+            "Post-event: t ≥ event_time (observed) or t ≥ observation_end (censored)."
         )
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Eligible windows", wc.get("eligible"))
@@ -687,9 +684,6 @@ def screen_data(dataset_id: str) -> None:
         fig.update_yaxes(title_text="Differential pressure (Pa)")
     st.plotly_chart(style_figure(fig, theme), width="stretch", theme=None)
     st.subheader("Target and quality")
-    st.write(report.get("sensor_time_note", ""))
-    phys = report.get("history_length_physical") or {}
-    st.caption(phys.get("note") or "")
     if dataset_id == "filters" and report.get("time_unit_note"):
         st.caption(
             "Sensor timestamps use seconds as labelled in the source paper. Exports retain original CSV Time/RUL fields. "
@@ -699,8 +693,6 @@ def screen_data(dataset_id: str) -> None:
     if report.get("issues_and_decisions"):
         for issue in report["issues_and_decisions"]:
             st.warning(issue)
-    with st.expander("data_report.json (debug)"):
-        st.json(report)
 
 
 def screen_train(dataset_id: str) -> None:
@@ -1330,15 +1322,6 @@ def screen_replay(dataset_id: str) -> None:
             [e["eval_id"] for e in mode_evals],
             key=f"eval_pick_{dataset_id}_{run_id}_{replay_mode}",
         )
-        st.caption(
-            "Each Evaluate writes a new `evaluations/<eval_id>/` and never overwrites a prior report. "
-            "predictions.csv does not depend on H/K."
-        )
-    elif replay_mode == REPLAY_MODE_RESEARCH and (rdir / "predictions.csv").exists():
-        st.caption(
-            "Legacy run-root `predictions.csv` / `test_metrics.json` (read-only). "
-            "New evaluations write under `evaluations/<eval_id>/`."
-        )
 
     if eval_id:
         artifacts = resolve_evaluation_artifacts(rdir, eval_id)
@@ -1430,18 +1413,11 @@ def screen_replay(dataset_id: str) -> None:
                 "Test replay does not use widget H/K."
             )
         elif matching_eval and has_preds and not uid_in_mask:
-            st.error(
-                "Play is blocked: selected unit is not in this evaluation's unit mask. "
-                "This screen does not run model inference on the Streamlit request thread."
-            )
+            st.error("Play is blocked: selected unit is not in this evaluation's unit mask.")
         else:
-            st.error(
-                "Play is blocked until Evaluate writes `evaluations/<eval_id>/predictions.csv`. "
-                "This screen does not run model inference on the Streamlit request thread. "
-                "Queue Evaluate (background worker) — not an unbounded inline Predictor."
-            )
+            st.error("Play is blocked. Run Evaluate to write predictions, then replay will unlock.")
         if eval_running:
-            st.info("Evaluate is running in the worker. Replay unlocks when predictions.csv is written.")
+            st.info("Evaluate is running. Replay unlocks when it finishes.")
         _render_replay_controls(enabled=False, n=max(n, 1))
         _render_evaluation_panel(dataset_id, artifacts, table_unit_ids, replay_mode=replay_mode)
         return
@@ -1518,8 +1494,7 @@ def screen_replay(dataset_id: str) -> None:
     _mount_replay_playback(playing=bool(st.session_state.get("playing")))
     _render_evaluation_panel(dataset_id, artifacts, table_unit_ids, replay_mode=replay_mode)
     if frozen_alerts_path is not None:
-        with st.expander("Retrospective eval alert log (all units)"):
-            st.caption("Frozen `alerts.csv` from Evaluate. Not filtered to replay time; not the live H/K rescore.")
+        with st.expander("Alert log (all units)"):
             st.dataframe(frozen_alerts, width="stretch", hide_index=True)
 
 
@@ -1529,18 +1504,13 @@ def _render_evaluation_panel(
     st.subheader("Evaluation summary")
     eval_id = artifacts.get("eval_id")
     if eval_id:
-        st.markdown(f"**eval_id:** `{eval_id}`")
-        st.caption(f"Immutable report under `evaluations/{eval_id}/`.")
-    elif artifacts.get("legacy"):
-        st.caption("Legacy `test_metrics.json` (read-only). New evaluations write under `evaluations/<eval_id>/`.")
+        st.markdown(f"`{eval_id}`")
 
     metrics = read_evaluation_metrics(artifacts)
     if metrics is None:
-        st.info(f"No metrics.json yet. Run Evaluate {_evaluate_scope_noun(replay_mode)}.")
+        st.info(f"No evaluation yet. Run Evaluate {_evaluate_scope_noun(replay_mode)}.")
         _eval_artifact_downloads(artifacts, dataset_id)
         return
-    if not metrics.get("primary_metric"):
-        st.caption("RUL metric tables are not populated yet (stub `metrics.json`).")
 
     cards = evaluation_metric_cards(metrics, dataset_id)
     if cards:
@@ -1580,8 +1550,6 @@ def _render_evaluation_panel(
             "evaluation label, not a sensor-observed 600 Pa event."
         )
 
-    with st.expander("metrics.json (debug)"):
-        st.json(metrics)
     _eval_artifact_downloads(artifacts, dataset_id)
 
 
@@ -1594,11 +1562,8 @@ def _eval_artifact_downloads(artifacts: dict, dataset_id: str) -> None:
     if dataset_id == "filters":
         st.caption(
             "CSV columns with an _s suffix use source seconds and keep time_original when present. "
-            "Predicted RUL describes the trained laboratory endpoint task; it is not a validated equipment failure clock. "
-            "Files are read from the evaluation directory."
+            "Predicted RUL describes the trained laboratory endpoint task; it is not a validated equipment failure clock."
         )
-    else:
-        st.caption("CSV downloads are the files in the evaluation directory, not a live rerun.")
     if pred is not None:
         st.download_button(
             "Download predictions CSV",
@@ -1645,18 +1610,9 @@ def _render_replay_header(
         f"**split:** `{split_label}`",
         f"**H_trigger:** `{_format_h_trigger_header(h_s, dataset_id)}`",
     ]
-    if eval_id:
-        bits.insert(1, f"**eval_id:** `{eval_id}`")
     st.markdown(" · ".join(bits))
-    if eval_id:
-        st.caption("Historical replay of a frozen evaluation. Predictions are not recomputed on this page.")
-    elif has_predictions:
-        st.caption(
-            "No `evaluations/<eval_id>/` yet — using legacy run-root `predictions.csv`. "
-            "Play is unlocked. Predictions are not recomputed on this page."
-        )
-    else:
-        st.caption("No `evaluations/<eval_id>/` yet — Play stays blocked until Evaluate writes predictions.csv.")
+    if not eval_id and not has_predictions:
+        st.caption("No evaluation saved yet. Run Evaluate to unlock replay.")
 
 
 def _sync_replay_session(key: tuple[str, str, str, str, str]) -> None:
@@ -2102,7 +2058,7 @@ def _replay_playback_body() -> None:
             replay_mode=str(view.get("replay_mode") or REPLAY_MODE_TEST),
         )
     st.subheader("Alert log")
-    st.caption("Selected unit only, timestamps ≤ current replay time. Full eval log is in the expander below.")
+    st.caption("Selected unit, up to the current replay time.")
     st.dataframe(live_alerts, width="stretch", hide_index=True)
     visible = visible_replay_slice(prefix_pred, live_alerts)
     if not visible.empty:
@@ -2112,10 +2068,6 @@ def _replay_playback_body() -> None:
             file_name=f"replay_slice_{uid}.csv",
             mime="text/csv",
             key=f"dl_visible_replay_{run_id}_{uid}_{eval_id or 'legacy'}",
-        )
-        st.caption(
-            "Visible slice is issued forecasts and alerts with timestamp ≤ current replay time. "
-            "Ground-truth overlay is omitted from this file."
         )
 
 

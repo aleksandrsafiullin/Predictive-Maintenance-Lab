@@ -176,8 +176,8 @@ def render_training(project_id: str, snapshot: dict) -> None:
     st.caption(f"Average observed Train history per unit: {_time_for_training(mean_duration, snapshot['schema'])}. "
                f"The proposed direct forecast reaches {_time_for_training(max(defaults['horizons_s']), snapshot['schema'])}.")
     if mean_duration > 0:
-        st.caption(f"Proposed useful RED-warning lead: {_time_for_training(mean_duration / 3, snapshot['schema'])} "
-                   "(one third of mean Train history). This is an evaluation target, not a trained alert guarantee.")
+        st.caption(f"Proposed RED-warning lead: {_time_for_training(mean_duration / 3, snapshot['schema'])} "
+                   "(one third of mean Train history).")
     if max(defaults["horizons_s"]) + 1e-6 < required_horizon:
         st.warning("This snapshot has no known Train and Validation targets at the average Train history length. "
                    "A validated direct forecast that far is not possible until longer continuous histories "

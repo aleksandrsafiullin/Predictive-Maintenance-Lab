@@ -429,9 +429,8 @@ def render_results(project_id: str, snapshot: dict, selected_run_id: str | None 
         provenance = manifest["connectome"]
         st.caption(f"{provenance['dataset']} · {provenance['n_nodes']:,} neurons · "
                    f"{provenance['n_edges']:,} directed connections · {provenance['n_synapses']:,} synaptic contacts.")
-        with st.expander("Connectome source and computation"):
+        with st.expander("Connectome source"):
             st.markdown("[Original MaleCNS data · HHMI Janelia / Cambridge / MRC LMB / Google Research](https://male-cns.janelia.org/download/)")
-            st.write("All classified neuron states are computed. Original connectivity is fixed; sensor encoding, scaled weights and leaky tanh dynamics are mathematical choices. Only the numeric signal readout is fitted.")
             st.caption(f"Graph SHA-256: {provenance['graph_hash']}")
     trained = manifest["params"]["horizons_s"]
     st.caption(f"{engine} · held-out Test unit · direct model forecast through "
@@ -439,8 +438,8 @@ def render_results(project_id: str, snapshot: dict, selected_run_id: str | None 
                f"signal in {snapshot['schema'].get('signal_unit', 'native units')}")
     mean_train_duration = average_training_duration_s(snapshot)
     if mean_train_duration > 0:
-        st.caption(f"Proposed useful RED-warning lead: {_lead_label(mean_train_duration / 3, snapshot['schema'])} "
-                   "(one third of mean Train history). This run has no validated event-time alert policy.")
+        st.caption(f"Proposed RED-warning lead: {_lead_label(mean_train_duration / 3, snapshot['schema'])} "
+                   "(one third of mean Train history).")
     if max(trained) + 1e-6 < mean_train_duration:
         average_label = (f"{mean_train_duration / 60:.1f} min"
                          if snapshot["schema"].get("source_kind") == "xjtu_bearings"
