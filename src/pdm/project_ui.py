@@ -344,7 +344,7 @@ def _render_import(store, project: dict) -> None:
     with st.container(border=True, key="pdm-import-signal"):
         st.subheader("Signal", anchor=False)
         if kind == "generic_sensor_csv":
-            st.caption("Each CSV needs unit_id, timestamp_s, and the selected numeric signal. Time is in seconds. Other columns are descriptive in this first version.")
+            st.caption("Each CSV needs unit_id, timestamp_s, and the selected numeric signal column. Time is in seconds.")
             s1, s2, s3 = st.columns(3)
             signal_column = s1.text_input("Signal column", value=str(saved.get("signal_column") or "signal"),
                                           help=IMPORT_SIGNAL_COLUMN_HELP)
@@ -357,7 +357,7 @@ def _render_import(store, project: dict) -> None:
             st.caption("XJTU-SY vibration fragments produce max-axis RMS acceleration in g. Acquisition time is recorded in seconds.")
         else:
             signal_column, signal_label, signal_unit = "differential_pressure", "Differential pressure", "Pa"
-            st.caption("HSE differential pressure is measured in Pa and source Time is seconds. Official test RUL stays for evaluation only.")
+            st.caption("HSE differential pressure is measured in Pa. Source time is in seconds.")
         st.caption("Yellow and red limits are set on Data Quality after import.")
     status = status_for_project(pid)
     running = worker_alive() or status.get("status") in {"queued", "running", "training", "preparing", "stopping"}

@@ -231,7 +231,7 @@ def _render_replay(rows, measurements, bundle, directory, key):
     show_old = st.checkbox("Show previously issued forecasts", value=False, key=key+"old")
     signal, unit = profile["signal_name"], profile["signal_unit"]
     scale = 60. if profile["time_basis"] == "physical_seconds" else 1.
-    time_label = "minutes" if scale == 60. else "dataset internal time"
+    time_label = "minutes" if scale == 60. else "time (s)"
     theme = current_theme()
     t, zone_color = tokens(theme), zone_colors(theme)
     fig = go.Figure()

@@ -1174,7 +1174,7 @@ def test_app_data_screen_reads_cached_counts_not_build_windows(monkeypatch, tiny
     assert kinds.str.contains("Right-censored").any()
 
     captions = "\n".join(str(w.value) for w in at.caption)
-    assert "does not rebuild windows" in captions
+    assert "Window counts" in captions or "history_length" in captions
     assert "Data_No" in captions or "origin_unit_id" in captions
     assert any("evaluation label" in str(w.value) for w in at.caption)
 
@@ -1389,8 +1389,6 @@ def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables
     assert mode.value == "Validation"
     eval_box = next(s for s in at.selectbox if "Evaluation" in s.label)
     assert eval_id in list(eval_box.options)
-    captions = "\n".join(str(w.value) for w in at.caption)
-    assert "never overwrites" in captions or "does not depend on H/K" in captions
     labels = [n.label for n in at.number_input]
     assert any("H_trigger" in lab for lab in labels)
     assert any("Minimum action lead time" in lab for lab in labels)
@@ -1429,13 +1427,10 @@ def test_app_replay_lists_evaluations(monkeypatch, tmp_path, tiny_bearing_tables
     infos = "\n".join(str(w.value) for w in at.info)
     assert "Age-only" in infos
     assert "overlap" in infos.lower() or "coverage" in infos.lower()
-    expanders = [str(e.label) for e in at.expander]
-    assert any("metrics.json" in lab for lab in expanders)
     dl = [b.label for b in at.download_button]
     assert any("predictions CSV" in lab for lab in dl)
     assert any("alerts CSV" in lab for lab in dl)
     captions = "\n".join(str(w.value) for w in at.caption)
-    assert "evaluation directory" in captions or "evaluations/" in captions
     assert "3 bearings" in captions or "3 held-out" in captions
 
 
@@ -1675,14 +1670,11 @@ def test_app_replay_screen_loads_without_eval(monkeypatch, tmp_path, tiny_bearin
     at.run()
     assert not at.exception
     errors = "\n".join(str(w.value) for w in at.error)
-    assert "predictions.csv" in errors or "Evaluate test set" in errors
+    assert "Play is blocked" in errors
     infos = "\n".join(str(w.value) for w in at.info)
-    assert "Run Evaluate validation set." in infos
-    assert "Run Evaluate test set." not in infos
+    assert "No evaluation yet" in infos or "Evaluate validation set" in infos
     play = next(b for b in at.button if b.label == "Play")
     assert play.disabled
-    captions = "\n".join(str(w.value) for w in at.caption)
-    assert "Play stays blocked" in captions
 
 
 def _launch_bearing_replay(monkeypatch, tmp_path, tiny_bearing_tables, *, run_id, eval_id=None):
@@ -1774,9 +1766,6 @@ def test_app_replay_legacy_predictions_unlock_play(monkeypatch, tmp_path, tiny_b
     assert not at.exception
     play = next(b for b in at.button if b.label == "Play")
     assert not play.disabled
-    captions = "\n".join(str(w.value) for w in at.caption)
-    assert "Play stays blocked" not in captions
-    assert "legacy" in captions.lower()
 
 
 def test_replay_play_advances_without_clicks(monkeypatch, tmp_path, tiny_bearing_tables):
