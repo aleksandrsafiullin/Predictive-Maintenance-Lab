@@ -18,7 +18,7 @@ from pdm.visualization.explorer import (
     soma_join_allowed,
 )
 from pdm.visualization.overlay import build_work_overlay_figure
-from pdm.visualization.presentation import render_hero, render_metrics, render_panel_header
+from pdm.visualization.presentation import render_panel_header
 from pdm.visualization.simulation import neuron_details, simulate_step
 from pdm.worker import worker_alive
 
@@ -100,7 +100,7 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
     if cursor < 0 or cursor >= len(feat):
         st.session_state[cursor_key] = max(0, min(cursor, len(feat) - 1))
         session.update(playing=False, predictions={}, forecast_rows={}, trace=None, at=None)
-    render_hero(dataset_id, uid, split_label_for_unit(bundle.get("split"), uid))
+    st.caption(f"Test run · unit {uid} · {split_label_for_unit(bundle.get('split'), uid)} split")
     with st.container(key="lab_controls"):
         with st.container(key="lab_transport"):
             cols = st.columns(4)
@@ -245,12 +245,19 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
         event = float(unit["observation_end_s"]) + float(unit["official_rul_at_prefix_end_s"])
         actual = np.maximum(event - points["timestamp_s"].to_numpy(), 0)
         actual_now = max(event - now, 0)
-    render_metrics(
-        now=now, interval=interval, history=trace["n_history"] if continuous else min(trace["n_history"], hist_len), node_count=model.n_nodes,
-        playing=session["playing"], unit_label=unit_label, scale=scale, history_length=hist_len,
-        progress=100 * index / max(len(feat) - 1, 1), predicted_rul_s=pred,
-        continuous=continuous, interval_method=("Empirical calibrated interval" if profile else trace.get("interval_method")),
-    )
+    _history = trace["n_history"] if continuous else min(trace["n_history"], hist_len)
+    _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+    _mc1.metric(f"Clock ({unit_label})", f"{now / scale:.1f}")
+    if interval is not None:
+        _mc2.metric(f"Failure window ({unit_label})", f"{(now + interval[0]) / scale:.1f}–{(now + interval[1]) / scale:.1f}")
+        _mc3.metric(f"Remaining life ({unit_label})", f"{pred / scale:.1f}" if pred is not None else "—")
+    elif pred is not None:
+        _mc2.metric(f"Failure window ({unit_label})", f"{(now + pred) / scale:.1f}")
+        _mc3.metric(f"Remaining life ({unit_label})", f"{pred / scale:.1f}")
+    else:
+        _mc2.metric("Forecast", "Collecting history")
+        _mc3.metric(f"Remaining life ({unit_label})", "—")
+    _mc4.metric("History", f"{_history:,} / {hist_len}")
     if not predicted:
         st.caption(f"{trace['status']} · {trace['n_history']} / {hist_len} measurements before the first forecast")
     elif interval is None:
@@ -262,13 +269,13 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
         if recurrent:
             from pdm.visualization.recurrent_trace import render_recurrent_trace
 
-            render_panel_header("01", model.architecture.upper() + " · recurrent network", "Actual model activity", "SYNCHRONIZED")
+            render_panel_header("01", model.architecture.upper() + " · recurrent network", "Actual model activity")
             render_recurrent_trace(trace, model, prep)
         else:
             full_cns = bool(payload["flags"].get("full_cns"))
             random_control = model.architecture == "random_reservoir"
             render_panel_header("01", "MaleCNS · whole connectome" if full_cns else ("Random reservoir" if random_control else "The computing brain"),
-                                "Engineered control" if random_control else "MaleCNS v1.0", f"{model.n_nodes:,} computing neurons")
+                                ("Engineered control" if random_control else "MaleCNS v1.0") + f" · {model.n_nodes:,} neurons")
             if random_control:
                 payload["context_positions"] = {}
                 payload["hull_polyline"] = []
@@ -299,7 +306,7 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
             else:
                 st.markdown('<div class="lab-panel-foot">Color and intensity show the current state.</div>', unsafe_allow_html=True)
     with right, st.container(key="lab_forecast_panel"):
-        render_panel_header("02", "Failure forecast", "Evidence → failure window", "SYNCHRONIZED")
+        render_panel_header("02", "Failure forecast", "Evidence → failure window")
         fig = build_work_overlay_figure(
             dataset_id=dataset_id, unit_features=feat, now_timestamp_s=now,
             predicted_rul_s=pred, history_length=trace["n_history"] if continuous else hist_len, show_gt=show_gt,
