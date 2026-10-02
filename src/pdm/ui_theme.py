@@ -199,7 +199,9 @@ def theme_css(theme: str) -> str:
 def page_header(title: str, description: str) -> None:
     """Product-screen title plus its one-sentence page description (design-spec §5 Page header)."""
     st.title(title)
-    st.markdown(f'<p class="pdm-page-desc">{html.escape(description)}</p>', unsafe_allow_html=True)
+    text = description.strip()
+    if text:
+        st.markdown(f'<p class="pdm-page-desc">{html.escape(text)}</p>', unsafe_allow_html=True)
 
 
 def empty_state(title: str, body: str):

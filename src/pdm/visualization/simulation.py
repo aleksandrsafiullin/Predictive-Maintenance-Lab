@@ -232,3 +232,162 @@ def window_forecast_history(measurements, model, prep, history_length, *, cached
             result = {"timestamp_s": stamp, **point}
         rows.append(result)
     return pd.DataFrame(rows)
+
+
+def _continuous_model_identity(model):
+    """Same identity tuple ``continuous_trace`` / ``_full_cns_trace`` store on a trace."""
+    return (id(model), model.W_in._version, model.W_res._version, model.b_res._version, float(model.alpha))
+
+
+def _forecast_frame(measurements, prep):
+    """One unit's causal prefix. Filters recompute gaps before any split; bearings do not."""
+    frame = measurements.sort_values("timestamp_s").reset_index(drop=True).copy()
+    if getattr(prep, "dataset_id", None) == "filters":
+        from pdm.windows import recompute_filter_gap_before
+
+        frame = recompute_filter_gap_before(
+            frame,
+            gap_multiplier=prep.gap_multiplier,
+            sampling_interval_s=prep.sampling_interval_s,
+            causal=True,
+        )
+    return frame
+
+
+def _segment_bounds(frame):
+    if "gap_before" in frame.columns:
+        gaps = frame["gap_before"].fillna(False).to_numpy(dtype=bool)
+    else:
+        gaps = np.zeros(len(frame), dtype=bool)
+    starts = np.unique(np.r_[0, np.flatnonzero(gaps)])
+    return starts, np.r_[starts[1:], len(frame)]
+
+
+def _trace_covers_segment(trace, segment_ts) -> bool:
+    if not trace:
+        return False
+    raw = trace.get("raw_rul_s")
+    stamps = trace.get("timestamps_s")
+    if raw is None or stamps is None:
+        return False
+    raw = np.asarray(raw, dtype=float).reshape(-1)
+    stamps = np.asarray(stamps, dtype=float).reshape(-1)
+    return len(raw) == len(segment_ts) and np.array_equal(stamps, segment_ts)
+
+
+def _lookup_cached_segment(cache, identity, segment_ts, prefix_end):
+    """Ignore a different model, a stale identity, or a segment that runs past this prefix."""
+    for entry in cache:
+        if not isinstance(entry, dict) or entry.get("model_identity") != identity:
+            continue
+        stamps = entry.get("timestamps_s")
+        raw = entry.get("raw_rul_s")
+        if stamps is None or raw is None:
+            continue
+        stamps = np.asarray(stamps, dtype=float).reshape(-1)
+        raw = np.asarray(raw, dtype=float).reshape(-1)
+        if stamps.size == 0 or float(stamps[-1]) > prefix_end or np.any(stamps > prefix_end):
+            continue
+        if len(stamps) != len(segment_ts) or len(raw) != len(segment_ts):
+            continue
+        if np.array_equal(stamps, segment_ts):
+            return raw
+    return None
+
+
+def _store_cached_segment(cache, identity, segment_ts, raw):
+    entry = {
+        "model_identity": identity,
+        "start_timestamp_s": float(segment_ts[0]),
+        "length": int(len(segment_ts)),
+        "timestamps_s": np.array(segment_ts, dtype=float, copy=True),
+        "raw_rul_s": np.array(raw, dtype=float, copy=True),
+    }
+    for index, old in enumerate(cache):
+        if not isinstance(old, dict) or old.get("model_identity") != identity:
+            continue
+        old_ts = np.asarray(old.get("timestamps_s", []), dtype=float).reshape(-1)
+        if len(old_ts) == len(segment_ts) and np.array_equal(old_ts, segment_ts):
+            cache[index] = entry
+            return
+    cache.append(entry)
+
+
+def _score_continuous_segment(frame, start, end, model, prep, history_length):
+    """One ``continuous_trace`` for this segment.
+
+    Pass the causal prefix through ``end``, not the bare slice. On filters,
+    ``continuous_trace`` recomputes ``delta_t_s`` before it keeps the last segment;
+    an isolated slice would zero that gap row and disagree with ``predict_from_history``.
+    """
+    traced = continuous_trace(frame.iloc[: int(end)], model, prep, history_length)
+    raw = np.asarray(traced["raw_rul_s"], dtype=float).reshape(-1)
+    segment_ts = frame["timestamp_s"].to_numpy(dtype=float)[int(start) : int(end)]
+    if len(raw) != len(segment_ts) or not np.array_equal(
+        np.asarray(traced["timestamps_s"], dtype=float).reshape(-1), segment_ts
+    ):
+        raise ValueError("Continuous forecast segment does not align with its timestamps")
+    return raw
+
+
+def continuous_forecast_history(
+    measurements, model, prep, history_length, *, trace=None, cached_segments=None
+):
+    """One causal predicted-RUL row per observed measurement, warmup-masked per segment.
+
+    The active segment is copied from ``trace`` when its timestamps match. Earlier
+    segments are stored on ``cached_segments`` and are not scored again. No ground
+    truth, event time, or interval profile enters this frame.
+    """
+    frame = _forecast_frame(measurements, prep)
+    columns = ("timestamp_s", "raw_rul_s", "predicted_rul_s")
+    if frame.empty:
+        return pd.DataFrame({name: pd.Series(dtype=float) for name in columns})
+    timestamps = frame["timestamp_s"].to_numpy(dtype=float)
+    starts, ends = _segment_bounds(frame)
+    raw = np.full(len(frame), np.nan, dtype=float)
+    seen = np.empty(len(frame), dtype=int)
+    identity = _continuous_model_identity(model)
+    cache = [] if cached_segments is None else cached_segments
+    prefix_end = float(timestamps[-1])
+    last = len(starts) - 1
+    for index, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        segment_ts = timestamps[int(start) : int(end)]
+        active = index == last
+        segment_raw = None
+        if active and _trace_covers_segment(trace, segment_ts):
+            segment_raw = np.asarray(trace["raw_rul_s"], dtype=float).reshape(-1)
+        if segment_raw is None:
+            segment_raw = _lookup_cached_segment(cache, identity, segment_ts, prefix_end)
+        if segment_raw is None:
+            segment_raw = _score_continuous_segment(frame, start, end, model, prep, history_length)
+        raw[int(start) : int(end)] = segment_raw
+        seen[int(start) : int(end)] = np.arange(1, int(end) - int(start) + 1)
+        if not active:
+            _store_cached_segment(cache, identity, segment_ts, segment_raw)
+    warmup = int(history_length)
+    return pd.DataFrame({
+        "timestamp_s": timestamps,
+        "raw_rul_s": raw,
+        "predicted_rul_s": np.where(seen >= warmup, raw, np.nan),
+    })
+
+
+def equipment_forecast_frame(
+    prefix, model, prep, history_length, *, profile, trace, window_cache=None, segment_cache=None,
+):
+    """Profile, window-reset, or continuous chart rows for one observed prefix.
+
+    A loaded profile uses only the active trace arrays. Window-reset models read
+    ``window_cache``. Continuous models without a profile read ``trace`` and
+    ``segment_cache``. Ground truth is not an input.
+    """
+    if profile is not None:
+        from pdm.forecasting import predict_failure_interval
+
+        return predict_failure_interval(trace["timestamps_s"], trace["raw_rul_s"], profile)
+    if getattr(model, "state_mode", None) != "continuous":
+        return window_forecast_history(prefix, model, prep, history_length, cached=window_cache)
+    return continuous_forecast_history(
+        prefix, model, prep, history_length, trace=trace, cached_segments=segment_cache,
+    )

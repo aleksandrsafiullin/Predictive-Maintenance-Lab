@@ -19,7 +19,7 @@ from pdm.visualization.explorer import (
 )
 from pdm.visualization.overlay import build_work_overlay_figure
 from pdm.visualization.presentation import render_panel_header
-from pdm.visualization.simulation import neuron_details, simulate_step
+from pdm.visualization.simulation import equipment_forecast_frame, neuron_details, simulate_step
 from pdm.worker import worker_alive
 
 
@@ -94,12 +94,12 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
     # Reset before constructing the widget or indexing the new table.
     version = bundle.get("dataset_version")
     if session.get("dataset_version") != version:
-        session.update(playing=False, predictions={}, forecast_rows={}, trace=None, at=None, dataset_version=version)
+        session.update(playing=False, predictions={}, forecast_rows={}, continuous_segments=[], trace=None, at=None, dataset_version=version)
         st.session_state[cursor_key] = 0
     cursor = int(st.session_state.get(cursor_key, 0))
     if cursor < 0 or cursor >= len(feat):
         st.session_state[cursor_key] = max(0, min(cursor, len(feat) - 1))
-        session.update(playing=False, predictions={}, forecast_rows={}, trace=None, at=None)
+        session.update(playing=False, predictions={}, forecast_rows={}, continuous_segments=[], trace=None, at=None)
     st.caption(f"Test run · unit {uid} · {split_label_for_unit(bundle.get('split'), uid)} split")
     with st.container(key="lab_controls"):
         with st.container(key="lab_transport"):
@@ -116,7 +116,7 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
             st.info(WORKER_BUSY_MESSAGE)
             return
         if reset:
-            session.update(playing=False, predictions={}, forecast_rows={}, trace=None, at=None)
+            session.update(playing=False, predictions={}, forecast_rows={}, continuous_segments=[], trace=None, at=None)
             st.session_state[cursor_key] = 0
         elif pause:
             session["playing"] = False
@@ -169,36 +169,32 @@ def _render_equipment_simulation(dataset_id, rdir, uid, bundle, scheduled):
         # checkpoint also discards cached predictions and states.
         version = bundle.get("dataset_version")
         if session.get("checkpoint") != stamp or session.get("dataset_version") != version:
-            session.update(predictions={}, forecast_rows={}, trace=None, at=None, checkpoint=stamp, dataset_version=version)
+            session.update(predictions={}, forecast_rows={}, continuous_segments=[], trace=None, at=None, checkpoint=stamp, dataset_version=version)
         if session["at"] != index:
             session["predictions"] = {t: p for t, p in session["predictions"].items() if t <= now}
             session["trace"] = simulate_step(feat, uid, now, model, prep, hist_len, previous_trace=session["trace"])
             session["at"] = index
         trace = session["trace"]
-        pred = trace["predicted_rul_s"]
+        session.setdefault("continuous_segments", [])
+        points = equipment_forecast_frame(
+            feat.iloc[:index + 1], model, prep, hist_len,
+            profile=profile, trace=trace,
+            window_cache=session.get("forecast_rows"),
+            segment_cache=session["continuous_segments"],
+        )
+        latest = points.iloc[-1]
+        pred = float(latest["predicted_rul_s"]) if pd.notna(latest.get("predicted_rul_s")) else None
         if pred is not None:
             session["predictions"][now] = pred
+        else:
+            session["predictions"].pop(now, None)
         if profile is not None:
-            from pdm.forecasting import predict_failure_interval
-
-            points = predict_failure_interval(trace["timestamps_s"], trace["raw_rul_s"], profile)
-            latest = points.iloc[-1]
-            pred = float(latest["predicted_rul_s"]) if pd.notna(latest["predicted_rul_s"]) else None
             interval = (float(latest["lower_rul_s"]), float(latest["upper_rul_s"])) if pred is not None else None
         elif not continuous:
-            from pdm.visualization.simulation import window_forecast_history
-
-            points = window_forecast_history(feat.iloc[:index + 1], model, prep, hist_len,
-                                             cached=session.get("forecast_rows"))
             session["forecast_rows"] = {float(r["timestamp_s"]): r for r in points.to_dict("records")}
-            latest = points.iloc[-1]
-            pred = float(latest.predicted_rul_s) if pd.notna(latest.predicted_rul_s) else None
             interval = ((float(latest.lower_rul_s), float(latest.upper_rul_s))
                         if pred is not None and pd.notna(latest.get("lower_rul_s")) else None)
         else:
-            points = pd.DataFrame([
-                {"timestamp_s": t, "predicted_rul_s": p} for t, p in sorted(session["predictions"].items())
-            ], columns=["timestamp_s", "predicted_rul_s"])
             interval = ((float(trace["lower_rul_s"]), float(trace["upper_rul_s"]))
                         if pred is not None and "lower_rul_s" in trace else None)
     except Exception as exc:  # noqa: BLE001

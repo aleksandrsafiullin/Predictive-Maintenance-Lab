@@ -8,15 +8,26 @@ import pytest
 from streamlit.testing.v1 import AppTest
 from streamlit.testing.v1.errors import AppTestError
 
-from pdm import project_zones
-from pdm.data.project_prepare import load_snapshot, load_zone_limits, move_units, save_zone_limits
+from pdm import project_zones, ui_copy
+from pdm.data.project_prepare import (
+    JOB_ACTIVE_MOVE_ERROR,
+    LINKED_LEGACY_MOVE_ERROR,
+    SPLIT_LABELS,
+    load_snapshot,
+    load_zone_limits,
+    move_units,
+    preview_move,
+    preview_swap,
+    save_zone_limits,
+    swap_units,
+)
 from pdm.paths import project_root
 from pdm.project_quality_ui import gap_safe_trace, limits_key, part_summary
 from pdm.project_training_ui import _default_profile, _parse_horizons
 from pdm.project_ui import _auto_shares, _open_step, _stage_uploads
 from pdm.projects import project_store
 from pdm.signal_training import average_training_duration_s
-from pdm.ui_copy import QUALITY_NO_ZONES
+from pdm.zone_limit_proposal import propose_absolute_limits
 from tests.project_contract import make_contract_snapshot
 
 
@@ -94,7 +105,7 @@ def test_import_cards_show_snapshot_counts_and_view(monkeypatch, tmp_path):
     expected = [part_summary(snapshot["features"], snapshot["split"], part) for part in ("train", "validation", "test")]
     for label, field in (("Units", "units"), ("Admitted rows", "rows"), ("Gaps", "gaps")):
         assert [int(m.value) for m in at.metric if m.label == label] == [summary[field] for summary in expected]
-    assert _captions(at).count("Counts are the saved snapshot.") == 1
+    assert "Counts are the saved snapshot." not in _captions(at)
     at.button(key="import_view:test").click()
     at.run()
     assert not at.exception
@@ -168,14 +179,26 @@ def test_quality_three_sets_and_training_gate(monkeypatch, tmp_path):
     at.run()
     assert not at.exception
     assert [tab.label for tab in at.tabs] == ["Training Data", "Validation Data", "Testing Data"]
-    assert any("Admitted measurements" in str(c.value) for c in at.caption)
+    assert any(widget.label.startswith("Inspect ") for widget in at.selectbox)
+    assert at.table
+    captions = _captions(at)
+    assert not any("Admitted measurements for the selected unit" in c for c in captions)
+    assert not any(c.startswith("Zones:") or c.startswith("Observed time:") for c in captions)
+    assert not any("forecast future" in c or "Recorded experiment endpoints" in c for c in captions)
+    assert not any(button.label in {"Move selected units", "Move units"} for button in at.button)
     assert any(button.label == "Continue to Training" for button in at.button)
+    ready_copy = (
+        "Train, Validation, and Test have admitted measurements. Training uses Train units; "
+        "Validation selects the model; Test is held out until evaluation."
+    )
+    assert ready_copy not in [str(item.value) for item in at.success]
     assert not any("dataset_version" in str(markdown.value) for markdown in at.markdown)
     monkeypatch.setattr("pdm.project_quality_ui.available_signal_engines",
                         lambda _pid, _sid: [{"engine_id": "gru", "available": False}])
     at.run()
     assert not at.exception
     assert not any(button.label == "Continue to Training" for button in at.button)
+    assert any("too short" in str(item.value) for item in at.warning)
 
 
 def _quality_app(project_id: str, tab: str | None = None) -> AppTest:
@@ -187,8 +210,30 @@ def _quality_app(project_id: str, tab: str | None = None) -> AppTest:
     return at.run()
 
 
+def _chart_spec(at: AppTest) -> dict:
+    return json.loads(at.get("plotly_chart")[0].proto.spec)
+
+
 def _chart_trace_names(at: AppTest) -> list[str]:
-    return [trace.get("name") for trace in json.loads(at.get("plotly_chart")[0].proto.spec)["data"]]
+    return [trace.get("name") for trace in _chart_spec(at)["data"]]
+
+
+def _chart_limit_ys(at: AppTest) -> set[float]:
+    shapes = (_chart_spec(at).get("layout") or {}).get("shapes") or []
+    return {round(float(shape["y0"]), 6) for shape in shapes
+            if shape.get("y0") is not None and shape.get("y0") == shape.get("y1")}
+
+
+def _zone_column(at: AppTest) -> list:
+    return list(at.table[0].value["Zone"])
+
+
+_ZONE_LABELS = {"green": "Green", "yellow": "Yellow", "red": "Red", "unknown": "Not zoned"}
+
+
+def _expected_zones(features: pd.DataFrame, unit_id: str, schema: dict) -> list[str]:
+    frame = features.loc[features["unit_id"].astype(str) == str(unit_id)]
+    return [_ZONE_LABELS[zone] for zone in project_zones.label_unit(frame, schema)["zone"]]
 
 
 def test_quality_chart_paints_zones_from_snapshot_limits(monkeypatch, tmp_path):
@@ -206,14 +251,8 @@ def test_quality_chart_paints_zones_from_snapshot_limits(monkeypatch, tmp_path):
     expected = [f"{names[zone]} · {count}" for zone in project_zones.ZONES
                 if (count := int((labelled["zone"] == zone).sum()))]
     assert [name for name in _chart_trace_names(at) if " · " in str(name)] == expected
-    captions = _captions(at)
-    rule = next(c for c in captions if "forecast future" in c)
-    assert "not zone classes" in rule and "yellow at ≥ 0.4 g" in rule and "red at ≥ 0.8 g" in rule
-    counts = project_zones.zone_counts(features, snapshot["split"]["train"], snapshot["schema"])
-    assert (f"Zones: Green {counts['green']} · Yellow {counts['yellow']} · Red {counts['red']} · "
-            f"Not zoned {counts['unknown']} rows") in captions
-    table = at.table[0].value
-    assert list(table["Zone"]) == [names[zone] for zone in labelled["zone"]]
+    assert _chart_limit_ys(at) == {0.4, 0.8}
+    assert _zone_column(at) == [names[zone] for zone in labelled["zone"]]
 
 
 def _minimal_quality_snapshot(project_id: str, schema: dict) -> dict:
@@ -243,10 +282,9 @@ def test_quality_chart_without_limits_is_not_zoned(monkeypatch, tmp_path):
     project_id = _patch_quality_snapshot(monkeypatch, {"signal_label": "Vibration", "signal_unit": "g"})
     at = _quality_app(project_id)
     assert not at.exception
-    assert QUALITY_NO_ZONES in _captions(at)
-    assert not any(c.startswith("Zones:") for c in _captions(at))
     assert _chart_trace_names(at) == ["Vibration"]
-    assert set(at.table[0].value["Zone"]) == {"Not zoned"}
+    assert set(_zone_column(at)) == {"Not zoned"}
+    assert not _chart_limit_ys(at)
 
 
 def test_quality_baseline_rule_caption_uses_schema_values(monkeypatch, tmp_path):
@@ -257,12 +295,10 @@ def test_quality_baseline_rule_caption_uses_schema_values(monkeypatch, tmp_path)
     project_id = _patch_quality_snapshot(monkeypatch, schema)
     at = _quality_app(project_id)
     assert not at.exception
-    rule = next(c for c in _captions(at) if "forecast future" in c)
-    assert "first 4" in rule and "2.5 × median" in rule and "Provisional" in rule
-    zones = list(at.table[0].value["Zone"])
-    assert zones[:3] == ["Not zoned"] * 3
-    assert zones[3:] == ["Green", "Yellow", "Red"]
-    assert "Zones: Green 1 · Yellow 1 · Red 1 · Not zoned 3 rows" in _captions(at)
+    assert _zone_column(at) == ["Not zoned", "Not zoned", "Not zoned", "Green", "Yellow", "Red"]
+    assert _chart_limit_ys(at) == {1.25, 2.5}
+    assert [name for name in _chart_trace_names(at) if " · " in str(name)] == [
+        "Green · 1", "Yellow · 1", "Red · 1", "Not zoned · 3"]
 
 
 def test_import_page_has_no_limit_widgets(monkeypatch, tmp_path):
@@ -272,8 +308,9 @@ def test_import_page_has_no_limit_widgets(monkeypatch, tmp_path):
     assert not at.exception
     assert not any(r.label == "Red condition" for r in at.radio)
     assert not any(n.label.startswith(("Yellow limit", "Red limit")) for n in at.number_input)
-    assert "Yellow and red limits are set on Data Quality after import." in _captions(at)
-    assert any("max-axis RMS" in c for c in _captions(at))
+    assert "Yellow and red limits are set on Data Quality after import." not in _captions(at)
+    assert not any("max-axis RMS" in c for c in _captions(at))
+    assert not any(header.value == "Signal" for header in at.subheader)
 
 
 def _capture_import(monkeypatch, project_id: str, signal_column: str | None = None) -> dict:
@@ -298,6 +335,8 @@ def test_first_hse_import_sends_provisional_limits(monkeypatch, tmp_path):
     monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
     project = project_store().create("First", "hse_filters")
     source = _capture_import(monkeypatch, project["project_id"])
+    assert (source["signal_column"], source["signal_label"], source["signal_unit"]) == (
+        "differential_pressure", "Differential pressure", "Pa")
     assert source["thresholds"] == {"mode": "absolute", "direction": "above", "yellow": 300.0, "red": 600.0}
 
 
@@ -310,7 +349,10 @@ def test_first_generic_import_sends_no_limits(monkeypatch, tmp_path):
 def test_first_xjtu_import_sends_baseline_rule(monkeypatch, tmp_path):
     monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
     project = project_store().create("Bearings", "xjtu_bearings")
-    rule = _capture_import(monkeypatch, project["project_id"])["thresholds"]
+    source = _capture_import(monkeypatch, project["project_id"])
+    assert (source["signal_column"], source["signal_label"], source["signal_unit"]) == (
+        "combined_rms", "Combined max-axis RMS", "g")
+    rule = source["thresholds"]
     assert rule["mode"] == "initial_baseline_multiple"
     assert (rule["direction"], rule["baseline_n"], rule["onset_sigma"], rule["onset_ratio"], rule["red_ratio"]) == (
         "above", 5, 3.0, 1.25, 2.0)
@@ -378,10 +420,6 @@ def test_generic_reimport_with_new_signal_column_drops_old_limits(monkeypatch, t
     assert source["thresholds"] == {}
 
 
-def _zone_rule_caption(at: AppTest) -> str:
-    return next(c for c in _captions(at) if "forecast future" in c)
-
-
 def _key(name: str, pid: str, sid: str) -> str:
     return f"quality_limit_{name}:{pid}:{sid}"
 
@@ -411,18 +449,15 @@ def test_quality_limit_edit_writes_sidecar_and_recolors_chart(monkeypatch, tmp_p
     at.number_input(key=_key("yellow", pid, sid)).set_value(0.1)
     at.run()
     assert not at.exception
-    rule = _zone_rule_caption(at)
-    assert "yellow at ≥ 0.1 g" in rule and "red at ≥ 0.8 g" in rule
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.1)
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(0.8)
+    assert at.radio(key=_key("direction", pid, sid)).value == "above"
+    assert _chart_limit_ys(at) == {0.1, 0.8}
     limits = {"mode": "absolute", "direction": "above", "yellow": 0.1, "red": 0.8}
     edited = {**snapshot["schema"], "thresholds": limits}
     selected = sorted(str(uid) for uid in snapshot["split"]["train"])[0]
     features = snapshot["features"]
-    labelled = project_zones.label_unit(features[features["unit_id"].astype(str) == selected], edited)
-    names = {"green": "Green", "yellow": "Yellow", "red": "Red", "unknown": "Not zoned"}
-    assert list(at.table[0].value["Zone"]) == [names[zone] for zone in labelled["zone"]]
-    counts = project_zones.zone_counts(features, snapshot["split"]["train"], edited)
-    assert (f"Zones: Green {counts['green']} · Yellow {counts['yellow']} · Red {counts['red']} · "
-            f"Not zoned {counts['unknown']} rows") in _captions(at)
+    assert _zone_column(at) == _expected_zones(features, selected, edited)
     assert load_zone_limits(pid, sid, store=store) is None
     assert not at.button(key=_limit_button("save", pid, sid)).disabled
     at.button(key=_limit_button("save", pid, sid)).click()
@@ -436,10 +471,13 @@ def test_quality_limit_edit_writes_sidecar_and_recolors_chart(monkeypatch, tmp_p
     assert limits_key(pid, sid) not in at.session_state
     assert at.button(key=_limit_button("save", pid, sid)).disabled
     assert at.button(key=_limit_button("cancel", pid, sid)).disabled
-    assert "yellow at ≥ 0.1 g" in _zone_rule_caption(at)
+    assert _chart_limit_ys(at) == {0.1, 0.8}
+    assert _zone_column(at) == _expected_zones(features, selected, edited)
     reopened = _quality_app(pid, "Training Data")
-    assert "yellow at ≥ 0.1 g" in _zone_rule_caption(reopened)
     assert reopened.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.1)
+    assert reopened.number_input(key=_key("red", pid, sid)).value == pytest.approx(0.8)
+    assert _chart_limit_ys(reopened) == {0.1, 0.8}
+    assert _zone_column(reopened) == _expected_zones(features, selected, edited)
 
 
 def test_quality_limit_cancel_reverts_preview_without_writing(monkeypatch, tmp_path):
@@ -450,20 +488,28 @@ def test_quality_limit_cancel_reverts_preview_without_writing(monkeypatch, tmp_p
     pid = project["project_id"]
     sid = project_store().get(pid)["active_snapshot_id"]
     original = _snapshot_bytes(store, pid, sid)
+    snapshot = load_snapshot(pid, store=store)
+    selected = sorted(str(uid) for uid in snapshot["split"]["train"])[0]
     at = _quality_app(pid, "Training Data")
-    before = _zone_rule_caption(at)
+    before_zones = _zone_column(at)
+    before_lines = _chart_limit_ys(at)
+    assert before_lines == {0.4, 0.8}
     assert at.button(key=_limit_button("cancel", pid, sid)).disabled
     assert at.button(key=_limit_button("save", pid, sid)).disabled
     at.number_input(key=_key("red", pid, sid)).set_value(1.5)
     at.radio(key=_key("direction", pid, sid)).set_value("above")
     at.run()
-    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    preview = {**snapshot["schema"], "thresholds": {"mode": "absolute", "direction": "above",
+                                                    "yellow": 0.4, "red": 1.5}}
+    assert _chart_limit_ys(at) == {0.4, 1.5}
+    assert _zone_column(at) == _expected_zones(snapshot["features"], selected, preview)
     assert load_zone_limits(pid, sid, store=store) is None
     assert not at.button(key=_limit_button("cancel", pid, sid)).disabled
     at.button(key=_limit_button("cancel", pid, sid)).click()
     at.run()
     assert not at.exception and not at.error
-    assert _zone_rule_caption(at) == before
+    assert _zone_column(at) == before_zones
+    assert _chart_limit_ys(at) == before_lines
     assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(0.8)
     assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.4)
     assert at.radio(key=_key("direction", pid, sid)).value == "above"
@@ -484,16 +530,18 @@ def test_quality_limit_cancel_restores_sidecar_not_schema(monkeypatch, tmp_path)
     save_zone_limits(pid, sidecar, expected_snapshot_id=sid, store=store)
     at = _quality_app(pid, "Training Data")
     assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.2)
-    before = _zone_rule_caption(at)
-    assert "yellow at ≥ 0.2 g" in before and "red at ≥ 0.6 g" in before
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(0.6)
+    assert _chart_limit_ys(at) == {0.2, 0.6}
+    before_zones = _zone_column(at)
     at.number_input(key=_key("yellow", pid, sid)).set_value(0.1)
     at.number_input(key=_key("red", pid, sid)).set_value(1.5)
     at.run()
-    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    assert _chart_limit_ys(at) == {0.1, 1.5}
     at.button(key=_limit_button("cancel", pid, sid)).click()
     at.run()
     assert not at.exception and not at.error
-    assert _zone_rule_caption(at) == before
+    assert _chart_limit_ys(at) == {0.2, 0.6}
+    assert _zone_column(at) == before_zones
     assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.2)
     assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(0.6)
     assert at.button(key=_limit_button("cancel", pid, sid)).disabled
@@ -517,7 +565,8 @@ def test_quality_linked_legacy_save_respects_job_and_writes_sidecar_only(monkeyp
     assert "A background job is running. Save is available after it finishes." in _captions(at)
     at.number_input(key=_key("red", pid, sid)).set_value(1.5)
     at.run()
-    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    assert _chart_limit_ys(at) == {0.4, 1.5}
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(1.5)
     assert at.button(key=_limit_button("save", pid, sid)).disabled
     assert not sidecar_path.exists()
     _no_job(monkeypatch)
@@ -582,19 +631,29 @@ def test_quality_invalid_limits_keep_last_valid_rule_and_do_not_save(monkeypatch
     at.run()
     assert not at.exception
     assert any("yellow limit must be below red" in str(e.value) for e in at.error)
-    assert "yellow at ≥ 0.4 g" in _zone_rule_caption(at)
+    assert _chart_limit_ys(at) == {0.4, 0.8}
+    assert at.radio(key=_key("direction", pid, sid)).value == "above"
     assert load_zone_limits(pid, sid, store=store) is None
     at.number_input(key=_key("yellow", pid, sid)).set_value(0.4)
     at.radio(key=_key("direction", pid, sid)).set_value("below")
     at.run()
     assert not at.exception
     assert any("yellow limit must be above red" in str(e.value) for e in at.error)
-    assert "yellow at ≥ 0.4 g" in _zone_rule_caption(at)
+    assert _chart_limit_ys(at) == {0.4, 0.8}
+    assert at.radio(key=_key("direction", pid, sid)).value == "below"
     assert load_zone_limits(pid, sid, store=store) is None
     at.number_input(key=_key("yellow", pid, sid)).set_value(0.9)
     at.run()
     assert not at.exception and not at.error
-    assert "yellow at ≤ 0.9 g" in _zone_rule_caption(at) and "red at ≤ 0.8 g" in _zone_rule_caption(at)
+    assert at.radio(key=_key("direction", pid, sid)).value == "below"
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.9)
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(0.8)
+    assert _chart_limit_ys(at) == {0.9, 0.8}
+    snapshot = load_snapshot(pid, store=store)
+    selected = sorted(str(uid) for uid in snapshot["split"]["train"])[0]
+    below = {**snapshot["schema"], "thresholds": {"mode": "absolute", "direction": "below",
+                                                  "yellow": 0.9, "red": 0.8}}
+    assert _zone_column(at) == _expected_zones(snapshot["features"], selected, below)
     assert load_zone_limits(pid, sid, store=store) is None
 
 
@@ -611,7 +670,8 @@ def test_quality_limits_are_preview_while_job_runs(monkeypatch, tmp_path):
     at.number_input(key=_key("red", pid, sid)).set_value(1.5)
     at.run()
     assert not at.exception
-    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    assert _chart_limit_ys(at) == {0.4, 1.5}
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(1.5)
     assert job_caption in _captions(at)
     assert not any("Preview only" in c or "Saved with this data" in c for c in _captions(at))
     assert load_zone_limits(pid, sid, store=store) is None
@@ -641,7 +701,8 @@ def test_quality_save_failure_keeps_preview_and_shows_error(monkeypatch, tmp_pat
     assert not any("Change a limit again" in str(e.value) for e in at.error)
     assert load_zone_limits(pid, sid, store=store) is None
     assert _snapshot_bytes(store, pid, sid) == original
-    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    assert _chart_limit_ys(at) == {0.4, 1.5}
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(1.5)
     assert at.session_state[limits_key(pid, sid)]["red"] == 1.5
     assert at.button(key=_limit_button("save", pid, sid)).disabled
 
@@ -656,13 +717,14 @@ def test_quality_edit_does_not_follow_to_a_new_snapshot(monkeypatch, tmp_path):
     at = _quality_app(pid, "Training Data")
     at.number_input(key=_key("red", pid, old_sid)).set_value(1.5)
     at.run()
-    assert "red at ≥ 1.5 g" in _zone_rule_caption(at)
+    assert _chart_limit_ys(at) == {0.4, 1.5}
     _no_job(monkeypatch)
     unit = sorted(load_snapshot(pid, store=store)["split"]["train"])[-1]
     new_sid = move_units(pid, [unit], "validation", expected_snapshot_id=old_sid, store=store)["snapshot_id"]
     at.run()
     assert not at.exception
-    assert "red at ≥ 0.8 g" in _zone_rule_caption(at)
+    assert _chart_limit_ys(at) == {0.4, 0.8}
+    assert at.number_input(key=_key("yellow", pid, new_sid)).value == pytest.approx(0.4)
     assert at.number_input(key=_key("red", pid, new_sid)).value == pytest.approx(0.8)
     assert not any(c.startswith(("Preview only", "Saved with this data")) for c in _captions(at))
 
@@ -729,10 +791,17 @@ def test_quality_baseline_snapshot_open_does_not_write(monkeypatch, tmp_path):
     fingerprint["file_hashes"]["feature_schema.json"] = sha256_file(directory / "feature_schema.json")
     (directory / "processed_fingerprint.json").write_text(json.dumps(fingerprint))
     original = _snapshot_bytes(store, pid, sid)
+    snapshot = load_snapshot(pid, store=store)
+    selected = sorted(str(uid) for uid in snapshot["split"]["train"])[0]
     at = _quality_app(pid, "Training Data")
     assert not at.exception
-    assert "first 4" in _zone_rule_caption(at)
-    assert "Zones use the saved initial-baseline rule" not in " ".join(_captions(at))
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(1.0)
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(2.0)
+    assert _zone_column(at) == _expected_zones(snapshot["features"], selected, snapshot["schema"])
+    prefix = snapshot["features"].loc[snapshot["features"]["unit_id"].astype(str) == selected].iloc[:4]
+    thresholds = project_zones.resolve_thresholds(snapshot["schema"], prefix)
+    assert _chart_limit_ys(at) == {round(float(thresholds["yellow"]), 6), round(float(thresholds["red"]), 6)}
+    assert _chart_limit_ys(at) != {1.0, 2.0}
     assert at.button(key=_limit_button("cancel", pid, sid)).disabled
     assert at.button(key=_limit_button("save", pid, sid)).disabled
     at.session_state["quality_tab"] = "Validation Data"
@@ -749,21 +818,25 @@ def test_quality_baseline_rule_switches_to_absolute_only_after_edit(monkeypatch,
     project_id = _patch_quality_snapshot(monkeypatch, schema)
     at = _quality_app(project_id)
     assert not at.exception
-    assert "first 4" in _zone_rule_caption(at)
+    baseline_zones = ["Not zoned", "Not zoned", "Not zoned", "Green", "Yellow", "Red"]
+    assert _zone_column(at) == baseline_zones
+    assert _chart_limit_ys(at) == {1.25, 2.0}
     assert at.number_input(key=_key("yellow", project_id, "snapshot1")).value == 1.0
     at.number_input(key=_key("red", project_id, "snapshot1")).set_value(1.2)
     at.run()
     assert not at.exception
-    assert "yellow at ≥ 1 g" in _zone_rule_caption(at) and "red at ≥ 1.2 g" in _zone_rule_caption(at)
-    assert list(at.table[0].value["Zone"]) == ["Yellow"] * 4 + ["Red", "Red"]
+    assert _chart_limit_ys(at) == {1.0, 1.2}
+    assert _zone_column(at) == ["Yellow"] * 4 + ["Red", "Red"]
     at.number_input(key=_key("red", project_id, "snapshot1")).set_value(2.0)
     at.run()
-    assert "red at ≥ 2 g" in _zone_rule_caption(at)
+    assert _chart_limit_ys(at) == {1.0, 2.0}
+    assert _zone_column(at) == ["Yellow"] * 5 + ["Red"]
     assert not at.button(key=_limit_button("cancel", project_id, "snapshot1")).disabled
     at.button(key=_limit_button("cancel", project_id, "snapshot1")).click()
     at.run()
     assert not at.exception
-    assert "first 4" in _zone_rule_caption(at)
+    assert _zone_column(at) == baseline_zones
+    assert _chart_limit_ys(at) == {1.25, 2.0}
     assert at.number_input(key=_key("red", project_id, "snapshot1")).value == 2.0
     assert at.button(key=_limit_button("cancel", project_id, "snapshot1")).disabled
 
@@ -778,7 +851,9 @@ def test_quality_invalid_sidecar_is_ignored(monkeypatch, tmp_path):
     sidecar.write_text(json.dumps({"mode": "absolute", "direction": "above", "yellow": 3, "red": 1}))
     at = _quality_app(pid, "Training Data")
     assert not at.exception
-    assert "yellow at ≥ 0.4 g" in _zone_rule_caption(at)
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.4)
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(0.8)
+    assert _chart_limit_ys(at) == {0.4, 0.8}
     assert not sidecar.exists()
 
 
@@ -788,147 +863,23 @@ def test_quality_zone_labels_only_for_open_tab(monkeypatch, tmp_path):
     store, project, _ = make_contract_snapshot(root)
     snapshot = load_snapshot(project["project_id"], store=store)
     calls = []
-    real = project_zones.zone_counts
+    real = project_zones.label_unit
 
-    def spy(features, unit_ids, schema):
-        calls.append(tuple(str(uid) for uid in unit_ids))
-        return real(features, unit_ids, schema)
+    def spy(frame, schema):
+        calls.append(sorted(set(frame["unit_id"].astype(str))))
+        return real(frame, schema)
 
-    monkeypatch.setattr("pdm.project_zones.zone_counts", spy)
+    monkeypatch.setattr("pdm.project_zones.label_unit", spy)
     at = _quality_app(project["project_id"], "Training Data")
     assert not at.exception
-    assert calls == [tuple(str(uid) for uid in snapshot["split"]["train"])]
+    selected = sorted(str(uid) for uid in snapshot["split"]["train"])[0]
+    assert calls == [[selected]]
     assert len(at.get("plotly_chart")) == 1
 
 
 def _no_job(monkeypatch, active: bool = False) -> None:
     monkeypatch.setattr("pdm.project_quality_ui.heavy_job_active", lambda *_a: active)
     monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_a: active)
-
-
-def test_quality_move_unit_publishes_new_snapshot(monkeypatch, tmp_path):
-    root = tmp_path / "projects"
-    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
-    _no_job(monkeypatch)
-    store, project, _ = make_contract_snapshot(root)
-    pid = project["project_id"]
-    old_id = project_store().get(pid)["active_snapshot_id"]
-    unit = sorted(load_snapshot(pid, store=store)["split"]["train"])[-1]
-    at = _quality_app(pid, "Training Data")
-    assert not at.exception
-    assert at.button(key="quality_move:train").disabled
-    at.multiselect(key="quality_move_units:train").set_value([unit])
-    at.selectbox(key="quality_move_to:train").set_value("Validation Data")
-    at.run()
-    assert "After the move: Training 5 · Validation 3 · Testing 1 units." in _captions(at)
-    at.button(key="quality_move:train").click()
-    at.run()
-    assert not at.exception
-    new_id = project_store().get(pid)["active_snapshot_id"]
-    assert new_id != old_id
-    assert any("Moved 1 unit(s) to Validation Data. A new data snapshot is active" in str(s.value)
-               for s in at.success)
-    assert unit in at.multiselect(key="quality_move_units:validation").options
-    assert unit not in at.multiselect(key="quality_move_units:train").options
-    assert at.multiselect(key="quality_move_units:train").value == []
-    assert unit in load_snapshot(pid, new_id, store=store)["split"]["validation"]
-    assert unit in load_snapshot(pid, old_id, store=store)["split"]["train"]
-
-
-def test_quality_move_callback_separates_bad_destination_from_move_errors(monkeypatch):
-    from types import SimpleNamespace
-
-    from pdm import project_quality_ui
-
-    fake = SimpleNamespace(session_state={"quality_move_units:train": ["u1"], "quality_move_to:train": "Nowhere"})
-    monkeypatch.setattr(project_quality_ui, "st", fake)
-    monkeypatch.setattr(project_quality_ui, "move_units",
-                        lambda *_a, **_k: pytest.fail("move_units must not run for an unknown set"))
-    project_quality_ui._do_move("p1", "s1", "train")
-    assert fake.session_state["quality_move_flash"] == ("warning", "Choose the set to move the units to.")
-
-    fake.session_state.pop("quality_move_flash")
-    fake.session_state["quality_move_to:train"] = "Validation Data"
-
-    def broken(*_a, **_k):
-        raise KeyError("units")
-
-    monkeypatch.setattr(project_quality_ui, "move_units", broken)
-    with pytest.raises(KeyError):
-        project_quality_ui._do_move("p1", "s1", "train")
-    assert "quality_move_flash" not in fake.session_state
-
-
-def test_quality_move_refuses_emptying_a_set(monkeypatch, tmp_path):
-    root = tmp_path / "projects"
-    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
-    _no_job(monkeypatch)
-    store, project, _ = make_contract_snapshot(root)
-    pid = project["project_id"]
-    old_id = project_store().get(pid)["active_snapshot_id"]
-    units = load_snapshot(pid, store=store)["split"]["validation"]
-    at = _quality_app(pid, "Validation Data")
-    at.multiselect(key="quality_move_units:validation").set_value(list(units))
-    at.run()
-    assert not at.exception
-    assert any("Validation Data would have no units" in str(w.value) for w in at.warning)
-    assert at.button(key="quality_move:validation").disabled
-    assert project_store().get(pid)["active_snapshot_id"] == old_id
-
-
-def test_quality_move_disabled_for_linked_legacy_and_active_job(monkeypatch, tmp_path):
-    root = tmp_path / "projects"
-    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
-    _no_job(monkeypatch, active=True)
-    _, project, _ = make_contract_snapshot(root)
-    at = _quality_app(project["project_id"])
-    assert not at.exception
-    assert at.button(key="quality_move:train").disabled
-    assert at.multiselect(key="quality_move_units:train").disabled
-    assert "Wait for the current job to finish before changing sets." in _captions(at)
-    monkeypatch.setattr("pdm.project_ui._maybe_wrap_legacy",
-                        lambda selected: {**selected, "storage_mode": "linked_legacy"})
-    at = _quality_app(project["project_id"])
-    assert not at.exception
-    assert any("published split of its source dataset" in str(i.value) for i in at.info)
-    assert not any(w.label == "Units to move" for w in at.multiselect)
-    assert not any(b.label == "Move selected units" for b in at.button)
-
-
-def test_quality_move_testing_shows_optimism_caption(monkeypatch, tmp_path):
-    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
-    _no_job(monkeypatch)
-    project_id = _patch_quality_snapshot(monkeypatch, {"signal_label": "Vibration", "signal_unit": "g"})
-    optimism = "Changing Testing units after reviewing results makes later Test scores optimistic."
-    at = _quality_app(project_id, "Training Data")
-    assert not at.exception
-    assert _captions(at).count(optimism) == 1
-    at.selectbox(key="quality_move_to:train").set_value("Testing Data")
-    at.run()
-    assert _captions(at).count(optimism) == 2
-    assert not any("official HSE" in c for c in _captions(at))
-
-
-def test_quality_move_hides_official_hse_test_units(monkeypatch, tmp_path):
-    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
-    _no_job(monkeypatch)
-    store = project_store()
-    project = store.create("Filters", "generic_sensor_csv")
-    store.update(project["project_id"], active_snapshot_id="snapshot1", state="ready")
-    snapshot = _minimal_quality_snapshot(project["project_id"], {"signal_label": "Pressure", "signal_unit": "Pa"})
-    snapshot["features"] = pd.concat([snapshot["features"], pd.DataFrame({
-        "unit_id": ["test2"], "timestamp_s": [0.0], "signal": [1.0], "gap_before": [False]})], ignore_index=True)
-    snapshot["split"]["test"] = ["test1", "test2"]
-    snapshot["units"] = pd.DataFrame({"unit_id": ["train1", "val1", "test1", "test2"],
-                                      "source_group": ["primary", "primary", "author_test", "primary"]})
-    monkeypatch.setattr("pdm.project_ui.load_snapshot", lambda _pid: snapshot)
-    monkeypatch.setattr("pdm.project_ui.list_project_runs", lambda _pid: [])
-    monkeypatch.setattr("pdm.project_quality_ui.available_signal_engines",
-                        lambda _pid, _sid: [{"engine_id": "gru", "available": True}])
-    at = _quality_app(project["project_id"], "Testing Data")
-    assert not at.exception
-    assert list(at.multiselect(key="quality_move_units:test").options) == ["test2"]
-    assert "1 official HSE test unit(s) are fixed in Testing Data." in _captions(at)
 
 
 def test_training_page_mentions_runs_from_previous_snapshot(monkeypatch, tmp_path):
@@ -1068,7 +1019,7 @@ def test_full_cns_training_dispatch_and_saved_results(monkeypatch, tmp_path, sig
     at.session_state["project_step"] = "Results"
     at.run()
     assert not at.exception and not at.error
-    assert any("3 neurons · 4 directed connections · 10 synaptic contacts" in c for c in _captions(at))
+    assert any(widget.label == "Connectome source" for widget in at.expander)
     assert any("test-fixture-only" in c for c in _captions(at))
 
 
@@ -1141,3 +1092,652 @@ def test_failed_worker_launch_cleans_this_attempt_uploads(monkeypatch, tmp_path)
     at.run()
     assert not at.exception
     assert not list((store.project_path(project["project_id"]) / "uploads").rglob("sensor.csv"))
+
+
+def _contract_quality(monkeypatch, tmp_path, tab: str = "Training Data"):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    _no_job(monkeypatch)
+    store, project, _snapshot = make_contract_snapshot(root)
+    pid = project["project_id"]
+    return store, pid, _quality_app(pid, tab)
+
+
+def _count_line(counts: dict) -> str:
+    return (
+        f"Training {counts['train']} · Validation {counts['validation']} · "
+        f"Testing {counts['test']} units."
+    )
+
+
+def _raise_membership(exc: BaseException):
+    def _fail(*_args, **_kwargs):
+        raise exc
+    return _fail
+
+
+def test_quality_move_unit_publishes_new_snapshot(monkeypatch, tmp_path):
+    store, pid, at = _contract_quality(monkeypatch, tmp_path)
+    assert not at.exception
+    before = load_snapshot(pid, store=store)
+    sid = before["snapshot_id"]
+    unit = at.selectbox(key="quality_unit_train").value
+    destination = at.selectbox(key="quality_move_to:train").value
+    assert destination == "validation"
+    assert len(before["split"]["train"]) >= 2
+    preview = preview_move(before, [unit], destination)
+    assert preview["problem"] is None
+    assert f"After the move: {_count_line(preview['counts'])}" in _captions(at)
+    assert ui_copy.QUALITY_MOVE_TEST_OPTIMISM not in _captions(at)
+    move_button = at.button(key="quality_move:train")
+    replace_button = at.button(key="quality_replace:train")
+    assert not move_button.disabled and move_button.proto.type != "primary"
+    assert replace_button.proto.type != "primary"
+    assert [widget.label for widget in at.selectbox if widget.label == "Move to"] == ["Move to"]
+    calls = []
+
+    def track_move(project_id, unit_ids, dest, *, expected_snapshot_id, store=None):
+        calls.append((list(unit_ids), dest, expected_snapshot_id))
+        return move_units(
+            project_id, unit_ids, dest, expected_snapshot_id=expected_snapshot_id, store=store,
+        )
+
+    monkeypatch.setattr("pdm.project_quality_ui.move_units", track_move)
+    monkeypatch.setattr(
+        "pdm.project_quality_ui.swap_units",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("swap during move")),
+    )
+    at.session_state["quality_move_to:sentinel"] = "keep"
+    at.session_state["quality_replace_with:sentinel"] = "keep"
+    at.session_state["quality_unit_sentinel"] = "keep"
+    at.session_state["quality_limits:sentinel"] = {"yellow": 1.0}
+    at.session_state["quality_limit_suggest:p:s"] = "leave"
+    at.button(key="quality_move:train").click()
+    at.run()
+    assert not at.exception
+    assert calls == [([unit], destination, sid)]
+    loaded = load_snapshot(pid, store=store)
+    assert loaded["snapshot_id"] != sid
+    assert project_store().get(pid)["active_snapshot_id"] == loaded["snapshot_id"]
+    assert unit not in loaded["split"]["train"]
+    assert unit in loaded["split"][destination]
+    assert load_snapshot(pid, sid, store=store)["split"]["train"] == before["split"]["train"]
+    expected = ui_copy.QUALITY_MOVE_DONE.format(unit=unit, destination=SPLIT_LABELS[destination])
+    assert [str(item.value) for item in at.success] == [expected]
+    for key in ("quality_move_to:sentinel", "quality_replace_with:sentinel", "quality_unit_sentinel"):
+        assert key not in at.session_state
+    assert at.session_state["quality_limits:sentinel"] == {"yellow": 1.0}
+    assert at.session_state["quality_limit_suggest:p:s"] == "leave"
+    at.run()
+    assert expected not in [str(item.value) for item in at.success]
+
+
+def test_quality_move_refuses_emptying_a_set(monkeypatch, tmp_path):
+    store, pid, at = _contract_quality(monkeypatch, tmp_path, "Testing Data")
+    assert not at.exception
+    before = load_snapshot(pid, store=store)
+    sid = before["snapshot_id"]
+    assert len(before["split"]["test"]) == 1
+    problem = "Testing Data would have no units. Keep at least one unit in each set."
+    assert problem in [str(item.value) for item in at.warning]
+    move_to = at.selectbox(key="quality_move_to:test")
+    assert move_to.options == ["Training Data", "Validation Data"]
+    assert at.button(key="quality_move:test").disabled
+    with pytest.raises(AppTestError):
+        at.button(key="quality_move:test").click()
+    move_to.set_value("validation")
+    at.run()
+    assert not at.exception
+    assert problem in [str(item.value) for item in at.warning]
+    assert at.button(key="quality_move:test").disabled
+    assert project_store().get(pid)["active_snapshot_id"] == sid
+    assert load_snapshot(pid, store=store)["split"] == before["split"]
+
+
+def test_quality_replace_keeps_counts_in_one_snapshot(monkeypatch, tmp_path):
+    store, pid, at = _contract_quality(monkeypatch, tmp_path)
+    assert not at.exception
+    before = load_snapshot(pid, store=store)
+    sid = before["snapshot_id"]
+    counts = dict(before["split"]["realized_counts"])
+    unit = at.selectbox(key="quality_unit_train").value
+    partner = at.selectbox(key="quality_replace_with:train").value
+    assert partner in set(map(str, before["split"]["validation"]))
+    swap = preview_swap(before, unit, partner)
+    assert swap["problem"] is None
+    set_a = SPLIT_LABELS[swap["to"][unit]]
+    set_b = SPLIT_LABELS[swap["to"][partner]]
+    caption = f"{unit} joins {set_a}; {partner} joins {set_b}. {_count_line(swap['counts'])}"
+    assert caption in _captions(at)
+    assert set_a == "Validation Data" and set_b == "Training Data"
+    calls = []
+
+    def track_swap(project_id, unit_a, unit_b, *, expected_snapshot_id, store=None):
+        calls.append((unit_a, unit_b, expected_snapshot_id))
+        return swap_units(
+            project_id, unit_a, unit_b, expected_snapshot_id=expected_snapshot_id, store=store,
+        )
+
+    monkeypatch.setattr("pdm.project_quality_ui.swap_units", track_swap)
+    monkeypatch.setattr(
+        "pdm.project_quality_ui.move_units",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("two moves")),
+    )
+    at.session_state["quality_move_to:sentinel"] = "keep"
+    at.session_state["quality_replace_with:sentinel"] = "keep"
+    at.session_state["quality_unit_sentinel"] = "keep"
+    at.button(key="quality_replace:train").click()
+    at.run()
+    assert not at.exception
+    assert calls == [(unit, partner, sid)]
+    loaded = load_snapshot(pid, store=store)
+    assert loaded["snapshot_id"] != sid
+    assert loaded["split"]["realized_counts"] == counts
+    assert loaded["split"]["train"] == sorted((set(map(str, before["split"]["train"])) - {unit}) | {partner})
+    assert loaded["split"]["validation"] == sorted(
+        (set(map(str, before["split"]["validation"])) - {partner}) | {unit},
+    )
+    assert loaded["split"]["test"] == sorted(map(str, before["split"]["test"]))
+    assert load_snapshot(pid, sid, store=store)["split"]["realized_counts"] == counts
+    expected = ui_copy.QUALITY_REPLACE_DONE.format(unit_a=unit, unit_b=partner)
+    assert [str(item.value) for item in at.success] == [expected]
+    for key in ("quality_move_to:sentinel", "quality_replace_with:sentinel", "quality_unit_sentinel"):
+        assert key not in at.session_state
+    at.run()
+    assert expected not in [str(item.value) for item in at.success]
+
+
+def test_quality_membership_disabled_for_linked_legacy_and_active_job(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+    calls = {"n": 0}
+
+    def active(*_args, **_kwargs):
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr("pdm.project_quality_ui.heavy_job_active", active)
+    monkeypatch.setattr("pdm.worker.heavy_job_active", lambda *_args, **_kwargs: True)
+    store, project, _snapshot = make_contract_snapshot(root)
+    pid = project["project_id"]
+    sid = project_store().get(pid)["active_snapshot_id"]
+    at = _quality_app(pid, "Training Data")
+    assert not at.exception
+    assert calls["n"] == 1
+    assert JOB_ACTIVE_MOVE_ERROR in _captions(at)
+    assert ui_copy.QUALITY_MOVE_TEST_OPTIMISM not in _captions(at)
+    assert "After the move:" not in "\n".join(_captions(at))
+    for key in ("quality_move_to:train", "quality_replace_with:train"):
+        assert at.selectbox(key=key).disabled
+    for key in ("quality_move:train", "quality_replace:train"):
+        button = at.button(key=key)
+        assert button.disabled and button.proto.type != "primary"
+    with pytest.raises(AppTestError):
+        at.button(key="quality_move:train").click()
+    assert project_store().get(pid)["active_snapshot_id"] == sid
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.4)
+    calls["n"] = 0
+    at.run()
+    assert calls["n"] == 1
+
+    _no_job(monkeypatch)
+    registry = json.loads(store.registry_path.read_text())
+    registry["projects"][pid]["storage_mode"] = "linked_legacy"
+    store.registry_path.write_text(json.dumps(registry))
+    linked = _quality_app(pid, "Training Data")
+    assert not linked.exception
+    assert [str(item.value) for item in linked.info] == [LINKED_LEGACY_MOVE_ERROR]
+    assert not any(widget.label in {"Move to", "Replace with"} for widget in linked.selectbox)
+    assert not any(button.label in {"Move unit", "Replace unit"} for button in linked.button)
+    assert linked.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.4)
+    assert project_store().get(pid)["active_snapshot_id"] == sid
+
+
+def test_quality_testing_tab_shows_optimism_caption(monkeypatch, tmp_path):
+    _store, pid, at = _contract_quality(monkeypatch, tmp_path, "Testing Data")
+    assert not at.exception
+    snapshot = load_snapshot(pid)
+    assert len(snapshot["split"]["test"]) == 1
+    assert _captions(at).count(ui_copy.QUALITY_MOVE_TEST_OPTIMISM) == 1
+    partner = at.selectbox(key="quality_replace_with:test").value
+    assert partner not in set(map(str, snapshot["split"]["test"]))
+
+
+def test_quality_hides_official_hse_test_units_as_move_sources(monkeypatch, tmp_path):
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
+    _no_job(monkeypatch)
+    project = project_store().create("HSE view", "hse_filters")
+    pid = project["project_id"]
+    project_store().update(pid, active_snapshot_id="snapshot1", state="ready")
+    ids = ["train_a", "train_b", "val_a", "test_free", "test_official"]
+    features = pd.DataFrame({
+        "unit_id": ids,
+        "timestamp_s": [0.0] * len(ids),
+        "signal": [1.0] * len(ids),
+        "gap_before": [False] * len(ids),
+    })
+    units = pd.DataFrame({
+        "unit_id": ids,
+        "source_group": ["primary", "primary", "primary", "primary", "author_test"],
+    })
+    snapshot = {
+        "project_id": pid,
+        "snapshot_id": "snapshot1",
+        "features": features,
+        "units": units,
+        "split": {
+            "train": ["train_a", "train_b"],
+            "validation": ["val_a"],
+            "test": ["test_free", "test_official"],
+        },
+        "schema": {"signal_label": "Pressure", "signal_unit": "Pa", "source_kind": "hse_filters"},
+        "report": {},
+    }
+    monkeypatch.setattr("pdm.project_ui.load_snapshot", lambda _pid: snapshot)
+    monkeypatch.setattr("pdm.project_ui.list_project_runs", lambda _pid: [])
+    monkeypatch.setattr(
+        "pdm.project_quality_ui.available_signal_engines",
+        lambda _pid, _sid: [{"engine_id": "gru", "available": True}],
+    )
+    at = _quality_app(pid, "Training Data")
+    assert not at.exception
+    labels = at.selectbox(key="quality_replace_with:train").options
+    assert "val_a · Validation Data" in labels
+    assert "test_free · Testing Data" in labels
+    assert "test_official · Testing Data" not in labels
+    assert not at.button(key="quality_move:train").disabled
+
+    held = _app()
+    held.session_state["project_id"] = pid
+    held.session_state["project_step"] = "Data Quality"
+    held.session_state["quality_tab"] = "Testing Data"
+    held.session_state["quality_unit_test"] = "test_official"
+    held.run()
+    assert not held.exception
+    assert "test_official" in held.selectbox(key="quality_unit_test").options
+    assert held.selectbox(key="quality_unit_test").value == "test_official"
+    assert held.button(key="quality_move:test").disabled
+    assert held.button(key="quality_replace:test").disabled
+    assert [str(item.value) for item in held.warning] == ["Official HSE test units stay in Testing Data."]
+    assert not any(widget.label == "Replace with" for widget in held.selectbox)
+    page = "\n".join([*_captions(held), *[str(item.value) for item in held.warning]])
+    assert ui_copy.QUALITY_REPLACE_NONE not in page
+    assert _captions(held).count(ui_copy.QUALITY_MOVE_TEST_OPTIMISM) == 1
+
+
+def test_quality_empty_partner_list_has_no_selectbox(monkeypatch, tmp_path):
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
+    _no_job(monkeypatch)
+    pid = project_store().create("Empty partners", "generic_sensor_csv")["project_id"]
+    project_store().update(pid, active_snapshot_id="snapshot1", state="ready")
+    features = pd.DataFrame({
+        "unit_id": ["a", "b", "official"],
+        "timestamp_s": [0.0, 0.0, 0.0],
+        "signal": [1.0, 1.0, 1.0],
+        "gap_before": [False, False, False],
+    })
+    snapshot = {
+        "project_id": pid,
+        "snapshot_id": "snapshot1",
+        "features": features,
+        "units": pd.DataFrame({
+            "unit_id": ["a", "b", "official"],
+            "source_group": ["primary", "primary", "author_test"],
+        }),
+        "split": {"train": ["a", "b"], "validation": [], "test": ["official"]},
+        "schema": {"signal_label": "Vibration", "signal_unit": "g"},
+        "report": {},
+    }
+    monkeypatch.setattr("pdm.project_ui.load_snapshot", lambda _pid: snapshot)
+    monkeypatch.setattr("pdm.project_ui.list_project_runs", lambda _pid: [])
+    monkeypatch.setattr(
+        "pdm.project_quality_ui.available_signal_engines",
+        lambda _pid, _sid: [{"engine_id": "gru", "available": True}],
+    )
+    at = _quality_app(pid, "Training Data")
+    assert not at.exception
+    assert not any(widget.label == "Replace with" for widget in at.selectbox)
+    assert ui_copy.QUALITY_REPLACE_NONE in _captions(at)
+    assert at.button(key="quality_replace:train").disabled
+    assert not at.button(key="quality_move:train").disabled
+
+
+def test_quality_membership_failure_warns_without_traceback(monkeypatch, tmp_path):
+    store, pid, _at = _contract_quality(monkeypatch, tmp_path)
+    sid = project_store().get(pid)["active_snapshot_id"]
+    split = load_snapshot(pid, store=store)["split"]
+    train_ids = sorted(str(uid) for uid in split["train"])
+    others = [str(uid) for name in ("validation", "test") for uid in split[name]]
+    assert len(train_ids) >= 2 and len(others) >= 2
+    for exc in (
+        KeyError("membership-key"),
+        ValueError("membership-value"),
+        RuntimeError("membership-runtime"),
+        OSError("membership-os"),
+    ):
+        monkeypatch.setattr("pdm.project_quality_ui.move_units", _raise_membership(exc))
+        at = _quality_app(pid, "Training Data")
+        assert not at.exception
+        at.selectbox(key="quality_unit_train").set_value(train_ids[1])
+        at.selectbox(key="quality_move_to:train").set_value("test")
+        at.selectbox(key="quality_replace_with:train").set_value(others[1])
+        at.session_state["quality_move_to:sentinel"] = "keep"
+        at.session_state["quality_replace_with:sentinel"] = "keep"
+        at.session_state["quality_unit_sentinel"] = "keep"
+        at.session_state["quality_limits:sentinel"] = {"yellow": 1.0}
+        at.button(key="quality_move:train").click()
+        at.run()
+        assert not at.exception
+        assert str(exc) in [str(item.value) for item in at.warning]
+        assert not at.success
+        assert [title.value for title in at.title] == ["Data Quality"]
+        assert project_store().get(pid)["active_snapshot_id"] == sid
+        assert load_snapshot(pid, store=store)["snapshot_id"] == sid
+        assert at.selectbox(key="quality_unit_train").value == train_ids[1]
+        assert at.selectbox(key="quality_move_to:train").value == "test"
+        assert at.selectbox(key="quality_replace_with:train").value == others[1]
+        assert at.session_state["quality_move_to:sentinel"] == "keep"
+        assert at.session_state["quality_replace_with:sentinel"] == "keep"
+        assert at.session_state["quality_unit_sentinel"] == "keep"
+        assert at.session_state["quality_limits:sentinel"] == {"yellow": 1.0}
+
+
+def test_quality_session_reset_drops_membership_prefixes():
+    def page():
+        import streamlit as st
+
+        from pdm.project_ui import _reset_project_session
+
+        if st.button("Arm"):
+            st.session_state["quality_move_to:train"] = "test"
+            st.session_state["quality_move:train"] = True
+            st.session_state["quality_replace_with:v"] = "u"
+            st.session_state["quality_replace:v"] = True
+            st.session_state["quality_membership_notice"] = ("warning", "x")
+            st.session_state["quality_unit_train"] = "unit"
+            st.session_state["quality_limit_yellow:p:s"] = 1.0
+            st.session_state["quality_limits:p:s"] = {"yellow": 1.0}
+            st.session_state["quality_limit_suggest:p:s"] = "leave"
+            st.session_state["quality_limit_suggest_note:p:s"] = "note"
+        if st.button("Reset"):
+            _reset_project_session()
+
+    at = AppTest.from_function(page, default_timeout=15).run()
+    next(button for button in at.button if button.label == "Arm").click()
+    at.run()
+    assert at.session_state["quality_membership_notice"] == ("warning", "x")
+    next(button for button in at.button if button.label == "Reset").click()
+    at.run()
+    for key in (
+        "quality_move_to:train", "quality_move:train", "quality_replace_with:v",
+        "quality_replace:v", "quality_membership_notice", "quality_unit_train",
+    ):
+        assert key not in at.session_state
+    assert at.session_state["quality_limit_yellow:p:s"] == 1.0
+    assert at.session_state["quality_limits:p:s"] == {"yellow": 1.0}
+    assert "quality_limit_suggest:p:s" not in at.session_state
+    assert "quality_limit_suggest_note:p:s" not in at.session_state
+
+
+def _texts(elements) -> list[str]:
+    return [str(item.value) for item in elements]
+
+
+def _pair_lines(yellow: float, red: float) -> set[float]:
+    return {round(float(yellow), 6), round(float(red), 6)}
+
+
+def _watch_proposal(monkeypatch) -> list[tuple[list[str], str]]:
+    seen: list[tuple[list[str], str]] = []
+    real = propose_absolute_limits
+
+    def spy(features, train_ids, direction):
+        seen.append(([str(uid) for uid in train_ids], direction))
+        return real(features, train_ids, direction)
+
+    monkeypatch.setattr("pdm.project_quality_ui.propose_absolute_limits", spy)
+    return seen
+
+
+def test_quality_suggest_fills_inputs_without_saving(monkeypatch, tmp_path):
+    store, pid, at = _contract_quality(monkeypatch, tmp_path)
+    assert not at.exception
+    snapshot = load_snapshot(pid, store=store)
+    sid = snapshot["snapshot_id"]
+    original = _snapshot_bytes(store, pid, sid)
+    train_ids = [str(uid) for uid in snapshot["split"]["train"]]
+    holdout = {str(uid) for name in ("validation", "test") for uid in snapshot["split"][name]}
+    proposal = propose_absolute_limits(snapshot["features"], snapshot["split"]["train"], "above")
+    assert proposal["ok"] is True and proposal["n"] == 30
+    button = at.button(key=_key("suggest", pid, sid))
+    assert not button.disabled and button.proto.type != "primary"
+    assert (button.help or button.proto.help) == ui_copy.QUALITY_SUGGEST_LIMITS_HELP
+    assert ui_copy.QUALITY_SUGGEST_LIMITS_CAPTION in _captions(at)
+    assert at.radio(key=_key("direction", pid, sid)).value == "above"
+    seen = _watch_proposal(monkeypatch)
+    button.click()
+    at.run()
+    assert not at.exception
+    text = ui_copy.QUALITY_SUGGEST_DONE.format(yellow=proposal["yellow"], red=proposal["red"])
+    assert _texts(at.success) == [text]
+    assert text not in _texts(at.error)
+    assert at.session_state[_key("suggest_note", pid, sid)] == text
+    assert _key("status", pid, sid) not in at.session_state
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(proposal["yellow"])
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(proposal["red"])
+    assert at.radio(key=_key("direction", pid, sid)).value == "above"
+    rule = at.session_state[limits_key(pid, sid)]
+    assert rule["mode"] == "absolute" and rule["direction"] == "above"
+    assert rule["yellow"] == pytest.approx(proposal["yellow"])
+    assert rule["red"] == pytest.approx(proposal["red"])
+    assert _chart_limit_ys(at) == _pair_lines(proposal["yellow"], proposal["red"])
+    assert seen and all(ids == train_ids and direction == "above" and set(ids).isdisjoint(holdout)
+                        for ids, direction in seen)
+    assert load_zone_limits(pid, sid, store=store) is None
+    assert not (store.snapshot_path(pid, sid) / "zone_limits.json").exists()
+    assert project_store().get(pid)["active_snapshot_id"] == sid
+    assert _snapshot_bytes(store, pid, sid) == original
+    assert load_snapshot(pid, store=store)["schema"]["thresholds"]["yellow"] == 0.4
+    at.run()
+    assert _texts(at.success) == [text]
+    at.number_input(key=_key("red", pid, sid)).set_value(1.5)
+    at.run()
+    assert not at.exception
+    assert _key("suggest_note", pid, sid) not in at.session_state
+    assert text not in _texts(at.success)
+    assert load_zone_limits(pid, sid, store=store) is None
+
+
+def test_quality_suggest_disabled_when_early_pool_is_short(monkeypatch, tmp_path):
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(tmp_path / "projects"))
+    _no_job(monkeypatch)
+    store = project_store()
+    project = store.create("Short pool", "generic_sensor_csv")
+    pid = project["project_id"]
+    store.update(pid, active_snapshot_id="snapshot1", state="ready")
+    features = pd.DataFrame({
+        "unit_id": ["train1", "train1", "val1", "test1"],
+        "timestamp_s": [0.0, 1.0, 0.0, 0.0],
+        "signal": [-2.0, -1.0, 1.0, 2.0],
+        "gap_before": [False, True, False, False],
+    })
+    snapshot = {
+        "project_id": pid, "snapshot_id": "snapshot1", "features": features,
+        "split": {"train": ["train1"], "validation": ["val1"], "test": ["test1"]},
+        "schema": {"signal_label": "Vibration", "signal_unit": "g"},
+        "report": {},
+    }
+    monkeypatch.setattr("pdm.project_ui.load_snapshot", lambda _pid: snapshot)
+    monkeypatch.setattr("pdm.project_ui.list_project_runs", lambda _pid: [])
+    monkeypatch.setattr(
+        "pdm.project_quality_ui.available_signal_engines",
+        lambda _pid, _sid: [{"engine_id": "gru", "available": True}],
+    )
+    at = _quality_app(pid, "Training Data")
+    proposal = propose_absolute_limits(features, snapshot["split"]["train"], "above")
+    assert not at.exception
+    assert proposal["ok"] is False and proposal["n"] == 2
+    button = at.button(key=_key("suggest", pid, "snapshot1"))
+    assert button.disabled and button.proto.type != "primary"
+    assert (button.help or button.proto.help) == ui_copy.QUALITY_SUGGEST_LIMITS_HELP
+    assert ui_copy.QUALITY_SUGGEST_LIMITS_CAPTION in _captions(at)
+    assert proposal["reason"] in _captions(at)
+    with pytest.raises(AppTestError):
+        button.click()
+
+
+def test_quality_suggest_respects_below_direction(monkeypatch, tmp_path):
+    store, pid, at = _contract_quality(monkeypatch, tmp_path)
+    snapshot = load_snapshot(pid, store=store)
+    sid = snapshot["snapshot_id"]
+    at.radio(key=_key("direction", pid, sid)).set_value("below")
+    at.run()
+    assert not at.exception
+    assert at.radio(key=_key("direction", pid, sid)).value == "below"
+    proposal = propose_absolute_limits(snapshot["features"], snapshot["split"]["train"], "below")
+    above = propose_absolute_limits(snapshot["features"], snapshot["split"]["train"], "above")
+    assert proposal["ok"] is True
+    assert (proposal["yellow"], proposal["red"]) != (above["yellow"], above["red"])
+    assert not at.button(key=_key("suggest", pid, sid)).disabled
+    at.button(key=_key("suggest", pid, sid)).click()
+    at.run()
+    assert not at.exception and not at.error
+    assert at.radio(key=_key("direction", pid, sid)).value == "below"
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(proposal["yellow"])
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(proposal["red"])
+    rule = at.session_state[limits_key(pid, sid)]
+    assert rule["direction"] == "below"
+    assert rule["yellow"] == pytest.approx(proposal["yellow"])
+    assert rule["red"] == pytest.approx(proposal["red"])
+    text = ui_copy.QUALITY_SUGGEST_DONE.format(yellow=proposal["yellow"], red=proposal["red"])
+    assert text in _texts(at.success)
+    assert _key("status", pid, sid) not in at.session_state
+    assert load_zone_limits(pid, sid, store=store) is None
+
+
+def test_quality_suggest_cancel_reverts_and_save_writes_sidecar_only(monkeypatch, tmp_path):
+    store, pid, at = _contract_quality(monkeypatch, tmp_path)
+    snapshot = load_snapshot(pid, store=store)
+    sid = snapshot["snapshot_id"]
+    original = _snapshot_bytes(store, pid, sid)
+    proposal = propose_absolute_limits(snapshot["features"], snapshot["split"]["train"], "above")
+    text = ui_copy.QUALITY_SUGGEST_DONE.format(yellow=proposal["yellow"], red=proposal["red"])
+    at.button(key=_key("suggest", pid, sid)).click()
+    at.run()
+    assert not at.exception
+    assert _chart_limit_ys(at) == _pair_lines(proposal["yellow"], proposal["red"])
+    assert text in _texts(at.success)
+    assert load_zone_limits(pid, sid, store=store) is None
+    at.button(key=_limit_button("cancel", pid, sid)).click()
+    at.run()
+    assert not at.exception and not at.error
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(0.4)
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(0.8)
+    assert at.radio(key=_key("direction", pid, sid)).value == "above"
+    assert _chart_limit_ys(at) == {0.4, 0.8}
+    assert _key("suggest_note", pid, sid) not in at.session_state
+    assert text not in _texts(at.success)
+    assert load_zone_limits(pid, sid, store=store) is None
+    assert _snapshot_bytes(store, pid, sid) == original
+    assert project_store().get(pid)["active_snapshot_id"] == sid
+    at.button(key=_key("suggest", pid, sid)).click()
+    at.run()
+    assert not at.button(key=_limit_button("save", pid, sid)).disabled
+    at.button(key=_limit_button("save", pid, sid)).click()
+    at.run()
+    assert not at.exception and not at.error
+    assert load_zone_limits(pid, sid, store=store) == {
+        "mode": "absolute", "direction": "above",
+        "yellow": float(proposal["yellow"]), "red": float(proposal["red"]),
+    }
+    loaded = load_snapshot(pid, store=store)
+    assert loaded["snapshot_id"] == sid
+    assert loaded["schema"]["thresholds"]["yellow"] == 0.4
+    assert loaded["schema"]["thresholds"]["red"] == 0.8
+    assert _snapshot_bytes(store, pid, sid) == original
+    assert _key("suggest_note", pid, sid) not in at.session_state
+    assert text not in _texts(at.success)
+
+
+def test_quality_suggest_allowed_during_job_and_on_linked_legacy(monkeypatch, tmp_path):
+    root = tmp_path / "projects"
+    monkeypatch.setenv("PDM_PROJECTS_ROOT", str(root))
+
+    def _refuse_save(*_args, **_kwargs):
+        raise AssertionError("suggest must not save")
+
+    monkeypatch.setattr("pdm.project_quality_ui.save_zone_limits", _refuse_save)
+    _no_job(monkeypatch, active=True)
+    store, project, _snapshot = make_contract_snapshot(root)
+    pid = project["project_id"]
+    sid = project_store().get(pid)["active_snapshot_id"]
+    snapshot = load_snapshot(pid, store=store)
+    proposal = propose_absolute_limits(snapshot["features"], snapshot["split"]["train"], "above")
+    original = _snapshot_bytes(store, pid, sid)
+    at = _quality_app(pid, "Training Data")
+    assert not at.exception
+    suggest = at.button(key=_key("suggest", pid, sid))
+    assert not suggest.disabled and suggest.proto.type != "primary"
+    assert at.button(key=_limit_button("save", pid, sid)).disabled
+    suggest.click()
+    at.run()
+    assert not at.exception
+    assert at.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(proposal["yellow"])
+    assert at.number_input(key=_key("red", pid, sid)).value == pytest.approx(proposal["red"])
+    assert _chart_limit_ys(at) == _pair_lines(proposal["yellow"], proposal["red"])
+    assert at.button(key=_limit_button("save", pid, sid)).disabled
+    assert load_zone_limits(pid, sid, store=store) is None
+    assert not (store.snapshot_path(pid, sid) / "zone_limits.json").exists()
+    assert _snapshot_bytes(store, pid, sid) == original
+    assert project_store().get(pid)["active_snapshot_id"] == sid
+
+    _no_job(monkeypatch)
+    registry = json.loads(store.registry_path.read_text())
+    registry["projects"][pid]["storage_mode"] = "linked_legacy"
+    store.registry_path.write_text(json.dumps(registry))
+    linked = _quality_app(pid, "Training Data")
+    assert not linked.exception
+    assert _texts(linked.info) == [LINKED_LEGACY_MOVE_ERROR]
+    assert not any(button.label in {"Move unit", "Replace unit"} for button in linked.button)
+    legacy = linked.button(key=_key("suggest", pid, sid))
+    assert not legacy.disabled and legacy.proto.type != "primary"
+    legacy.click()
+    linked.run()
+    assert not linked.exception
+    assert linked.number_input(key=_key("yellow", pid, sid)).value == pytest.approx(proposal["yellow"])
+    assert linked.number_input(key=_key("red", pid, sid)).value == pytest.approx(proposal["red"])
+    assert load_zone_limits(pid, sid, store=store) is None
+    assert project_store().get(pid)["storage_mode"] == "linked_legacy"
+    assert project_store().get(pid)["active_snapshot_id"] == sid
+
+
+def test_quality_suggest_after_move_uses_new_training_ids(monkeypatch, tmp_path):
+    store, pid, at = _contract_quality(monkeypatch, tmp_path)
+    before = load_snapshot(pid, store=store)
+    sid = before["snapshot_id"]
+    unit = at.selectbox(key="quality_unit_train").value
+    at.button(key="quality_move:train").click()
+    at.run()
+    assert not at.exception
+    loaded = load_snapshot(pid, store=store)
+    new_sid = loaded["snapshot_id"]
+    assert new_sid != sid
+    new_ids = [str(uid) for uid in loaded["split"]["train"]]
+    parent_ids = [str(uid) for uid in before["split"]["train"]]
+    assert unit not in new_ids and new_ids != parent_ids
+    holdout = {str(uid) for name in ("validation", "test") for uid in loaded["split"][name]}
+    seen = _watch_proposal(monkeypatch)
+    at.button(key=_key("suggest", pid, new_sid)).click()
+    at.run()
+    assert not at.exception
+    assert seen
+    for ids, direction in seen:
+        assert ids == new_ids and direction == "above"
+        assert set(ids).isdisjoint(holdout)
+        assert ids != parent_ids
+    child = propose_absolute_limits(loaded["features"], loaded["split"]["train"], "above")
+    parent = propose_absolute_limits(before["features"], before["split"]["train"], "above")
+    assert (child["yellow"], child["red"]) != (parent["yellow"], parent["red"])
+    assert at.number_input(key=_key("yellow", pid, new_sid)).value == pytest.approx(child["yellow"])
+    assert at.number_input(key=_key("red", pid, new_sid)).value == pytest.approx(child["red"])
+    assert load_zone_limits(pid, new_sid, store=store) is None

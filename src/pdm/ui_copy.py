@@ -78,10 +78,6 @@ IMPORT_SUBMIT_HELP = (
 )
 
 # Data Quality
-QUALITY_TABS_CAPTION = (
-    "Each tab shows one set. Training learns from Training Data, Validation Data picks the best model, "
-    "Testing Data is scored once at the end."
-)
 QUALITY_INSPECT_UNIT_HELP = (
     "Choose one physical unit to see its measurements over time. Viewing does not change the data."
 )
@@ -93,39 +89,49 @@ QUALITY_ADMITTED_ROWS_HELP = (
     "Rows kept after import checks. Rows the import rejected are not counted; any remaining missing values "
     "are listed below."
 )
-QUALITY_ZONE_MODEL_CAPTION = (
-    "Signal models in this project learn to forecast future {label} values, not zone classes. Zones are derived "
-    "from those values with the same limits, and Results uses them to report the expected red entry."
-)
-QUALITY_ZONE_SUMMARY_HELP = (
-    "Every admitted measurement in this set, colored by the yellow/red limits saved with the data. "
-    "Not zoned rows have no valid limit yet, such as the start of a baseline."
-)
-QUALITY_NO_ZONES = "No valid yellow/red limits are saved with this data, so measurements are not zoned."
 QUALITY_GAPS_HELP = (
     "Breaks in a unit's timeline. The model never learns or forecasts across a gap, so many gaps mean fewer "
     "usable windows."
 )
-QUALITY_MOVE_UNITS_HELP = (
-    "Choose whole physical units to move. All rows of a unit move together; rows and windows cannot be moved "
-    "on their own."
+QUALITY_MOVE_TO_HELP = (
+    "The set this unit will join. The unit leaves its current set. Training, Validation, and Test each keep "
+    "at least one unit."
 )
-QUALITY_MOVE_TO_HELP = "The set the chosen units join. Each set must keep at least one unit."
 QUALITY_MOVE_SUBMIT_HELP = (
-    "Saves a new data snapshot with the changed sets. Earlier model runs keep the previous snapshot, so train "
-    "again on the new data."
+    "Publishes a new data snapshot with this unit in the chosen set. Earlier model runs stay on the previous "
+    "snapshot."
 )
-QUALITY_MOVE_LEGACY = (
-    "This project uses the published split of its source dataset. Create a new project to change the split."
+QUALITY_REPLACE_WITH_HELP = (
+    "A unit from another set that trades places with the unit you are inspecting. Set counts stay the same."
+)
+QUALITY_REPLACE_SUBMIT_HELP = (
+    "Publishes one new data snapshot in which the two units trade sets. Earlier model runs stay on the "
+    "previous snapshot."
+)
+QUALITY_MOVE_TEST_OPTIMISM = (
+    "Changing Testing units after reviewing results makes later Test scores optimistic."
 )
 QUALITY_MOVE_DONE = (
-    "Moved {n} unit(s) to {name}. A new data snapshot is active; earlier model runs stay with the previous "
+    "Moved {unit} to {destination}. A new data snapshot is active; earlier model runs stay with the previous "
     "data snapshot."
 )
-QUALITY_MOVE_TEST_OPTIMISM = "Changing Testing units after reviewing results makes later Test scores optimistic."
-QUALITY_MOVE_FIXED_HSE = "{n} official HSE test unit(s) are fixed in Testing Data."
-QUALITY_MOVE_JOB_ACTIVE = "Wait for the current job to finish before changing sets."
-QUALITY_MOVE_PREVIEW = "After the move: Training {train} · Validation {validation} · Testing {test} units."
+QUALITY_REPLACE_DONE = (
+    "Swapped {unit_a} with {unit_b}. A new data snapshot is active; earlier model runs stay with the previous "
+    "data snapshot."
+)
+QUALITY_REPLACE_NONE = "No unit in another set can take this place."
+QUALITY_SUGGEST_LIMITS_HELP = (
+    "Fills yellow and red from Training Data for the selected direction. Zones only label the chart. "
+    "Nothing is saved until you press Save."
+)
+QUALITY_SUGGEST_LIMITS_CAPTION = (
+    "From Training Data only, yellow is the early 90th percentile if the signal rises, or the 10th "
+    "if it falls. Red is the more extreme of the 99th or 1st percentile and a minimum gap from yellow "
+    "set by that early spread."
+)
+QUALITY_SUGGEST_DONE = (
+    "Suggested yellow {yellow:g} and red {red:g} from Training Data. Press Save to keep them."
+)
 LEGACY_PREPARE_HELP = (
     "Reads the imported files, checks them, and builds the prepared snapshot used for training. "
     "Runs in the background."
@@ -148,9 +154,6 @@ TRAIN_MODEL_HELP = (
 TRAIN_FULL_CNS_CAPTION = (
     "Uses all classified MaleCNS v1.0 neurons and original directed connections. Synapse counts are scaled "
     "for a fixed reservoir; its dynamics are mathematical, not measured fly activity. Training may be slow."
-)
-TRAIN_MODEL_CAPTION = (
-    "The model forecasts the signal itself in its native unit, not the remaining life of the unit."
 )
 TRAIN_HISTORY_HELP = (
     "How many past measurements the model sees for each forecast. More history can capture slower trends but "

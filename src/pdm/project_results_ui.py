@@ -212,8 +212,6 @@ def _show_forecast_context(result: dict, schema: dict, interval_status: str | No
         furthest = max(float(row["target_time_s"]) for row in supported)
         st.caption(f"Forecast through {_time_label(furthest, schema)} · "
                    f"{_time_label(furthest - float(result['as_of_s']), schema)} ahead of Now.")
-    else:
-        st.info(str(result.get("reason") or "A forecast is unavailable at this point. Collect more continuous history."))
     crossing = result.get("crossing") or {}
     when = crossing.get("time_s")
     if crossing.get("status") == "already_red":
@@ -226,8 +224,6 @@ def _show_forecast_context(result: dict, schema: dict, interval_status: str | No
         st.info("No red crossing is predicted within the shown forecast horizon.")
     elif crossing.get("status") == "pending":
         st.caption("Searching for red entry; the forecast is still being calculated.")
-    else:
-        st.caption("Red crossing time is unavailable for this prefix or threshold rule.")
     rollout = result.get("rollout") or {}
     if rollout.get("status") in {"unavailable", "stopped"}:
         st.warning(str(rollout["reason"]))
@@ -380,7 +376,7 @@ def _play_fragment(project_id: str, run_id: str, unit_id: str, snapshot: dict,
 
 def render_results(project_id: str, snapshot: dict, selected_run_id: str | None = None,
                    theme: str = "dark") -> None:
-    page_header("Results", "Replay a saved model on a held-out Test unit, one measurement at a time.")
+    page_header("Results", "")
     runs = []
     for row in list_project_runs(project_id):
         run_id = _run_id(row)
@@ -423,37 +419,11 @@ def render_results(project_id: str, snapshot: dict, selected_run_id: str | None 
                 st.session_state.pop(key, None)
         st.session_state.pop("project_last_forecast", None)
         st.session_state["result_active_pair"] = pair
-    engine = manifest.get("engine_id") or manifest.get("engine") or "Saved model"
-    if engine == "full_cns":
-        engine = "Fly brain · Full MaleCNS"
+    if (manifest.get("engine_id") or manifest.get("engine")) == "full_cns":
         provenance = manifest["connectome"]
-        st.caption(f"{provenance['dataset']} · {provenance['n_nodes']:,} neurons · "
-                   f"{provenance['n_edges']:,} directed connections · {provenance['n_synapses']:,} synaptic contacts.")
         with st.expander("Connectome source"):
             st.markdown("[Original MaleCNS data · HHMI Janelia / Cambridge / MRC LMB / Google Research](https://male-cns.janelia.org/download/)")
             st.caption(f"Graph SHA-256: {provenance['graph_hash']}")
-    trained = manifest["params"]["horizons_s"]
-    st.caption(f"{engine} · held-out Test unit · direct model forecast through "
-               f"{_time_label(max(trained), snapshot['schema'])} ahead · "
-               f"signal in {snapshot['schema'].get('signal_unit', 'native units')}")
-    mean_train_duration = average_training_duration_s(snapshot)
-    if mean_train_duration > 0:
-        st.caption(f"Proposed RED-warning lead: {_lead_label(mean_train_duration / 3, snapshot['schema'])} "
-                   "(one third of mean Train history).")
-    if max(trained) + 1e-6 < mean_train_duration:
-        average_label = (f"{mean_train_duration / 60:.1f} min"
-                         if snapshot["schema"].get("source_kind") == "xjtu_bearings"
-                         else f"{mean_train_duration:.1f} s")
-        st.info(f"This run stops at {_time_label(max(trained), snapshot['schema'])} ahead, shorter than the "
-                f"average Train history of {average_label}. "
-                "Retrain with the longer direct horizons to extend this model's forecast.")
-    validation_rows = ((manifest.get("metrics") or {}).get("validation") or {}).get("by_horizon") or []
-    weaker = [row for row in validation_rows if row.get("mae") is not None
-              and row.get("persistence_mae") is not None and row["mae"] >= row["persistence_mae"]]
-    if weaker:
-        st.warning(f"This model did not beat the last-value baseline on {len(weaker)} of "
-                   f"{len(validation_rows)} Validation horizons. Its red-entry forecast is not reliable "
-                   "without better independent validation.")
     _play_fragment(project_id, run_id, unit_id, snapshot, manifest.get("interval_status"), theme,
                    load_zone_limits(project_id, snapshot["snapshot_id"]),
                    background=manifest.get("engine_id") == "full_cns")

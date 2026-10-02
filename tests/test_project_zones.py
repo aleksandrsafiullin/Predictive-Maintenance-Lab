@@ -166,12 +166,14 @@ def test_invalid_rule_is_not_valid_and_described_as_not_zoned(thresholds):
     assert "not zoned" in describe_rule({"thresholds": thresholds})
 
 
-def test_quality_ui_branch_ignores_no_zones_copy(monkeypatch):
+def test_quality_ui_branch_ignores_no_zones_copy():
     import pdm.project_quality_ui as quality_ui
-    monkeypatch.setattr(quality_ui, "QUALITY_NO_ZONES", describe_rule(ABOVE))
     labelled = label_unit(_unit([0.1, 0.5, 0.9]), ABOVE)
     names = [trace.name for trace in quality_ui.zone_figure(labelled, ABOVE, "Vibration", "g", "dark").data]
     assert names == ["Vibration", "Green · 1", "Yellow · 1", "Red · 1"]
+    assert describe_rule(ABOVE) not in names
+    bare = quality_ui.zone_figure(labelled, {"signal_label": "Vibration"}, "Vibration", "g", "dark")
+    assert [trace.name for trace in bare.data] == ["Vibration"]
 
 
 def test_label_unit_sorts_by_timestamp():

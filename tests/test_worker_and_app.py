@@ -324,6 +324,7 @@ def test_import_and_quality_controls_expose_help(monkeypatch, tmp_path):
 
     from pdm import ui_copy
     from pdm.projects import project_store
+    from pdm.zone_limit_proposal import propose_absolute_limits
 
     at, _ = _product_app(monkeypatch, tmp_path)
     at.run()
@@ -368,12 +369,27 @@ def test_import_and_quality_controls_expose_help(monkeypatch, tmp_path):
     assert not at.exception
     inspect = [w for w in at.selectbox if w.label.startswith("Inspect ")]
     assert inspect and all(_help_of(w) for w in inspect)
-    moves = [*at.multiselect, *(w for w in at.selectbox if w.label == "Move to"),
-             *(b for b in at.button if b.label == "Move selected units")]
-    assert len(moves) == 9 and all(_help_of(w) for w in moves)
+    assert not at.multiselect
+    move_to = [w for w in at.selectbox if w.label == "Move to"]
+    replace_with = [w for w in at.selectbox if w.label == "Replace with"]
+    assert len(move_to) == 1 and len(replace_with) == 1
+    move_unit = next(b for b in at.button if b.label == "Move unit")
+    replace_unit = next(b for b in at.button if b.label == "Replace unit")
+    assert _help_of(move_to[0]) == ui_copy.QUALITY_MOVE_TO_HELP
+    assert _help_of(move_unit) == ui_copy.QUALITY_MOVE_SUBMIT_HELP
+    assert _help_of(replace_with[0]) == ui_copy.QUALITY_REPLACE_WITH_HELP
+    assert _help_of(replace_unit) == ui_copy.QUALITY_REPLACE_SUBMIT_HELP
+    assert move_unit.proto.type != "primary" and replace_unit.proto.type != "primary"
+    proposal = propose_absolute_limits(features, snapshot["split"]["train"], "above")
+    suggest = next(b for b in at.button if b.label == "Suggest from Training Data")
+    assert suggest.disabled
+    assert _help_of(suggest) == ui_copy.QUALITY_SUGGEST_LIMITS_HELP
+    assert suggest.proto.type != "primary"
+    assert ui_copy.QUALITY_SUGGEST_LIMITS_CAPTION in [str(item.value) for item in at.caption]
+    assert proposal["reason"] in [str(item.value) for item in at.caption]
+    assert not at.exception
     assert len(at.metric) and all(_help_of(m) for m in at.metric)
     assert _help_of(next(b for b in at.button if b.label == "Continue to Training"))
-    assert ui_copy.QUALITY_TABS_CAPTION in [c.value for c in at.caption]
     admitted = next(m for m in at.metric if m.label == "Admitted rows")
     assert _help_of(admitted) == ui_copy.QUALITY_ADMITTED_ROWS_HELP
     assert ui_copy.QUALITY_ADMITTED_ROWS_HELP == (
@@ -446,6 +462,10 @@ def test_product_screens_single_primary_button(monkeypatch, tmp_path):
     seen = []
     for title, at in _product_screens(monkeypatch, tmp_path):
         assert not at.exception, title
+        if title == "Data Quality":
+            assert any(widget.label == "Move to" for widget in at.selectbox)
+            assert any("would have no units" in str(item.value) for item in at.warning)
+            assert not at.multiselect
         # AppTest lists st.form_submit_button entries in at.button too (proto.is_form_submitter).
         primaries = [b for b in at.button if b.proto.type == "primary"
                      and not str(b.key or "").startswith("project_nav:")]
@@ -458,7 +478,12 @@ def test_product_titles_unchanged(monkeypatch, tmp_path):
     for title, at in _product_screens(monkeypatch, tmp_path):
         assert not at.exception, title
         assert [t.value for t in at.title] == [title]
-        assert any("pdm-page-desc" in str(m.value) for m in at.markdown), title
+        # Stylesheet markdown names the class; only the header element counts.
+        has_desc = any('<p class="pdm-page-desc">' in str(m.value) for m in at.markdown)
+        if title in {"Data Quality", "Training"}:
+            assert not has_desc, title
+        else:
+            assert has_desc, title
 
 
 def test_training_form_boosting_has_no_epochs(monkeypatch, tmp_path):

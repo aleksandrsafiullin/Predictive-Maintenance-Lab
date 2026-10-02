@@ -18,12 +18,7 @@ from pdm.data.project_prepare import (
     read_zone_limits,
 )
 from pdm.io_util import read_json
-from pdm.project_quality_ui import (
-    PARTS,
-    QUALITY_DESCRIPTION,
-    part_summary,
-    render_quality,
-)
+from pdm.project_quality_ui import PARTS, part_summary, render_quality
 from pdm.project_results_ui import cancel_replay_forecast, render_results
 from pdm.project_training_ui import render_training
 from pdm.projects import project_store
@@ -76,9 +71,12 @@ def _reset_project_session() -> None:
     cancel_replay_forecast()
     for key in list(st.session_state):
         if str(key).startswith(("project_play:", "play_slider:", "play_toggle:", "play_reset:",
-                                 "result_run:", "result_unit:", "quality_unit_", "quality_move", "folder:", "path:",
+                                 "result_run:", "result_unit:", "quality_unit_", "folder:", "path:",
                                  "source_mode:", "validation_mode", "test_mode", "quality_tab",
-                                 "import_weight_", "import_seed", "import_split_settings", "import_view:")):
+                                 "import_weight_", "import_seed", "import_split_settings", "import_view:",
+                                 "quality_move_to:", "quality_move:", "quality_replace_with:",
+                                 "quality_replace:", "quality_membership_notice",
+                                 "quality_limit_suggest")):
             st.session_state.pop(key, None)
     st.session_state.pop("project_last_forecast", None)
     st.session_state.pop("result_active_pair", None)
@@ -332,8 +330,6 @@ def _render_import(store, project: dict) -> None:
             summaries = _snapshot_summaries(pid, str(project["active_snapshot_id"]))
         except Exception as exc:
             load_error = str(exc)
-    if summaries:
-        st.caption("Counts are the saved snapshot.")
     primary, validation, test, val_mode, test_mode = _import_cards(store, project, summaries)
     if load_error:
         st.caption(f"Saved data could not be read: {load_error}")
@@ -341,9 +337,9 @@ def _render_import(store, project: dict) -> None:
         st.caption("Current sets include manual moves from Data Quality. Importing again creates a fresh split.")
     train_pct, val_pct, test_pct, seed = _split_settings("auto" in {val_mode, test_mode})
     saved = _saved_schema(store, project)
-    with st.container(border=True, key="pdm-import-signal"):
-        st.subheader("Signal", anchor=False)
-        if kind == "generic_sensor_csv":
+    if kind == "generic_sensor_csv":
+        with st.container(border=True, key="pdm-import-signal"):
+            st.subheader("Signal", anchor=False)
             st.caption("Each CSV needs unit_id, timestamp_s, and the selected numeric signal column. Time is in seconds.")
             s1, s2, s3 = st.columns(3)
             signal_column = s1.text_input("Signal column", value=str(saved.get("signal_column") or "signal"),
@@ -352,13 +348,11 @@ def _render_import(store, project: dict) -> None:
                                          help=IMPORT_SIGNAL_NAME_HELP)
             signal_unit = s3.text_input("Signal unit", value=str(saved.get("signal_unit") or "unit"),
                                         help=IMPORT_SIGNAL_UNIT_HELP)
-        elif kind == "xjtu_bearings":
-            signal_column, signal_label, signal_unit = "combined_rms", "Combined max-axis RMS", "g"
-            st.caption("XJTU-SY vibration fragments produce max-axis RMS acceleration in g. Acquisition time is recorded in seconds.")
-        else:
-            signal_column, signal_label, signal_unit = "differential_pressure", "Differential pressure", "Pa"
-            st.caption("HSE differential pressure is measured in Pa. Source time is in seconds.")
-        st.caption("Yellow and red limits are set on Data Quality after import.")
+            st.caption("Yellow and red limits are set on Data Quality after import.")
+    elif kind == "xjtu_bearings":
+        signal_column, signal_label, signal_unit = "combined_rms", "Combined max-axis RMS", "g"
+    else:
+        signal_column, signal_label, signal_unit = "differential_pressure", "Differential pressure", "Pa"
     status = status_for_project(pid)
     running = worker_alive() or status.get("status") in {"queued", "running", "training", "preparing", "stopping"}
     if running:
@@ -552,7 +546,9 @@ def main() -> None:
                     if importing_current:
                         st.caption("Showing the previous saved data while the replacement import is checked.")
                 snapshot = load_snapshot(selected_id)
-                ready = render_quality(snapshot, theme, storage_mode=selected.get("storage_mode", "owned"))
+                ready = render_quality(
+                    snapshot, theme, storage_mode=str(selected.get("storage_mode") or "owned"),
+                )
                 if ready and st.button("Continue to Training", type="primary", disabled=importing_current,
                                        help=QUALITY_CONTINUE_HELP):
                     st.session_state["project_step"] = "Training"
@@ -560,7 +556,7 @@ def main() -> None:
             except (OSError, ValueError, KeyError, RuntimeError) as exc:
                 st.error(f"Prepared data could not be opened: {exc}")
         else:
-            page_header("Data Quality", QUALITY_DESCRIPTION)
+            page_header("Data Quality", "")
             _import_status(selected_id)
             if selected.get("storage_mode") == "linked_legacy":
                 st.info("This linked source has no prepared sensor table yet. Prepare the legacy dataset, then reopen this project, or create a new project to import its folder.")

@@ -517,6 +517,118 @@ def preview_move(snapshot: Mapping[str, Any], unit_ids, destination: str) -> dic
     return result(None, projected)
 
 
+def _swap_unit_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
+
+
+def preview_swap(snapshot: Mapping[str, Any], unit_a, unit_b) -> dict[str, Any]:
+    """Validate exchanging two whole units between sets without any I/O."""
+    split = snapshot["split"]
+    current = {uid: name for name in SPLIT_NAMES for uid in map(str, split[name])}
+    counts = {name: len(split[name]) for name in SPLIT_NAMES}
+    fixed = _fixed_test_units(snapshot)
+
+    def result(
+        problem: str | None,
+        projected: dict[str, int] | None = None,
+        origin: dict[str, str] | None = None,
+        destination: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "counts": projected or counts,
+            "problem": problem,
+            "fixed_units": fixed,
+            "from": origin,
+            "to": destination,
+        }
+
+    left, right = _swap_unit_text(unit_a), _swap_unit_text(unit_b)
+    if left is None or right is None or left == right:
+        return result("Choose two different units.")
+    if left not in current:
+        return result(f"Unknown unit: {left}.")
+    if right not in current:
+        return result(f"Unknown unit: {right}.")
+    set_a, set_b = current[left], current[right]
+    if set_a == set_b:
+        return result("Units must be in different sets.")
+    protected = set(fixed)
+    for uid, origin_set, dest_set in ((left, set_a, set_b), (right, set_b, set_a)):
+        if uid in protected and origin_set == "test" and dest_set != "test":
+            return result("Official HSE test units stay in Testing Data.")
+    projected = dict(counts)
+    empty = next((name for name in SPLIT_NAMES if projected[name] == 0), None)
+    if empty is not None:
+        return result(
+            f"{SPLIT_LABELS[empty]} would have no units. Keep at least one unit in each set.",
+            projected,
+        )
+    return result(None, projected, {left: set_a, right: set_b}, {left: set_b, right: set_a})
+
+
+def _publish_manual_snapshot(
+    store: ProjectStore,
+    project_id: str,
+    parent: Mapping[str, Any],
+    split: dict[str, Any],
+    report: Mapping[str, Any],
+    *,
+    expected_snapshot_id: str,
+) -> dict[str, Any]:
+    """Stage one manual snapshot and activate it under the registry lock.
+
+    The destination path is resolved before ``launch_lock``. That lock is not
+    re-entrant: the critical section must not call ``store.get``,
+    ``load_snapshot``, ``project_path``, or ``snapshot_path``.
+    """
+    from pdm.worker import heavy_job_active
+
+    old_fingerprint = parent["fingerprint"]
+    copied = ("features.parquet", "units.parquet", "feature_schema.json")
+
+    def write_data(staging: Path) -> None:
+        for filename in copied:
+            _copy_snapshot_file(parent["dir"] / filename, staging / filename)
+
+    base = store.project_path(project_id) / "snapshots"
+    staging, snapshot_id, payload = _stage_snapshot(
+        base, project_id, write_data=write_data, split=split, report=report,
+        fingerprint={"source_digest": old_fingerprint.get("source_digest"),
+                     "source_manifest_id": old_fingerprint.get("source_manifest_id"),
+                     "parent_snapshot_id": expected_snapshot_id},
+    )
+    try:
+        new_hashes = payload["fingerprint"]["file_hashes"]
+        if any(new_hashes[name] != old_fingerprint["file_hashes"][name] for name in copied):
+            raise ValueError("Snapshot copy does not match its parent")
+        destination = store.snapshot_path(project_id, snapshot_id)
+        with store.launch_lock():
+            if heavy_job_active():
+                raise RuntimeError(JOB_ACTIVE_MOVE_ERROR)
+            registry = store._load()
+            record = store._entry(registry, project_id)
+            if record.get("storage_mode") != "owned":
+                raise ValueError(LINKED_LEGACY_MOVE_ERROR)
+            if record.get("active_snapshot_id") != expected_snapshot_id:
+                raise ValueError(STALE_SNAPSHOT_ERROR)
+            limits = read_zone_limits(parent["dir"])
+            if limits is not None:
+                atomic_write_json(staging / ZONE_LIMITS_FILE, limits)
+            _publish_snapshot(staging, destination,
+                              lambda: store._activate_snapshot_locked(registry, project_id, snapshot_id))
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+    return {"project_id": project_id, "snapshot_id": snapshot_id,
+            "parent_snapshot_id": expected_snapshot_id, "dir": destination, "split": split,
+            "report": payload["report"], "schema": parent["schema"],
+            "fingerprint": payload["fingerprint"]}
+
+
 def move_units(
     project_id: str, unit_ids, destination: Literal["train", "validation", "test"], *,
     expected_snapshot_id: str, store: ProjectStore | None = None,
@@ -566,47 +678,73 @@ def move_units(
         "by_split": _by_split(parent["features"], parent["units"], split),
         "created_at": now,
     }
-    old_fingerprint = parent["fingerprint"]
-    copied = ("features.parquet", "units.parquet", "feature_schema.json")
-
-    def write_data(staging: Path) -> None:
-        for filename in copied:
-            _copy_snapshot_file(parent["dir"] / filename, staging / filename)
-
-    base = store.project_path(project_id) / "snapshots"
-    staging, snapshot_id, payload = _stage_snapshot(
-        base, project_id, write_data=write_data, split=split, report=report,
-        fingerprint={"source_digest": old_fingerprint.get("source_digest"),
-                     "source_manifest_id": old_fingerprint.get("source_manifest_id"),
-                     "parent_snapshot_id": expected_snapshot_id},
+    return _publish_manual_snapshot(
+        store, project_id, parent, split, report, expected_snapshot_id=expected_snapshot_id,
     )
-    try:
-        new_hashes = payload["fingerprint"]["file_hashes"]
-        if any(new_hashes[name] != old_fingerprint["file_hashes"][name] for name in copied):
-            raise ValueError("Snapshot copy does not match its parent")
-        destination = store.snapshot_path(project_id, snapshot_id)
-        with store.launch_lock():
-            if heavy_job_active():
-                raise RuntimeError(JOB_ACTIVE_MOVE_ERROR)
-            registry = store._load()
-            record = store._entry(registry, project_id)
-            if record.get("storage_mode") != "owned":
-                raise ValueError(LINKED_LEGACY_MOVE_ERROR)
-            if record.get("active_snapshot_id") != expected_snapshot_id:
-                raise ValueError(STALE_SNAPSHOT_ERROR)
-            limits = read_zone_limits(parent["dir"])
-            if limits is not None:
-                atomic_write_json(staging / ZONE_LIMITS_FILE, limits)
-            _publish_snapshot(staging, destination,
-                              lambda: store._activate_snapshot_locked(registry, project_id, snapshot_id))
-    except BaseException:
-        if staging.exists():
-            shutil.rmtree(staging)
-        raise
-    return {"project_id": project_id, "snapshot_id": snapshot_id,
-            "parent_snapshot_id": expected_snapshot_id, "dir": destination, "split": split,
-            "report": payload["report"], "schema": parent["schema"],
-            "fingerprint": payload["fingerprint"]}
+
+
+def swap_units(
+    project_id: str, unit_a, unit_b, *,
+    expected_snapshot_id: str, store: ProjectStore | None = None,
+) -> dict[str, Any]:
+    """Exchange two whole units in one new snapshot.
+
+    Set counts stay equal to the parent, so two one-unit sets can trade places.
+    The parent snapshot and its runs are left untouched.
+    """
+    from pdm.worker import heavy_job_active
+
+    store = store or project_store()
+    _safe_id(expected_snapshot_id, "snapshot ID")
+    project = store.get(project_id)
+    if project["storage_mode"] != "owned":
+        raise ValueError(LINKED_LEGACY_MOVE_ERROR)
+    if project["active_snapshot_id"] != expected_snapshot_id:
+        raise ValueError(STALE_SNAPSHOT_ERROR)
+    if heavy_job_active():
+        raise RuntimeError(JOB_ACTIVE_MOVE_ERROR)
+    parent = load_snapshot(project_id, expected_snapshot_id, store=store)
+    problem = preview_swap(parent, unit_a, unit_b)["problem"]
+    if problem:
+        raise ValueError(problem)
+
+    left, right = str(unit_a), str(unit_b)
+    old_split = parent["split"]
+    current = {uid: name for name in SPLIT_NAMES for uid in map(str, old_split[name])}
+    set_a, set_b = current[left], current[right]
+    split = dict(old_split)
+    exchanged = {left, right}
+    destinations = {left: set_b, right: set_a}
+    for name in SPLIT_NAMES:
+        kept = [uid for uid in map(str, old_split[name]) if uid not in exchanged]
+        arrived = [uid for uid, dest in destinations.items() if dest == name]
+        split[name] = sorted(kept + arrived)
+    now = datetime.now(timezone.utc).isoformat()
+    split.update(
+        protocol=MANUAL_SPLIT_PROTOCOL,
+        parent_snapshot_id=expected_snapshot_id,
+        realized_counts={name: len(split[name]) for name in SPLIT_NAMES},
+        manual_moves=[
+            *old_split.get("manual_moves", []),
+            {
+                "kind": "swap",
+                "unit_ids": sorted((left, right)),
+                "from": {left: set_a, right: set_b},
+                "to": {left: set_b, right: set_a},
+                "at": now,
+            },
+        ],
+    )
+    assert_split_coverage(parent["units"].copy(), split)
+    report = {
+        **parent["report"], "snapshot_id": None, "parent_snapshot_id": expected_snapshot_id,
+        "split_counts": split["realized_counts"],
+        "by_split": _by_split(parent["features"], parent["units"], split),
+        "created_at": now,
+    }
+    return _publish_manual_snapshot(
+        store, project_id, parent, split, report, expected_snapshot_id=expected_snapshot_id,
+    )
 
 
 JOB_ACTIVE_LIMITS_ERROR = ("A background job is running, so this edit is not saved. "

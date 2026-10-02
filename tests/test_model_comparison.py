@@ -1,4 +1,6 @@
 import copy
+import inspect
+from unittest.mock import Mock
 
 import numpy as np
 import pandas as pd
@@ -7,10 +9,19 @@ import torch
 
 from pdm.benchmark import add_survival_scores, compare_evaluations
 from pdm.config import load_dataset_config
-from pdm.models import PDMNet
+from pdm.connectome.sources import load_synthetic_fixture
+from pdm.forecasting import predict_failure_interval
+from pdm.models import FlyConnectomeReservoir, PDMNet, RandomReservoir
+from pdm.models.reservoir import LeakyESN
 from pdm.predict import Predictor, prepare_history_window
-from pdm.preprocessing import fit_preprocessor
+from pdm.preprocessing import Preprocessor, fit_preprocessor
 from pdm.splits import bearings_split
+from pdm.visualization.simulation import (
+    continuous_forecast_history,
+    continuous_trace,
+    equipment_forecast_frame,
+    window_forecast_history,
+)
 
 
 def evaluation(rid, values, *, dataset='bearings', split='validation'):
@@ -137,20 +148,227 @@ def test_actual_recurrent_trace_matches_prediction_and_cell_memory(tiny_bearing_
         assert plain['lower_rul_s'] <= plain['predicted_rul_s'] <= plain['upper_rul_s']
 
 
-@pytest.mark.parametrize('architecture', ['gru', 'lstm'])
+def _window_reset_parity_model(architecture, prep):
+    width = len(prep.feature_names)
+    if architecture in ('gru', 'lstm'):
+        return PDMNet(width, hidden_size=8, architecture=architecture, time_scale_s=prep.time_scale_s)
+    graph = load_synthetic_fixture().graph
+    reservoir = FlyConnectomeReservoir if architecture == 'fly_connectome_reservoir' else RandomReservoir
+    return reservoir(graph, input_size=width, state_mode='window_reset', time_scale_s=prep.time_scale_s)
+
+
+@pytest.mark.parametrize('architecture', ['gru', 'lstm', 'fly_connectome_reservoir', 'random_reservoir'])
 def test_seek_and_replay_export_use_identical_forecasts(tiny_bearing_tables, architecture):
     from pdm.replay import replay_unit
     from pdm.visualization.simulation import window_forecast_history
     f, u = tiny_bearing_tables
     cfg = load_dataset_config('bearings')
     prep, _ = fit_preprocessor('bearings', f, u, bearings_split(u), cfg)
-    model = PDMNet(len(prep.feature_names), hidden_size=8, architecture=architecture, time_scale_s=prep.time_scale_s)
+    model = _window_reset_parity_model(architecture, prep)
+    assert model.state_mode == 'window_reset'
     prefix = f[f.unit_id == 'Bearing1_1'].iloc[:16]
     points = window_forecast_history(prefix, model, prep, 5)
     cache = {r['timestamp_s']: r for r in points.to_dict('records')}
     rewind = window_forecast_history(prefix.iloc[:9], model, prep, 5, cached=cache)
-    replay = window_forecast_history(prefix, model, prep, 5, cached={r['timestamp_s']: r for r in rewind.to_dict('records')})
+    replay = window_forecast_history(
+        prefix, model, prep, 5, cached={r['timestamp_s']: r for r in rewind.to_dict('records')},
+    )
+    overlap = points['timestamp_s'].isin(rewind['timestamp_s'])
+    pd.testing.assert_frame_equal(points.loc[overlap].reset_index(drop=True), rewind.reset_index(drop=True))
     pd.testing.assert_frame_equal(points, replay)
     export = replay_unit(prefix, Predictor(model, prep, 5), dataset_id='bearings', unit_id='Bearing1_1', run_id='test',
                          history_length=5, warning_horizon_s=60, truth_units=u)['predictions']
-    np.testing.assert_allclose(points.predicted_rul_s, export.predicted_rul_s, equal_nan=True, rtol=0, atol=0)
+    np.testing.assert_allclose(points['predicted_rul_s'], export['predicted_rul_s'], equal_nan=True, rtol=0, atol=0)
+    held = list(cache)[3:8]
+    partial = {stamp: cache[stamp] for stamp in held}
+    partial_rewind = window_forecast_history(prefix.iloc[:9], model, prep, 5, cached=partial)
+    cached_rows = points['timestamp_s'].isin(held)
+    got = partial_rewind.loc[partial_rewind['timestamp_s'].isin(held)]
+    pd.testing.assert_frame_equal(points.loc[cached_rows].reset_index(drop=True), got.reset_index(drop=True))
+
+
+def _reject_overlay_and_visited(fn):
+    names = [name.lower() for name in inspect.signature(fn).parameters]
+    assert 'show_gt' not in names
+    assert 'official_rul_at_prefix_end_s' not in names
+    assert 'predictions' not in names
+    assert not any('visit' in name for name in names)
+
+
+def _continuous_prefix(n=16):
+    frame = pd.DataFrame({
+        'unit_id': 'bearing', 'timestamp_s': np.arange(n) * 60.0,
+        'operating_age_s': np.arange(n) * 60.0, 'rpm': 1800, 'load_kn': 4,
+    })
+    for axis in ('horizontal', 'vertical'):
+        for stat in ('rms', 'std', 'abs_peak', 'peak_to_peak', 'crest_factor', 'kurtosis',
+                     'band_0', 'band_1', 'band_2', 'band_3'):
+            frame[f'{axis}_{stat}'] = np.linspace(0.1, 2.0, n)
+    frame['gap_before'] = False
+    return frame
+
+
+def _continuous_model():
+    model = LeakyESN(
+        torch.tensor([[.3], [-.2], [.1]]), torch.eye(3) * .25, torch.zeros(3),
+        state_mode='continuous', time_scale_s=600,
+    )
+    model.node_order = ['a', 'b', 'c']
+    model.rul_transform = 'log1p'
+    model.readout.load_ridge_vector(np.array([.2, -.3, .4, -.1, 4.0]))
+    prep = Preprocessor(
+        ['horizontal_rms'], [], [0], [1], 600,
+        fill_values={'horizontal_rms': 0}, dataset_id='bearings',
+    )
+    return model, prep
+
+
+def test_equipment_forecast_frame_choice(monkeypatch, tiny_bearing_tables):
+    _reject_overlay_and_visited(equipment_forecast_frame)
+    _reject_overlay_and_visited(continuous_forecast_history)
+    signature = inspect.signature(equipment_forecast_frame)
+    assert list(signature.parameters) == [
+        'prefix', 'model', 'prep', 'history_length', 'profile', 'trace', 'window_cache', 'segment_cache',
+    ]
+    for name in ('profile', 'trace', 'window_cache', 'segment_cache'):
+        assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+
+    history_length = 3
+    model, prep = _continuous_model()
+    prefix = _continuous_prefix()
+    prefix.loc[10, 'gap_before'] = True
+    assert len(prefix) == 16
+    visited = {
+        float(prefix['timestamp_s'].iloc[0]): {
+            'timestamp_s': float(prefix['timestamp_s'].iloc[0]), 'predicted_rul_s': 9.0,
+        },
+    }
+    segment_cache = []
+    with monkeypatch.context() as guarded:
+        guarded.setattr(
+            'pdm.visualization.simulation.window_forecast_history',
+            Mock(side_effect=AssertionError('window forecast used')),
+        )
+        spy = Mock(wraps=continuous_forecast_history)
+        guarded.setattr('pdm.visualization.simulation.continuous_forecast_history', spy)
+        early = prefix.iloc[:2]
+        early_trace = continuous_trace(early, model, prep, history_length)
+        equipment_forecast_frame(
+            early, model, prep, history_length, profile=None, trace=early_trace,
+            window_cache=visited, segment_cache=segment_cache,
+        )
+        trace = continuous_trace(prefix, model, prep, history_length)
+        prior = copy.deepcopy(segment_cache)
+        result = equipment_forecast_frame(
+            prefix, model, prep, history_length, profile=None, trace=trace,
+            window_cache=visited, segment_cache=segment_cache,
+        )
+        assert [len(call.args[0]) for call in spy.call_args_list] == [2, 16]
+        assert spy.call_args.kwargs['trace'] is trace
+        assert spy.call_args.kwargs['cached_segments'] is segment_cache
+        expected = continuous_forecast_history(
+            prefix, model, prep, history_length, trace=trace, cached_segments=prior,
+        )
+        pd.testing.assert_frame_equal(result, expected)
+        assert len(result) == len(prefix) == 16
+        assert len(result) != 1
+        assert trace['status'] == 'predicted'
+        assert float(result.iloc[-1]['predicted_rul_s']) == float(trace['predicted_rul_s'])
+        assert segment_cache
+        short = prefix.iloc[:9]
+        short_trace = continuous_trace(short, model, prep, history_length)
+        rewound = equipment_forecast_frame(
+            short, model, prep, history_length, profile=None, trace=short_trace,
+            window_cache=visited, segment_cache=segment_cache,
+        )
+        assert len(rewound) == len(short)
+        short_end = float(short['timestamp_s'].iloc[-1])
+        assert np.all(rewound['timestamp_s'].to_numpy(dtype=float) <= short_end)
+        warm = prefix.copy()
+        warm['gap_before'] = False
+        warm_gap = 14
+        warm.loc[warm_gap, 'gap_before'] = True
+        warm_trace = continuous_trace(warm, model, prep, history_length)
+        warm_result = equipment_forecast_frame(
+            warm, model, prep, history_length, profile=None, trace=warm_trace,
+            window_cache=visited, segment_cache=segment_cache,
+        )
+    scalar = warm_trace['predicted_rul_s']
+    last = warm_result.iloc[-1]['predicted_rul_s']
+    previous = warm_result['predicted_rul_s'].iloc[warm_gap - 1]
+    assert warm_trace['status'] != 'predicted'
+    assert scalar is None or pd.isna(scalar)
+    assert pd.isna(last)
+    assert np.isfinite(previous)
+    assert not np.isfinite(last)
+
+    features, units = tiny_bearing_tables
+    cfg = load_dataset_config('bearings')
+    fitted, _ = fit_preprocessor('bearings', features, units, bearings_split(units), cfg)
+    measured = features[features.unit_id == 'Bearing1_1'].iloc[:16].reset_index(drop=True)
+    graph = load_synthetic_fixture().graph
+    decoy = {
+        'timestamps_s': np.zeros(1), 'raw_rul_s': np.zeros(1),
+        'predicted_rul_s': None, 'status': 'Collecting history',
+    }
+    for cls in (FlyConnectomeReservoir, RandomReservoir):
+        reservoir = cls(
+            graph, input_size=len(fitted.feature_names), state_mode='window_reset',
+            time_scale_s=fitted.time_scale_s,
+        )
+        assert reservoir.state_mode == 'window_reset'
+        window_cache = {}
+        with monkeypatch.context() as guarded:
+            guarded.setattr(
+                'pdm.visualization.simulation.continuous_forecast_history',
+                Mock(side_effect=AssertionError('continuous forecast used')),
+            )
+            window_spy = Mock(wraps=window_forecast_history)
+            guarded.setattr('pdm.visualization.simulation.window_forecast_history', window_spy)
+            got = equipment_forecast_frame(
+                measured, reservoir, fitted, 5, profile=None, trace=decoy, window_cache=window_cache,
+            )
+        assert window_spy.call_count == 1
+        assert window_spy.call_args.args[0] is measured
+        assert window_spy.call_args.kwargs['cached'] is window_cache
+        pd.testing.assert_frame_equal(
+            got, window_forecast_history(measured, reservoir, fitted, 5, cached=window_cache),
+        )
+
+    profile = {
+        'version': 1, 'warmup_measurements': history_length, 'smoothing_tau_s': 300,
+        'residual_q_low': -1.0, 'residual_q_high': 2.0,
+    }
+    seen = {}
+
+    def _spy_interval(timestamps_s, raw_rul_s, profile_arg, *, gap_before=None):
+        seen['timestamps'] = timestamps_s
+        seen['raw'] = raw_rul_s
+        seen['profile'] = profile_arg
+        seen['gap_before'] = gap_before
+        return predict_failure_interval(timestamps_s, raw_rul_s, profile_arg, gap_before=gap_before)
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(
+            'pdm.visualization.simulation.window_forecast_history',
+            Mock(side_effect=AssertionError('window forecast used')),
+        )
+        guarded.setattr(
+            'pdm.visualization.simulation.continuous_forecast_history',
+            Mock(side_effect=AssertionError('continuous forecast used')),
+        )
+        guarded.setattr('pdm.forecasting.predict_failure_interval', _spy_interval)
+        profiled = equipment_forecast_frame(
+            prefix, model, prep, history_length, profile=profile, trace=trace, segment_cache=[],
+        )
+    assert seen['timestamps'] is trace['timestamps_s']
+    assert seen['raw'] is trace['raw_rul_s']
+    assert seen['profile'] is profile
+    assert seen['gap_before'] is None
+    expected_profile = predict_failure_interval(trace['timestamps_s'], trace['raw_rul_s'], profile)
+    pd.testing.assert_frame_equal(profiled, expected_profile)
+    assert list(profiled.columns) == list(expected_profile.columns)
+    assert len(profiled) == len(np.asarray(trace['timestamps_s']))
+    assert len(profiled) < len(prefix)
+    assert 'horizontal_rms' not in profiled.columns
+    assert 'gap_before' not in profiled.columns

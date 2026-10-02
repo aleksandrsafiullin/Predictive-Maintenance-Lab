@@ -35,10 +35,6 @@ def _training_step(snapshot: dict) -> float:
     return step
 
 
-def _time_for_training(seconds: float, schema: dict) -> str:
-    return f"{seconds / 60:.1f} min" if schema.get("source_kind") == "xjtu_bearings" else f"{seconds:.1f} s"
-
-
 def _default_profile(snapshot: dict, engine_id: str) -> tuple[dict, list[dict]]:
     """Choose editable starting settings using Train/Validation clocks only."""
     profiles = {
@@ -134,7 +130,6 @@ def _job_status(project_id: str) -> None:
             except (KeyError, ValueError, RuntimeError) as exc:
                 st.error(str(exc))
     elif state == "completed":
-        st.success("Job completed. Its saved model is ready to open.")
         if st.session_state.get(f"last_terminal:{project_id}") != status.get("job_id"):
             st.session_state[f"last_terminal:{project_id}"] = status.get("job_id")
             st.rerun(scope="app")
@@ -143,7 +138,7 @@ def _job_status(project_id: str) -> None:
 
 
 def render_training(project_id: str, snapshot: dict) -> None:
-    page_header("Training", "Choose one signal model and its settings. Training uses Train units, Validation selects the saved model, and Test remains held out until evaluation.")
+    page_header("Training", "")
     _job_status(project_id)
     runs = list_project_runs(project_id)
     stale = sum(1 for row in runs if row.get("snapshot_id") != snapshot["snapshot_id"])
@@ -163,9 +158,6 @@ def render_training(project_id: str, snapshot: dict) -> None:
     ids = [str(entry["engine_id"]) for entry in available]
     selected = st.selectbox("Model", ids, format_func=lambda key: ENGINE_LABELS.get(key, key),
                             help=ui_copy.TRAIN_MODEL_HELP)
-    st.caption(ui_copy.TRAIN_MODEL_CAPTION)
-    st.caption("Settings below are data-aware starting points, not proven optimal parameters. "
-               "Use Validation and the last-value baseline to judge quality; keep Test out of tuning.")
     recurrent = selected in {"gru", "lstm"}
     full_cns = selected == "full_cns"
     defaults, coverage = _default_profile(snapshot, selected)
@@ -173,11 +165,6 @@ def render_training(project_id: str, snapshot: dict) -> None:
     mean_duration = average_training_duration_s(snapshot)
     step = _training_step(snapshot)
     required_horizon = max(1, math.ceil(mean_duration / step - 1e-9)) * step
-    st.caption(f"Average observed Train history per unit: {_time_for_training(mean_duration, snapshot['schema'])}. "
-               f"The proposed direct forecast reaches {_time_for_training(max(defaults['horizons_s']), snapshot['schema'])}.")
-    if mean_duration > 0:
-        st.caption(f"Proposed RED-warning lead: {_time_for_training(mean_duration / 3, snapshot['schema'])} "
-                   "(one third of mean Train history).")
     if max(defaults["horizons_s"]) + 1e-6 < required_horizon:
         st.warning("This snapshot has no known Train and Validation targets at the average Train history length. "
                    "A validated direct forecast that far is not possible until longer continuous histories "
@@ -278,7 +265,6 @@ def render_training(project_id: str, snapshot: dict) -> None:
         validation = metrics.get("validation") or {}
         test = metrics.get("test") or {}
         if validation or test:
-            st.caption(f"Latest saved model: {ENGINE_LABELS.get(latest.get('engine_id'), 'Signal model')}. Mean absolute error is in {snapshot['schema'].get('signal_unit', 'signal units')}.")
             c1, c2 = st.columns(2)
             val_mae = validation.get("mae")
             test_mae = test.get("mae")

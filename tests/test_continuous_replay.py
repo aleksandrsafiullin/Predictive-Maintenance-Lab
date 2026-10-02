@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from unittest.mock import Mock
 
 import numpy as np
@@ -11,8 +12,9 @@ from pdm.forecasting import predict_failure_interval
 from pdm.models.reservoir import LeakyESN
 from pdm.predict import Predictor
 from pdm.preprocessing import Preprocessor
-from pdm.replay import replay_unit
-from pdm.visualization.simulation import continuous_trace
+from pdm.replay import _continuous_bearing_predictions, replay_unit
+from pdm.visualization.simulation import continuous_forecast_history, continuous_trace
+from pdm.windows import recompute_filter_gap_before
 
 
 @pytest.fixture
@@ -92,3 +94,194 @@ def test_continuous_profile_warmup_must_match_saved_model(continuous_case):
     frame, predictor, profile = continuous_case
     with pytest.raises(ValueError, match="warmup"):
         _replay(frame, predictor, {**profile, "warmup_measurements": 2})
+
+
+def _forbid_chart_shortcuts(monkeypatch):
+    monkeypatch.setattr("pdm.predict.Predictor", Mock(side_effect=AssertionError("per-row Predictor used")))
+    monkeypatch.setattr(
+        "pdm.visualization.simulation.window_forecast_history",
+        Mock(side_effect=AssertionError("window forecast used")),
+    )
+    monkeypatch.setattr(
+        "pdm.forecasting.predict_failure_interval",
+        Mock(side_effect=AssertionError("interval profile used")),
+    )
+
+
+def _assert_forecast_signature():
+    names = set(inspect.signature(continuous_forecast_history).parameters)
+    assert "show_gt" not in names
+    assert "official_rul_at_prefix_end_s" not in names
+    assert not any("visit" in name.lower() for name in names)
+    for banned in ("predictions", "event_time", "event_time_s", "profile", "forecast_profile"):
+        assert banned not in names
+
+
+def _assert_earlier_segments_only(cache, trace, model):
+    assert isinstance(cache, list) and cache
+    active_ts = np.asarray(trace["timestamps_s"], dtype=float).reshape(-1)
+    identity = (id(model), model.W_in._version, model.W_res._version, model.b_res._version, float(model.alpha))
+    assert len(cache) == 1
+    for entry in cache:
+        assert entry["model_identity"] == identity
+        stamps = np.asarray(entry["timestamps_s"], dtype=float).reshape(-1)
+        assert entry["length"] == len(stamps) == len(entry["raw_rul_s"])
+        assert entry["start_timestamp_s"] == float(stamps[0])
+        assert not np.array_equal(stamps, active_ts)
+        assert float(stamps[-1]) < float(active_ts[0])
+
+
+@pytest.mark.parametrize("architecture", ["leaky", "full_cns"])
+def test_continuous_forecast_reuses_traced_segment(continuous_case, monkeypatch, architecture):
+    frame, predictor, _profile = continuous_case
+    if architecture == "full_cns":
+        from tests.test_future_red_full_cns import _mini_full_cns_reservoir
+
+        model = _mini_full_cns_reservoir(1)
+        assert model.pool_index is not None and model.pool_index.tolist() == [0, 0, 1, 1]
+        model.rul_transform = "log1p"
+        model.readout.load_ridge_vector(np.array([0.2, -0.3, 0.4, -0.1, 0.05, 4.0]))
+    else:
+        model = predictor.model
+        assert isinstance(model, LeakyESN)
+        assert not hasattr(model, "pool_index")
+    prep, history_length = predictor.prep, predictor.history_length
+    prefix = frame.copy()
+    prefix.loc[12, "gap_before"] = True
+    gap_at = int(np.flatnonzero(prefix["gap_before"].fillna(False).to_numpy(dtype=bool))[-1])
+    post_gap = prefix.iloc[gap_at:].reset_index(drop=True)
+    trace = continuous_trace(post_gap, model, prep, history_length)
+    if architecture == "full_cns":
+        assert "activity_history" in trace
+    _assert_forecast_signature()
+    reference = Predictor(model, prep, history_length)
+    cached_segments = []
+    with monkeypatch.context() as guarded:
+        _forbid_chart_shortcuts(guarded)
+        original = model.forward_states
+        calls = Mock(wraps=original)
+        guarded.setattr(model, "forward_states", calls)
+        first = continuous_forecast_history(
+            prefix, model, prep, history_length, trace=trace, cached_segments=cached_segments
+        )
+        assert calls.call_count == 1
+        _assert_earlier_segments_only(cached_segments, trace, model)
+        calls.reset_mock()
+        second = continuous_forecast_history(
+            prefix, model, prep, history_length, trace=trace, cached_segments=cached_segments
+        )
+        assert calls.call_count == 0
+        _assert_earlier_segments_only(cached_segments, trace, model)
+        short = prefix.iloc[:20].copy()
+        short_result = continuous_forecast_history(
+            short, model, prep, history_length, trace=trace, cached_segments=cached_segments
+        )
+        assert calls.call_count == 1
+        _assert_earlier_segments_only(cached_segments, trace, model)
+    assert list(second.columns) == ["timestamp_s", "raw_rul_s", "predicted_rul_s"]
+    assert len(first) == len(second) == len(prefix)
+    active = np.asarray(trace["raw_rul_s"], dtype=float).reshape(-1)
+    np.testing.assert_array_equal(second["raw_rul_s"].to_numpy(dtype=float)[-len(active) :], active)
+    predicted = second["predicted_rul_s"].to_numpy(dtype=float)
+    raw = second["raw_rul_s"].to_numpy(dtype=float)
+    assert np.isnan(predicted[: history_length - 1]).all()
+    assert np.isnan(predicted[gap_at : gap_at + history_length - 1]).all()
+    np.testing.assert_array_equal(predicted[history_length - 1 : gap_at], raw[history_length - 1 : gap_at])
+    np.testing.assert_array_equal(predicted[gap_at + history_length - 1 :], raw[gap_at + history_length - 1 :])
+    expected = _continuous_bearing_predictions(prefix, reference, None)
+    np.testing.assert_allclose(
+        predicted, expected["predicted_rul_s"].to_numpy(dtype=float), equal_nan=True, rtol=0, atol=0
+    )
+    short_end = float(short["timestamp_s"].iloc[-1])
+    assert len(short_result) == len(short)
+    assert np.all(short_result["timestamp_s"].to_numpy(dtype=float) <= short_end)
+    np.testing.assert_array_equal(
+        short_result["timestamp_s"].to_numpy(dtype=float), short["timestamp_s"].to_numpy(dtype=float)
+    )
+
+
+def test_filter_forecast_ignores_poisoned_gap_flags(monkeypatch):
+    n = 14
+    step = 6.0
+    timestamps = np.arange(n) * step
+    timestamps[8:] += 100.0
+    prefix = pd.DataFrame({
+        "dataset_id": ["filters"] * n,
+        "unit_id": ["filter-a"] * n,
+        "timestamp_s": timestamps,
+        "operating_age_s": timestamps,
+        "delta_t_s": np.r_[0.0, np.diff(timestamps)],
+        "differential_pressure": np.linspace(10.0, 80.0, n),
+        "delta_pressure": np.zeros(n),
+        "flow_rate": np.full(n, 80.0),
+        "dust_feed": np.full(n, 100.0),
+        "dust": ["A3"] * n,
+        "gap_before": np.zeros(n, dtype=bool),
+    })
+    assert str(prefix["dataset_id"].iloc[0]) == "filters"
+    model = LeakyESN(
+        torch.tensor([[0.3, 0.05], [-0.2, 0.1], [0.1, -0.05]]),
+        torch.eye(3) * 0.25,
+        torch.zeros(3),
+        state_mode="continuous",
+        time_scale_s=600,
+    )
+    model.node_order = ["a", "b", "c"]
+    model.rul_transform = "log1p"
+    model.readout.load_ridge_vector(np.array([0.2, -0.3, 0.4, -0.1, 0.05, 4.0]))
+    history_length = 3
+    prep = Preprocessor(
+        ["differential_pressure", "delta_t_s"],
+        [],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        600,
+        fill_values={"differential_pressure": 0.0, "delta_t_s": 0.0},
+        dataset_id="filters",
+        gap_multiplier=2.5,
+        sampling_interval_s=step,
+    )
+    assert prep.dataset_id == "filters"
+    recomputed = recompute_filter_gap_before(
+        prefix,
+        gap_multiplier=prep.gap_multiplier,
+        sampling_interval_s=prep.sampling_interval_s,
+        causal=True,
+    )
+    stored = prefix["gap_before"].to_numpy(dtype=bool)
+    causal = recomputed["gap_before"].to_numpy(dtype=bool)
+    assert not np.array_equal(stored, causal)
+    gap_at = int(np.flatnonzero(causal)[0])
+    assert not bool(stored[gap_at])
+    predictor = Predictor(model, prep, history_length)
+    with monkeypatch.context() as guarded:
+        _forbid_chart_shortcuts(guarded)
+        result = continuous_forecast_history(prefix, model, prep, history_length)
+    expected = []
+    for index in range(len(prefix)):
+        value = predictor.predict_from_history(prefix.iloc[: index + 1])["predicted_rul_s"]
+        expected.append(np.nan if value is None else float(value))
+    np.testing.assert_allclose(
+        result["predicted_rul_s"].to_numpy(dtype=float),
+        np.asarray(expected, dtype=float),
+        equal_nan=True,
+        rtol=0,
+        atol=0,
+    )
+    assert result["predicted_rul_s"].iloc[gap_at : gap_at + history_length - 1].isna().all()
+
+    def keep_stored(frame, **_kwargs):
+        return frame.sort_values("timestamp_s").reset_index(drop=True)
+
+    with monkeypatch.context() as guarded:
+        _forbid_chart_shortcuts(guarded)
+        guarded.setattr("pdm.windows.recompute_filter_gap_before", keep_stored)
+        poisoned = continuous_forecast_history(prefix, model, prep, history_length)
+    assert np.isfinite(poisoned["predicted_rul_s"].iloc[gap_at])
+    assert not np.allclose(
+        result["predicted_rul_s"].to_numpy(dtype=float),
+        poisoned["predicted_rul_s"].to_numpy(dtype=float),
+        equal_nan=True,
+        rtol=0,
+        atol=0,
+    )
