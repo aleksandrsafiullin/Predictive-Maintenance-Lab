@@ -313,6 +313,17 @@ def main(argv: list[str] | None = None) -> int:
     future_targets = sub.add_parser("future-red-targets", help="Export fixed-horizon future red-entry targets")
     future_targets.add_argument("--dataset", required=True, choices=["bearings", "filters"])
     future_targets.add_argument("--horizon-s", type=float, default=None)
+    live_sim = sub.add_parser("live-simulate", help="Replay recorded units into a live folder (demo feed)")
+    live_sim.add_argument("--project", required=True)
+    live_sim.add_argument("--folder", default=None, help="Default: data/live/<project>/incoming")
+    live_sim.add_argument("--units", default="test", help="Comma-separated unit ids, or test/validation/train")
+    live_sim.add_argument("--tick-s", type=float, default=1.0, help="Seconds between ticks")
+    live_sim.add_argument("--rows-per-tick", type=int, default=1, help="Measurements added per unit per tick")
+    live_watch = sub.add_parser("live-watch", help="Score the live folder on a schedule and send Teams alerts")
+    live_watch.add_argument("--project", required=True)
+    live_watch.add_argument("--interval-s", type=float, default=None)
+    live_watch.add_argument("--once", action="store_true", help="Run one cycle and exit")
+
     args = parser.parse_args(argv)
     if args.cmd == "zones-labels":
         if args.dataset == "filters" and args.red_ratio is not None:
@@ -400,6 +411,33 @@ def main(argv: list[str] | None = None) -> int:
             overrides = {k: v for k, v in {"red_ratio": args.red_ratio}.items() if v is not None}
             print(json.dumps(export_zone_labels(args.dataset, overrides), indent=2))
         return 0
+    if args.cmd == "live-simulate":
+        from pdm.live_monitor import default_folder
+        from pdm.live_simulator import demo_units, run_simulator
+
+        groups = demo_units(args.project)
+        units = []
+        for item in (u.strip() for u in args.units.split(",") if u.strip()):
+            units.extend(groups.get(item, [item]))
+        status = run_simulator(args.project, args.folder or default_folder(args.project), units,
+                               tick_s=args.tick_s, rows_per_tick=args.rows_per_tick)
+        print(json.dumps({"state": status["state"], "units": status["units"]}, indent=2))
+        return 0
+    if args.cmd == "live-watch":
+        from pdm.live_monitor import load_config, poll_once
+        from pdm.projects import project_store
+
+        name = project_store().get(args.project)["name"]
+        while True:
+            config = load_config(args.project)
+            cycle = poll_once(args.project, name, config)
+            counts = {z: sum(r["zone"] == z for r in cycle["results"]) for z in ("green", "yellow", "red", "unknown")}
+            print(json.dumps({"read_at": cycle["read_at"], "machines": len(cycle["results"]), **counts,
+                              "alerts": [{k: a[k] for k in ("unit_id", "zone", "delivery")} for a in cycle["alerts"]]}),
+                  flush=True)
+            if args.once:
+                return 0
+            time.sleep(args.interval_s or float(config.get("refresh_s") or 10))
     if args.cmd == "doctor":
         doctor()
         return 0

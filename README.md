@@ -1,6 +1,6 @@
 # Predictive Maintenance Lab
 
-A local laboratory for **sensor-signal forecasting**, with independent projects and a Create ML-style workflow: **Projects → Import data → Data Quality → Training → Results**. Import sensor CSV folders or the supported XJTU-SY/HSE formats, choose one model, and replay its saved forecast beside the measurements received so far. Yellow and red are signal limits; crossing one is not automatically an equipment failure.
+A local laboratory for **sensor-signal forecasting**, with independent projects and a Create ML-style workflow: **Projects → Import data → Data Quality → Training → Results → Live monitor**. Import sensor CSV folders or the supported XJTU-SY/HSE formats, choose one model, and replay its saved forecast beside the measurements received so far. Yellow and red are signal limits; crossing one is not automatically an equipment failure.
 
 See the [project workflow guide](docs/create_ml_workflow.md) for folder formats, automatic/manual splits, model settings, playback and recoverable deletion. The public datasets and earlier research below remain available without copying their raw files into each project.
 
@@ -12,6 +12,10 @@ See the [project workflow guide](docs/create_ml_workflow.md) for folder formats,
 | Filters / HSE | [Public dataset](https://www.kaggle.com/datasets/prognosticshse/preventive-to-predicitve-maintenance) and [source paper](https://papers.phmsociety.org/index.php/ijphm/article/download/3087/1835) | Differential pressure in Pa, flow and dust feed; source `Time` is seconds, with 0.1-second CSV steps | Original 40 / 10 / 50; admission retains 39 / 10 / 50 units |
 
 The bundled HSE source document at `data/raw/filters/Preventive to Predictive Maintenance dataset.pdf` labels Figure 6's x axis **Time / s** (p. 5), describes sampling in Hz (p. 7), and defines the laboratory endpoint at pressure **strictly above 600 Pa** (p. 6). The RUL column's duration scale follows Time in the CSV, but its unit is not independently restated in the schema. See [data units and endpoints](docs/data_units_and_endpoints.md).
+
+## Live monitor and Teams alerts
+
+**Live monitor** watches a folder of sensor CSV files (for example a SharePoint library synced with OneDrive) and, every few seconds, shows each machine's current green/yellow/red zone and the saved model's forecast of when it reaches red, most urgent first. Machines turning yellow or red can post an Adaptive Card to a Microsoft Teams channel. A **demo feed** replays recorded test bearings into the folder with an accelerated clock, for presentations. See the [live monitor guide](docs/live_monitor.md).
 
 ## Current sensor zones
 
@@ -242,6 +246,7 @@ scripts/          setup.sh / run.sh (and Windows .ps1)
 ## More documentation
 
 - [Project workflow guide](docs/create_ml_workflow.md) — folder import, split rules, training, playback and storage
+- [Live monitor](docs/live_monitor.md) — watched folder, SharePoint sync, demo feed, Teams alerts and `live-watch`
 - [Implementation plan (Russian)](docs/create_ml_implementation_plan_ru.md) — scope, architecture and acceptance criteria
 - [Sensor-zone benchmark review](docs/sensor_zone_benchmark_review.md) — weak-label score, baselines and filter threshold sensitivity
 - [Future-red forecast report](docs/future_red_forecast_report.md) — horizon targets, censored masks, full model matrix and limits

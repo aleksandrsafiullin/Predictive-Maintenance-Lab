@@ -9,6 +9,7 @@ data/raw/
 data/processed/
 data/projects/
 data/cache/
+data/live/
 runs/
 *.pt
 .env

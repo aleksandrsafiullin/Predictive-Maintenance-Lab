@@ -51,7 +51,7 @@ from pdm.ui_copy import (
 from pdm.ui_theme import empty_state, page_header, render_theme_control
 from pdm.worker import read_status, status_for_project, worker_alive
 
-STEPS = ("Projects", "Import data", "Data Quality", "Training", "Results")
+STEPS = ("Projects", "Import data", "Data Quality", "Training", "Results", "Live monitor")
 SOURCE_KINDS = {
     "generic_sensor_csv": "Sensor CSV",
     "xjtu_bearings": "XJTU-SY bearings",
@@ -524,7 +524,7 @@ def main() -> None:
                 enabled = name == "Projects" or bool(selected) and (
                     name in {"Import data", "Data Quality"} or
                     name == "Training" and snapshot_ready and not importing_current or
-                    name == "Results" and runs_ready and not importing_current)
+                    name in {"Results", "Live monitor"} and runs_ready and not importing_current)
                 if st.button(name, key=f"project_nav:{name}", disabled=not enabled,
                              type="primary" if step == name else "secondary", width="stretch"):
                     st.session_state["project_step"] = name
@@ -572,5 +572,12 @@ def main() -> None:
             render_results(selected_id, load_snapshot(selected_id), selected.get("selected_run_id"), theme)
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
             st.error(f"Results could not be opened: {exc}")
+    elif step == "Live monitor" and selected.get("state") == "ready" and not importing_current:
+        from pdm.live_monitor_ui import render_live_monitor
+
+        try:
+            render_live_monitor(selected_id, selected["name"], load_snapshot(selected_id), theme)
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            st.error(f"Live monitor could not be opened: {exc}")
     else:
         empty_state("Not ready yet", "Finish importing and checking the current source before training or opening results.")
