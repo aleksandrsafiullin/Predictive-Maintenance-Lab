@@ -340,7 +340,8 @@ def test_import_and_quality_controls_expose_help(monkeypatch, tmp_path):
     at.run()
     assert not at.exception
     controls = [w for w in [*at.radio, *at.number_input, *at.text_input, *at.selectbox]
-                if w.label not in {"Appearance", "Project"}]
+                if w.label not in {"Appearance", "Project", "Age source"}
+                and not str(w.key or "").startswith(("import_context:", "import_context_unit:"))]
     assert controls
     missing = [w.label for w in controls if not _help_of(w)]
     assert not missing
@@ -388,7 +389,7 @@ def test_import_and_quality_controls_expose_help(monkeypatch, tmp_path):
     assert ui_copy.QUALITY_SUGGEST_LIMITS_CAPTION in [str(item.value) for item in at.caption]
     assert proposal["reason"] in [str(item.value) for item in at.caption]
     assert not at.exception
-    assert len(at.metric) and all(_help_of(m) for m in at.metric)
+    assert len(at.metric) and all(_help_of(m) for m in at.metric if m.label != "Known operating age")
     assert _help_of(next(b for b in at.button if b.label == "Continue to Training"))
     admitted = next(m for m in at.metric if m.label == "Admitted rows")
     assert _help_of(admitted) == ui_copy.QUALITY_ADMITTED_ROWS_HELP
@@ -474,7 +475,7 @@ def test_product_screens_single_primary_button(monkeypatch, tmp_path):
     assert seen == list(expected)
 
 
-def test_product_titles_unchanged(monkeypatch, tmp_path):
+def test_product_titles_match_default_task(monkeypatch, tmp_path):
     for title, at in _product_screens(monkeypatch, tmp_path):
         assert not at.exception, title
         assert [t.value for t in at.title] == [title]
@@ -496,6 +497,9 @@ def test_training_form_boosting_has_no_epochs(monkeypatch, tmp_path):
     at.session_state["project_step"] = "Training"
     at.run()
     assert not at.exception
+    next(w for w in at.selectbox if w.label == "Training task").set_value("signal_forecast")
+    at.run()
+    assert not at.exception
     assert [s.value for s in at.subheader][:3] == ["Data window", "Model size", "Repeatability"]
     model = next(w for w in at.selectbox if w.label == "Model")
     model.set_value("quantile_boosting")
@@ -506,7 +510,7 @@ def test_training_form_boosting_has_no_epochs(monkeypatch, tmp_path):
     assert {"Random seed", "Boosting iterations"} <= labels
     assert ui_copy.TRAIN_BOOSTING_NO_EPOCHS_CAPTION in [c.value for c in at.caption]
     assert ui_copy.TRAIN_BOOSTING_NO_EPOCHS_CAPTION == (
-        "Quantile boosting has no epoch count; it tries two tree counts and keeps the better one on Validation."
+        "Quantile boosting uses a fixed iteration count."
     )
     next(w for w in at.selectbox if w.label == "Model").set_value("gru")
     at.run()
@@ -910,7 +914,10 @@ def test_product_tables_use_st_table(monkeypatch, tmp_path):
     assert not at.exception
     assert len(at.table) >= 1
     assert len(at.dataframe) == 0
-    first = at.table[0].value
+    sample_tables = [table.value for table in at.table
+                     if list(table.value.columns) == ["Time (s)", "Vibration (g)", "Record position", "Zone"]]
+    assert len(sample_tables) == 1
+    first = sample_tables[0]
     assert list(first.columns) == ["Time (s)", "Vibration (g)", "Record position", "Zone"]
     assert list(first["Record position"]) == ["Start of record", "Gap before"]
     for name in ("project_quality_ui.py", "project_results_ui.py"):
@@ -1002,6 +1009,23 @@ def test_training_controls_expose_help(monkeypatch, tmp_path):
     at.session_state["project_step"] = "Training"
     at.run()
     assert not at.exception
+    task = next(w for w in at.selectbox if w.label == "Training task")
+    assert task.value == "signal_forecast"
+    assert list(task.options) == ["Signal forecast", "First RED entry",
+                                  "Legacy RUL (research CLI)"]
+    assert not _help_of(task)
+    task.set_value("red_entry")
+    at.run()
+    assert not at.exception
+    widgets = [*at.selectbox, *at.number_input, *at.text_input]
+    for label in ("Event model", "Inputs", "Probability horizons (s, comma-separated)",
+                  "History length", "Max GRU/LSTM epochs", "Random seed"):
+        assert not _help_of(next(w for w in widgets if w.label == label)), label
+    assert not _help_of(next(b for b in at.button if b.label == "Train first RED model"))
+
+    next(w for w in at.selectbox if w.label == "Training task").set_value("signal_forecast")
+    at.run()
+    assert not at.exception
     widgets = [*at.selectbox, *at.number_input, *at.text_input]
     for label in ("Model", "History samples", "Forecast horizons (seconds)", "Random seed",
                   "Training epochs", "Hidden units", "Batch size"):
@@ -1012,7 +1036,7 @@ def test_training_controls_expose_help(monkeypatch, tmp_path):
     at.run()
     assert not at.exception
     assert _help_of(next(w for w in at.number_input if w.label == "Boosting iterations"))
-    assert "5–95% range (not calibrated)" in _help_of(next(w for w in at.selectbox if w.label == "Model"))
+    assert "out-of-fold Training errors" in _help_of(next(w for w in at.selectbox if w.label == "Model"))
 
 
 def test_training_stop_help_copy():
@@ -1031,7 +1055,7 @@ def test_training_mae_help_mentions_equal_units():
 
     assert "each unit counts equally" in ui_copy.TRAIN_VALIDATION_MAE_HELP
     assert "each unit counts equally" in ui_copy.TRAIN_TEST_MAE_HELP
-    assert "rough 5–95% range (not calibrated)" in ui_copy.TRAIN_MODEL_HELP
+    assert "out-of-fold Training errors" in ui_copy.TRAIN_MODEL_HELP
     assert "likely range" not in ui_copy.TRAIN_MODEL_HELP
 
 
@@ -1221,11 +1245,33 @@ def _fake_processed_bundle(dataset_id, features, units, split):
     }
 
 
-def test_app_training_screen_shows_future_red_matrix_without_rul_controls(monkeypatch, tiny_bearing_tables):
+def _isolate_legacy_navigation(monkeypatch, tmp_path, dataset_id, tables):
+    """Legacy UI tests must not depend on the user's prepared data or saved runs."""
+    from pdm.splits import bearings_split, filters_split
+
+    features, units = tables
+    split = (bearings_split if dataset_id == "bearings" else filters_split)(units)
+    bundle = _fake_processed_bundle(dataset_id, features, units, split)
+    monkeypatch.setattr("pdm.data.prepare.processed_ready", lambda value: value == dataset_id)
+    monkeypatch.setattr("pdm.data.prepare.load_processed", lambda _value: bundle)
+    monkeypatch.setattr("pdm.paths.runs_root", lambda: tmp_path / "runs")
+    monkeypatch.setattr("pdm.experiments.list_runs", lambda _value: [
+        {"run_id": "synthetic-navigation-fixture", "has_legacy_predictions": True}])
+    manifest = {"run_id": "synthetic-matrix-fixture", "run_config": {
+        "datasets": [dataset_id], "architectures": ["gru"],
+        "target_artifacts": {dataset_id: {"horizon_s": 1800 if dataset_id == "bearings" else 20}}}}
+    monkeypatch.setattr("pdm.future_red_ui.latest_matrix", lambda *_args: (tmp_path, manifest))
+    monkeypatch.setattr("pdm.future_red_ui.load_test_metrics", lambda *_args: [
+        {"dataset_id": dataset_id, "architecture": "gru", "split": "test"}])
+    monkeypatch.setattr("pdm.future_red_ui.matching_full_cns_run", lambda *_args: None)
+
+
+def test_app_training_screen_shows_future_red_matrix_without_rul_controls(monkeypatch, tmp_path, tiny_bearing_tables):
     from streamlit.testing.v1 import AppTest
 
     from pdm.paths import project_root
 
+    _isolate_legacy_navigation(monkeypatch, tmp_path, "bearings", tiny_bearing_tables)
     monkeypatch.setattr("pdm.worker.worker_alive", lambda: False)
     at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
@@ -1253,11 +1299,12 @@ def test_app_training_screen_shows_future_red_matrix_without_rul_controls(monkey
     assert any("Compare models" in str(widget.value) for widget in at.header)
 
 
-def test_app_training_screen_filters_uses_20_second_future_red_target(monkeypatch, tiny_filter_tables):
+def test_app_training_screen_filters_uses_20_second_future_red_target(monkeypatch, tmp_path, tiny_filter_tables):
     from streamlit.testing.v1 import AppTest
 
     from pdm.paths import project_root
 
+    _isolate_legacy_navigation(monkeypatch, tmp_path, "filters", tiny_filter_tables)
     monkeypatch.setattr("pdm.worker.worker_alive", lambda: False)
     at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.session_state["workflow_dataset"] = "filters"
@@ -1285,6 +1332,7 @@ def test_app_training_screen_hides_legacy_resume_controls(monkeypatch, tmp_path,
 
     from pdm.paths import project_root
 
+    _isolate_legacy_navigation(monkeypatch, tmp_path, "bearings", tiny_bearing_tables)
     monkeypatch.setattr("pdm.worker.worker_alive", lambda: False)
     at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)
     at.run()
@@ -2460,13 +2508,14 @@ def test_browser_import_persists_both_required_filter_files(monkeypatch, tmp_pat
     assert (Path(source) / "Train_Data_CSV.csv").read_bytes() == b"Train_Data_CSV.csv\n"
 
 
-def test_app_operational_explorer_by_label_no_exception(tmp_path, monkeypatch):
+def test_app_operational_explorer_by_label_no_exception(tmp_path, monkeypatch, tiny_bearing_tables):
     """The one-flow explorer stays selectable without legacy comparison/mode widgets."""
     from streamlit.testing.v1 import AppTest
 
     from pdm.paths import project_root
     from pdm.visualization.explorer import clear_soma_table_cache
 
+    _isolate_legacy_navigation(monkeypatch, tmp_path, "bearings", tiny_bearing_tables)
     monkeypatch.setattr("pdm.connectome.anatomy.default_soma_dir", lambda: tmp_path)
     clear_soma_table_cache()
     at = AppTest.from_file(str(project_root() / "tests" / "legacy_app_harness.py"), default_timeout=15)

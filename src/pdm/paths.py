@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -28,7 +29,8 @@ def reports_root() -> Path:
 
 
 def worker_dir() -> Path:
-    d = runs_root() / "_worker"
+    configured = os.environ.get("PDM_WORKER_ROOT")
+    d = Path(configured).expanduser().resolve() if configured else runs_root() / "_worker"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

@@ -16,8 +16,9 @@ from pdm.forecast_worker import ForecastWorker
 from pdm.project_chart_style import add_threshold_layers, style_signal_chart
 from pdm.project_zones import is_beyond, resolve_thresholds
 from pdm.projects import project_store
+from pdm.red_entry_training import list_red_entry_runs, load_red_entry_run
 from pdm.signal_inference import forecast_prefix
-from pdm.signal_training import average_training_duration_s, list_project_runs, load_signal_run
+from pdm.signal_training import list_project_runs, load_signal_run
 from pdm.ui_theme import empty_state, page_header, tokens
 from pdm.visualization.presentation import apply_explorer_style
 
@@ -72,14 +73,16 @@ def first_recorded_red_after_now(observed: list[dict], future: list[dict],
 def _red_entry_corridor(result: dict) -> tuple[float, float] | None:
     """Accept only an explicit model-issued interval, never infer one from Test data."""
     entry = result.get("red_entry_corridor") or {}
-    if entry.get("status") != "available":
+    empirical = entry.get("status") in {"empirical_conditional", "learned"}
+    if entry.get("status") != "available" and not empirical:
         return None
     try:
         start, end = float(entry["earliest_s"]), float(entry["latest_s"])
         now = float(result["as_of_s"])
     except (KeyError, TypeError, ValueError):
         return None
-    return (start, end) if all(map(math.isfinite, (start, end, now))) and now < start <= end else None
+    valid = now <= start < end if empirical else now < start <= end
+    return (start, end) if all(map(math.isfinite, (start, end, now))) and valid else None
 
 
 def replay_figure(result: dict, schema: dict, theme: str = "dark", *,
@@ -110,9 +113,10 @@ def replay_figure(result: dict, schema: dict, theme: str = "dark", *,
                 "lower": observed[-1]["signal"], "upper": observed[-1]["signal"]}]
               if observed else [])
     if points:
-        direct = anchor + [r for r in all_points if r.get("kind") != "recursive"]
+        direct = anchor + [r for r in all_points if r.get("kind") not in {"recursive", "anchor"}]
         recursive = [r for r in all_points if r.get("kind") == "recursive"]
-        fig.add_trace(go.Scatter(x=[r["target_time_s"] for r in direct], y=[r.get("value") for r in direct],
+        if (result.get("funnel") or {}).get("mode") != "learned_joint_trajectories":
+            fig.add_trace(go.Scatter(x=[r["target_time_s"] for r in direct], y=[r.get("value") for r in direct],
                                  mode="lines+markers", name="Forecast horizon", line={"color": forecast_color, "width": 2},
                                  marker={"size": 6}, connectgaps=False))
         if recursive:
@@ -122,15 +126,16 @@ def replay_figure(result: dict, schema: dict, theme: str = "dark", *,
                                      name="Recursive forecast", line={"color": forecast_color, "width": 2, "dash": "dash"},
                                      marker={"size": 4}, connectgaps=False))
         if any(row.get("lower") is not None and row.get("upper") is not None for row in points):
+            joint = bool(result.get("funnel"))
             fig.add_trace(go.Scatter(x=[r["target_time_s"] for r in direct],
                                      y=[r.get("upper") for r in direct], mode="lines",
                                      line={"color": t["series_band_line"], "width": 1},
-                                     name="Pointwise upper quantile", connectgaps=False))
+                                     name="Forecast band upper" if joint else "Pointwise upper quantile", connectgaps=False))
             fig.add_trace(go.Scatter(x=[r["target_time_s"] for r in direct],
                                      y=[r.get("lower") for r in direct], mode="lines", fill="tonexty",
                                      fillcolor=t["series_band"],
                                      line={"color": t["series_band_line"], "width": 1},
-                                     name="Pointwise lower quantile", connectgaps=False))
+                                     name="Forecast band" if joint else "Pointwise lower quantile", connectgaps=False))
     future = sorted([r for r in _records(future_actual)
                      if as_of is not None and float(r["timestamp_s"]) > float(as_of)],
                     key=lambda r: float(r["timestamp_s"]))
@@ -148,12 +153,13 @@ def replay_figure(result: dict, schema: dict, theme: str = "dark", *,
                                  line={"color": actual_color, "width": 2}, connectgaps=False))
     thresholds = result.get("thresholds") or schema.get("thresholds") or {}
     values = ([float(v) for v in observed_y if v is not None] + [float(row["value"]) for row in points]
+              + [float(row[key]) for row in points for key in ("lower", "upper") if row.get(key) is not None]
               + [float(row["signal"]) for row in future if row.get("signal") is not None])
     add_threshold_layers(fig, thresholds, values, theme)
     corridor = _red_entry_corridor(result)
     if corridor:
         fig.add_vrect(x0=corridor[0], x1=corridor[1], fillcolor=t["series_band"],
-                      line_width=0, annotation_text="Predicted RED-entry window",
+                      line_width=0, annotation_text="RED window" if (result.get("funnel") or {}).get("mode") == "learned_joint_trajectories" else "Conditional RED window" if result.get("funnel") else "Predicted RED-entry window",
                       annotation_position="top left")
     actual_red = first_recorded_red_after_now(observed, future, thresholds, as_of) if future else None
     if actual_red is not None:
@@ -191,7 +197,7 @@ def _run_label(row: dict) -> str:
         date = datetime.fromisoformat(created.replace("Z", "+00:00")).strftime("%b %d, %H:%M")
     except ValueError:
         date = "Saved run"
-    return f"{engine} · {date} · {str(_run_id(row))[-8:]}"
+    return f"{'First RED entry · ' if row.get('task') == 'red_entry' else 'Signal · '}{engine} · {date}"
 
 
 def advance_play_state(state: dict, length: int) -> dict:
@@ -206,6 +212,21 @@ def advance_play_state(state: dict, length: int) -> dict:
 
 
 def _show_forecast_context(result: dict, schema: dict, interval_status: str | None = None) -> None:
+    if result.get("funnel"):
+        funnel = result["funnel"]
+        status = str(funnel.get("calibration_status") or funnel.get("status") or "unavailable")
+        st.caption(f"Band: {status.replace('_', ' ')}")
+        entry = result.get("red_entry_corridor") or {}
+        probability = entry.get("probability_within_horizon")
+        if probability is not None:
+            c1, c2 = st.columns(2)
+            learned = funnel.get("mode") == "learned_joint_trajectories"
+            c1.metric("RED within horizon" if learned else "RED within horizon · empirical", f"{float(probability):.1%}")
+            corridor = _red_entry_corridor(result)
+            c2.metric("RED window" if learned else "Conditional RED window · empirical", "Open" if corridor is None and learned else "N/A" if corridor is None else
+                      f"{_time_label(corridor[0] - float(result['as_of_s']), schema)} – "
+                      f"{_time_label(corridor[1] - float(result['as_of_s']), schema)}")
+        return
     points = _records(result.get("points"))
     supported = [row for row in points if row.get("value") is not None]
     if supported:
@@ -256,10 +277,27 @@ def _lead_label(seconds: float, schema: dict) -> str:
     return f"{seconds / 60:.1f} min" if schema.get("source_kind") == "xjtu_bearings" else f"{seconds:.1f} s"
 
 
+def forecast_span_options(horizons_s: list[float]) -> tuple[list[float], int]:
+    """Bound span choices to saved support, defaulting to 30 minutes."""
+    supported = max(float(h) for h in horizons_s)
+    first = min(float(h) for h in horizons_s)
+    options = sorted({max(first, min(minutes * 60.0, supported))
+                      for minutes in (10, 20, 30, 60, 120)} | {supported})
+    return options, options.index(max(first, min(30 * 60.0, supported)))
+
+
+def replay_forecast_key(project_id: str, run_id: str, snapshot_id: str, unit_id: str,
+                        as_of_s: float, zone_limits: dict | None,
+                        prediction_horizon_s: float | None = None) -> tuple:
+    return (project_id, run_id, snapshot_id, unit_id, as_of_s,
+            json.dumps(zone_limits, sort_keys=True), prediction_horizon_s)
+
+
 @st.fragment(run_every=0.6)
 def _play_fragment(project_id: str, run_id: str, unit_id: str, snapshot: dict,
                    interval_status: str | None = None, theme: str = "dark",
-                   zone_limits: dict | None = None, *, background: bool = False) -> None:
+                   zone_limits: dict | None = None, *, background: bool = False,
+                   learned_horizons_s: list[float] | None = None) -> None:
     # Streamlit replaces fragment content on each timer tick. Keep the theme
     # marker inside that content so the body/sidebar CSS remains selected.
     apply_explorer_style(theme)
@@ -284,6 +322,16 @@ def _play_fragment(project_id: str, run_id: str, unit_id: str, snapshot: dict,
     def pause() -> None:
         state["playing"] = False
 
+    prediction_horizon_s = None
+    if learned_horizons_s:
+        spans, default_index = forecast_span_options(learned_horizons_s)
+        supported = max(spans)
+        prediction_horizon_s = st.selectbox(
+            "Forecast span", spans, index=default_index,
+            format_func=lambda span: (f"Full supported horizon ({span / 60:g} min)"
+                                      if span == supported else f"{span / 60:g} min"),
+            key=f"forecast_span:{project_id}:{run_id}", on_change=pause)
+    request_options = {"prediction_horizon_s": prediction_horizon_s} if prediction_horizon_s is not None else {}
     show_future = st.toggle("Show future actual measurements", value=False,
                             key=f"future_actual:{project_id}:{run_id}", on_change=pause,
                             help="Show recorded Test measurements after Now in gray, for comparison only. "
@@ -302,8 +350,8 @@ def _play_fragment(project_id: str, run_id: str, unit_id: str, snapshot: dict,
     as_of_s = clocks[state["cursor"]]
     time_label = f"{as_of_s / 60:g} min" if schema.get("source_kind") == "xjtu_bearings" else f"{as_of_s:g} s"
     st.caption(f"Measurements received through {time_label} · sample {state['cursor'] + 1} of {len(clocks)}")
-    forecast_key = (project_id, run_id, snapshot["snapshot_id"], unit_id, as_of_s,
-                    json.dumps(zone_limits, sort_keys=True))
+    forecast_key = replay_forecast_key(project_id, run_id, snapshot["snapshot_id"], unit_id,
+                                       as_of_s, zone_limits, prediction_horizon_s)
     saved = st.session_state.get("project_last_forecast")
     pending = failed = False
     if isinstance(saved, dict) and saved.get("key") == forecast_key:
@@ -314,7 +362,7 @@ def _play_fragment(project_id: str, run_id: str, unit_id: str, snapshot: dict,
         st.session_state["project_forecast_worker"] = worker
         job = worker.request(forecast_key, partial(
             forecast_prefix, project_id, run_id, unit_id, as_of_s,
-            thresholds=dict(zone_limits) if zone_limits else None))
+            thresholds=dict(zone_limits) if zone_limits else None, **request_options))
         pending = not job["done"]
         if job["error"]:
             failed = True
@@ -334,7 +382,8 @@ def _play_fragment(project_id: str, run_id: str, unit_id: str, snapshot: dict,
         cancel_replay_forecast()
         try:
             with st.spinner("Calculating forecast…"):
-                result = forecast_prefix(project_id, run_id, unit_id, as_of_s, thresholds=zone_limits)
+                result = forecast_prefix(project_id, run_id, unit_id, as_of_s, thresholds=zone_limits,
+                                         **request_options)
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
             st.error(f"Saved forecast cannot be opened: {exc}")
             return
@@ -348,28 +397,11 @@ def _play_fragment(project_id: str, run_id: str, unit_id: str, snapshot: dict,
     result = dict(result)
     result["observed_prefix"] = visible_observations(features, unit_id, as_of_s)[["timestamp_s", "signal", "gap_before"]].to_dict("records")
     future = one.loc[one["timestamp_s"] > as_of_s] if show_future else None
+    if future is not None and prediction_horizon_s is not None:
+        displayed_span = float((result.get("funnel") or {}).get("issued_horizon_s") or prediction_horizon_s)
+        issued = result.get("as_of_s")
+        future = future.loc[future["timestamp_s"] <= (float(issued) if issued is not None else as_of_s) + displayed_span]
     st.plotly_chart(replay_figure(result, schema, theme, future_actual=future), width="stretch", theme=None)
-    if show_future:
-        st.caption("Gray after Now: recorded future measurements for comparison only; hidden from the model.")
-        if future.empty:
-            st.caption("No recorded measurements remain after Now.")
-        else:
-            actual_red = first_recorded_red_after_now(
-                result["observed_prefix"], future.to_dict("records"), result.get("thresholds") or {}, as_of_s)
-            if actual_red is not None:
-                st.caption(f"First recorded RED sample: {_time_label(float(actual_red['timestamp_s']), schema)}. "
-                           "The threshold crossing may have occurred between samples; this outcome is shown only for review.")
-                corridor = _red_entry_corridor(result)
-                if corridor:
-                    inside = corridor[0] <= float(actual_red["timestamp_s"]) <= corridor[1]
-                    st.caption("The first recorded RED sample is "
-                               f"{'inside' if inside else 'outside'} the model-issued window.")
-                lead_target = average_training_duration_s(snapshot) / 3 if snapshot.get("split") else 0
-                first_sample_s = float(one["timestamp_s"].iloc[0])
-                if lead_target > 0 and float(actual_red["timestamp_s"]) - first_sample_s < lead_target:
-                    st.caption(f"A {_lead_label(lead_target, schema)} warning lead (one third of mean Train "
-                               "history) is impossible for this unit: its first recorded RED sample "
-                               "occurs sooner than that after the first measurement.")
     if not failed:
         _show_forecast_context(result, schema, interval_status)
 
@@ -378,14 +410,15 @@ def render_results(project_id: str, snapshot: dict, selected_run_id: str | None 
                    theme: str = "dark") -> None:
     page_header("Results", "")
     runs = []
-    for row in list_project_runs(project_id):
+    for row in sorted(list_project_runs(project_id) + list_red_entry_runs(project_id), key=lambda row: str(row.get("created_at", "")), reverse=True):
         run_id = _run_id(row)
         if not run_id or row.get("snapshot_id") != snapshot["snapshot_id"]:
             continue
-        try:
-            load_signal_run(project_id, run_id)
-        except (OSError, ValueError, KeyError, RuntimeError):
-            continue
+        if row.get("task") != "red_entry":
+            try:
+                load_signal_run(project_id, run_id)
+            except (OSError, ValueError, KeyError, RuntimeError):
+                continue
         runs.append(row)
     if not runs:
         empty_state("No saved model yet", "Train a signal model to see its saved forecast here.")
@@ -397,9 +430,10 @@ def render_results(project_id: str, snapshot: dict, selected_run_id: str | None 
                           format_func=lambda value: next((_run_label(row) for row in runs if _run_id(row) == value), str(value)),
                           key=f"result_run:{project_id}:{snapshot['snapshot_id']}")
     try:
-        manifest = load_signal_run(project_id, run_id)
+        selected_row = next(row for row in runs if _run_id(row) == run_id)
+        manifest = (load_red_entry_run if selected_row.get("task") == "red_entry" else load_signal_run)(project_id, run_id)
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
-        st.error(f"Saved model run cannot be verified: {exc}")
+        st.error(f"Saved run cannot be verified: {exc}")
         return
     if manifest.get("project_id") != project_id or manifest.get("snapshot_id") != snapshot["snapshot_id"]:
         st.error("This saved model belongs to another project or data snapshot.")
@@ -419,22 +453,47 @@ def render_results(project_id: str, snapshot: dict, selected_run_id: str | None 
                 st.session_state.pop(key, None)
         st.session_state.pop("project_last_forecast", None)
         st.session_state["result_active_pair"] = pair
+    if manifest.get("task") == "red_entry":
+        from pdm.red_entry_ui import render_event_evaluation, render_event_replay
+        render_event_replay(project_id, run_id, unit_id, snapshot, theme)
+        render_event_evaluation(manifest)
+        return
     if (manifest.get("engine_id") or manifest.get("engine")) == "full_cns":
         provenance = manifest["connectome"]
         with st.expander("Connectome source"):
             st.markdown("[Original MaleCNS data · HHMI Janelia / Cambridge / MRC LMB / Google Research](https://male-cns.janelia.org/download/)")
             st.caption(f"Graph SHA-256: {provenance['graph_hash']}")
+    learned = manifest.get("params", {}).get("forecast_mode") == "learned_joint_trajectories"
+    replay_limits = (manifest["schema"].get("thresholds") if learned else
+                     load_zone_limits(project_id, snapshot["snapshot_id"]))
     _play_fragment(project_id, run_id, unit_id, snapshot, manifest.get("interval_status"), theme,
-                   load_zone_limits(project_id, snapshot["snapshot_id"]),
-                   background=manifest.get("engine_id") == "full_cns")
+                   replay_limits, background=manifest.get("engine_id") == "full_cns",
+                   learned_horizons_s=manifest["params"]["horizons_s"] if learned else None)
     metrics = (manifest.get("metrics") or {}).get("test") or {}
     if metrics:
-        st.subheader("Held-out Test summary")
+        st.subheader("Test summary" if manifest.get("funnel") else "Held-out Test summary")
+        if manifest.get("params",{}).get("forecast_mode") == "learned_joint_trajectories":
+            c1,c2=st.columns(2)
+            c1.metric("Test equipment",metrics.get("physical_group_count",0))
+            c2.metric("Replay origins",metrics.get("origins",0))
+            st.dataframe(pd.DataFrame([{"Horizon (min)":row["horizon_s"]/60,
+                          "Whole-path coverage":row["whole_path_coverage"],
+                          "Mean band width (g)":row["mean_width_g"],
+                          "Complete equipment":row["complete_physical_groups"],
+                          "Useful RED warnings":row["events_with_useful_warning"]}
+                          for row in metrics.get("horizons",[])]),hide_index=True)
+            return
         c1, c2 = st.columns(2)
         c1.metric("Known future measurements", metrics.get("known_targets", "—"))
         error = metrics.get("mae")
         c2.metric(f"Mean absolute error ({snapshot['schema'].get('signal_unit', '')})",
                   "—" if error is None else f"{float(error):.3g}")
+        funnel_metrics = metrics.get("funnel") or {}
+        if funnel_metrics:
+            c1, c2 = st.columns(2)
+            coverage = funnel_metrics.get("whole_path_coverage")
+            c1.metric("Whole-path coverage · empirical", "N/A" if coverage is None else f"{float(coverage):.1%}")
+            c2.metric("Complete-path Test equipment", funnel_metrics.get("complete_physical_group_count", 0))
         horizons = metrics.get("by_horizon") or []
         if horizons:
             rows = [{"Horizon (s)": row.get("horizon_s"),

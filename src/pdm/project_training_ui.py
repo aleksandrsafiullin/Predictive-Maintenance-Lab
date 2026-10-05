@@ -11,6 +11,7 @@ import streamlit as st
 from pdm import ui_copy
 from pdm.cli import spawn_worker
 from pdm.models.signal_full_cns import ENGINE_LABEL
+from pdm.signal_profiles import funnel_training_profile, learned_bearings_training_profile
 from pdm.signal_training import (
     _segments,
     available_signal_engines,
@@ -117,6 +118,10 @@ def _job_status(project_id: str) -> None:
     if state == "not_ready":
         return
     label = status.get("message") or "Working on the selected model"
+    if label == "Обучение прогноза первого RED":
+        label = "Training first RED entry model"
+    elif label == "Прогноз первого RED сохранён":
+        label = "First RED entry model ready"
     if state in {"queued", "running", "training", "preparing", "stopping"}:
         st.info(str(label))
         value = status.get("progress")
@@ -137,7 +142,7 @@ def _job_status(project_id: str) -> None:
         st.error(str(status.get("error") or status.get("message") or f"Job {state}."))
 
 
-def render_training(project_id: str, snapshot: dict) -> None:
+def _render_signal_training(project_id: str, snapshot: dict) -> None:
     page_header("Training", "")
     _job_status(project_id)
     runs = list_project_runs(project_id)
@@ -160,7 +165,10 @@ def render_training(project_id: str, snapshot: dict) -> None:
                             help=ui_copy.TRAIN_MODEL_HELP)
     recurrent = selected in {"gru", "lstm"}
     full_cns = selected == "full_cns"
-    defaults, coverage = _default_profile(snapshot, selected)
+    learned_defaults = learned_bearings_training_profile(snapshot, selected)
+    defaults = learned_defaults or funnel_training_profile(snapshot, selected)
+    learned = learned_defaults is not None
+    coverage = []
     profile_key = f"{selected}:{snapshot['snapshot_id']}"
     mean_duration = average_training_duration_s(snapshot)
     step = _training_step(snapshot)
@@ -170,7 +178,6 @@ def render_training(project_id: str, snapshot: dict) -> None:
                    "A validated direct forecast that far is not possible until longer continuous histories "
                    "are available in both splits.")
     if full_cns:
-        st.info(ui_copy.TRAIN_FULL_CNS_CAPTION)
         st.markdown("[MaleCNS v1.0 · public connection map and annotations](https://male-cns.janelia.org/download/)")
     with st.form("signal_train_form"):
         with st.container(border=True, key="pdm-train-window"):
@@ -179,7 +186,13 @@ def render_training(project_id: str, snapshot: dict) -> None:
             history = c1.number_input("History samples", min_value=2, max_value=256,
                                       value=defaults["history_length"], step=1, key=f"history:{profile_key}",
                                       help=ui_copy.TRAIN_HISTORY_HELP)
-            horizons = c2.text_input("Forecast horizons (seconds)",
+            if learned:
+                span = c2.number_input("Forecast span (minutes)", min_value=step/60,
+                                      max_value=4096*step/60, value=defaults["horizons_s"][-1]/60,
+                                      step=step/60, key=f"span:{profile_key}")
+                horizons = None
+            else:
+                horizons = c2.text_input("Forecast horizons (seconds)",
                                      value=", ".join(f"{value:g}" for value in defaults["horizons_s"]),
                                      key=f"horizons:{profile_key}",
                                      help=ui_copy.TRAIN_HORIZONS_HELP)
@@ -187,18 +200,20 @@ def render_training(project_id: str, snapshot: dict) -> None:
             st.subheader("Model size", anchor=False)
             if recurrent:
                 c1, c2 = st.columns(2)
-                hidden = c1.number_input("Hidden units", min_value=4, max_value=512,
+                hidden = c1.number_input("Hidden units", min_value=16 if learned else 4, max_value=1024 if learned else 512,
                                          value=defaults["hidden_size"], step=4, key=f"hidden:{profile_key}",
                                          help=ui_copy.TRAIN_HIDDEN_HELP)
                 batch = c2.number_input("Batch size", min_value=1, max_value=1024,
                                         value=defaults["batch_size"], step=1, key=f"batch:{profile_key}",
                                         help=ui_copy.TRAIN_BATCH_HELP)
-                residual = st.checkbox("Predict change from last measurement", value=True,
+                residual = True
+                if not learned:
+                    residual = st.checkbox("Predict change from last measurement", value=True,
                                        key=f"residual:{profile_key}",
                                        help="The model learns a change at each horizon and adds it to the latest "
                                             "observed signal. This gives a stable last-value starting point.")
             elif full_cns:
-                st.caption("All classified MaleCNS neurons and all connections between them participate in every state update. The graph size is fixed by the source data.")
+                st.caption("Full MaleCNS · complete source topology")
             else:
                 max_iter = st.number_input("Boosting iterations", min_value=10, max_value=1000,
                                            value=defaults["max_iter"], step=10,
@@ -206,10 +221,10 @@ def render_training(project_id: str, snapshot: dict) -> None:
         with st.container(border=True, key="pdm-train-repeat"):
             st.subheader("Repeatability", anchor=False)
             c1, c2 = st.columns(2)
-            seed = c1.number_input("Random seed", min_value=0, max_value=2**31 - 1, value=42, step=1,
+            seed = c1.number_input("Random seed", min_value=0, max_value=2**31 - 1, value=defaults.get("seed",42), step=1,
                                    key=f"seed:{profile_key}",
                                    help=ui_copy.TRAIN_SEED_HELP)
-            if recurrent:
+            if recurrent or learned:
                 epochs = c2.number_input("Training epochs", min_value=1, max_value=500,
                                          value=defaults["epochs"], step=1, key=f"epochs:{profile_key}",
                                          help=ui_copy.TRAIN_EPOCHS_HELP)
@@ -217,17 +232,19 @@ def render_training(project_id: str, snapshot: dict) -> None:
                                                 value=defaults["learning_rate"], step=0.0001,
                                                 format="%.5f", key=f"learning_rate:{profile_key}")
             elif full_cns:
-                st.caption("Only the signal readout is fitted. Validation selects ridge regularization; the original connectivity stays fixed.")
+                st.caption("Fixed connectome · signal readout fitted on Training")
             else:
                 st.caption(ui_copy.TRAIN_BOOSTING_NO_EPOCHS_CAPTION)
-        params: dict = {"history_length": int(history), "seed": int(seed)}
-        if recurrent:
+        params: dict = {**defaults, "history_length": int(history), "seed": int(seed)}
+        if recurrent or learned:
             params["epochs"] = int(epochs)
-            params["hidden_size"] = int(hidden)
-            params["batch_size"] = int(batch)
             params["learning_rate"] = float(learning_rate)
-            params["residual_forecast"] = bool(residual)
-        elif not full_cns:
+            if recurrent:
+                params["hidden_size"] = int(hidden)
+                params["batch_size"] = int(batch)
+                if not learned:
+                    params["residual_forecast"] = bool(residual)
+        if not recurrent and not full_cns:
             params["max_iter"] = int(max_iter)
         global_busy = worker_alive() or read_status().get("status") in {"queued", "running", "training", "preparing", "stopping"}
         submitted = st.form_submit_button("Train model", type="primary", disabled=global_busy,
@@ -247,7 +264,7 @@ def render_training(project_id: str, snapshot: dict) -> None:
                 "validation_targets": "Validation targets"}), hide_index=True)
     if submitted:
         try:
-            params["horizons_s"] = _parse_horizons(horizons)
+            params["horizons_s"] = [float(i*step) for i in range(1,int(round(span*60/step))+1)] if learned else _parse_horizons(horizons)
             status = status_for_project(project_id)
             if status.get("status") in {"queued", "running", "training", "preparing", "stopping"}:
                 raise RuntimeError("This project already has a running job.")
@@ -264,13 +281,25 @@ def render_training(project_id: str, snapshot: dict) -> None:
         metrics = latest.get("metrics") or {}
         validation = metrics.get("validation") or {}
         test = metrics.get("test") or {}
-        if validation or test:
+        if (latest.get("params") or {}).get("forecast_mode") == "learned_joint_trajectories":
+            rows = []
+            for partition, scores in (("Validation", validation), ("Test", test)):
+                for row in scores.get("horizons") or []:
+                    coverage = row.get("whole_path_coverage")
+                    rows.append({"Partition": partition, "Horizon (min)": row["horizon_s"] / 60,
+                                 "Whole-path coverage": None if coverage is None else f"{coverage:.1%}",
+                                 "Mean width (g)": row.get("mean_width_g"),
+                                 "Equipment": row.get("complete_physical_groups"),
+                                 "Useful RED warnings": row.get("events_with_useful_warning")})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True)
+        elif validation or test:
             c1, c2 = st.columns(2)
             val_mae = validation.get("mae")
             test_mae = test.get("mae")
             c1.metric("Validation mean absolute error", "—" if val_mae is None else f"{float(val_mae):.3g}",
                       help=ui_copy.TRAIN_VALIDATION_MAE_HELP)
-            c2.metric("Held-out Test mean absolute error", "—" if test_mae is None else f"{float(test_mae):.3g}",
+            c2.metric("Test mean absolute error", "—" if test_mae is None else f"{float(test_mae):.3g}",
                       help=ui_copy.TRAIN_TEST_MAE_HELP)
             st.caption(f"Known future measurements: Validation {validation.get('known_targets', 0)} · Test {test.get('known_targets', 0)}.")
             by_horizon = validation.get("by_horizon") or []
@@ -290,3 +319,22 @@ def render_training(project_id: str, snapshot: dict) -> None:
                 if beaten:
                     st.warning(f"On {len(beaten)} of {len(by_horizon)} Validation horizons, the saved model "
                                "does not beat repeating the last measurement. Do not treat those forecasts as reliable warnings.")
+
+
+def render_training(project_id: str, snapshot: dict) -> None:
+    task = st.selectbox("Training task", ["signal_forecast", "red_entry", "legacy_rul"],
+                        format_func=lambda value: {"red_entry": "First RED entry", "signal_forecast": "Signal forecast", "legacy_rul": "Legacy RUL (research CLI)"}[value],
+                        key=f"training_task:{project_id}")
+    if task == "signal_forecast":
+        _render_signal_training(project_id, snapshot)
+    elif task == "red_entry":
+        from pdm.red_entry_ui import render_event_training
+        page_header("First RED entry", "")
+        _job_status(project_id)
+        from pdm.red_entry_training import list_red_entry_runs
+        stale = sum(row.get("snapshot_id") != snapshot["snapshot_id"] for row in list_project_runs(project_id) + list_red_entry_runs(project_id))
+        if stale:
+            st.caption(ui_copy.TRAIN_STALE_RUNS_CAPTION.format(n=stale))
+        render_event_training(project_id, snapshot)
+    else:
+        st.info("Legacy RUL training is unavailable here; use the research interface or CLI.")

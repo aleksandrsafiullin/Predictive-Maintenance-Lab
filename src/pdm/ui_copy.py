@@ -148,8 +148,8 @@ LEGACY_OPEN_PROJECT_HELP = "Pick an imported dataset to continue with. Opening i
 
 # Training
 TRAIN_MODEL_HELP = (
-    "GRU and LSTM learn time patterns. Quantile boosting uses trees and gives a rough 5–95% range (not calibrated). "
-    "Fly brain uses the full public MaleCNS connection map with a trained signal readout."
+    "GRU and LSTM learn sequences. Quantile boosting fits trees. Full MaleCNS fits a signal readout "
+    "on the public connectome. Forecast bands use grouped out-of-fold Training errors."
 )
 TRAIN_FULL_CNS_CAPTION = (
     "Uses all classified MaleCNS v1.0 neurons and original directed connections. Synapse counts are scaled "
@@ -161,7 +161,7 @@ TRAIN_HISTORY_HELP = (
 )
 TRAIN_HORIZONS_HELP = (
     "Comma-separated seconds, preferably multiples of the sampling interval. Each time is a direct model "
-    "output and needs a matching future measurement in both Train and Validation."
+    "output and needs matching Training measurements. Missing calibration targets remain unknown."
 )
 TRAIN_SEED_HELP = (
     "Fixes the random start and shuffling. Same data and seed give repeatable results; change it to check that "
@@ -180,15 +180,14 @@ TRAIN_BATCH_HELP = (
     "larger is smoother and faster on big data."
 )
 TRAIN_BOOSTING_ITER_HELP = (
-    "Number of trees added one after another. More can fit finer detail but may overfit; the app also tries "
-    "half this number and keeps whichever scores better on Validation."
+    "Fixed number of boosting iterations. The model fits Training units; Validation calibrates the forecast band."
 )
 TRAIN_BOOSTING_NO_EPOCHS_CAPTION = (
-    "Quantile boosting has no epoch count; it tries two tree counts and keeps the better one on Validation."
+    "Quantile boosting uses a fixed iteration count."
 )
 TRAIN_SUBMIT_HELP = (
-    "Starts training in the background with these settings. Training uses Train units, picks the best model "
-    "on Validation, then scores Test once."
+    "Fits these settings on Training, estimates uncertainty from grouped Training folds, "
+    "calibrates on Validation, then evaluates the frozen model on Test."
 )
 TRAIN_STOP_HELP = (
     "Asks the job to stop after its current safe step. No model is saved from a stopped run; earlier saved runs "

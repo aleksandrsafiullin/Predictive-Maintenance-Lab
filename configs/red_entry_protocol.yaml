@@ -1,0 +1,64 @@
+# Исследовательский контракт. Числа ниже не являются требованиями эксплуатации.
+protocol_version: red_entry_protocol_v1
+tasks:
+  signal_forecast: {version: signal_forecast_v1, target: future_signal_values}
+  red_entry: {version: red_entry_v2, target: first_recorded_red_in_risk_episode}
+  legacy_rul: {version: legacy_rul_v1, target: historical_endpoint_remaining_time}
+input_modes:
+  age_context: [known_age, operating_context, quality]
+  sensor_only: [sensor, quality]
+  hybrid: [sensor, known_age, operating_context, quality]
+# Номер строки, конец записи и доля прожитой жизни запрещены во всех режимах.
+forbidden_input_roles: [metadata, target_only]
+forbidden_input_columns: [event_time_s, rul_s, true_rul_s, life_fraction, row_index, record_end_s]
+event:
+  version: first_recorded_red_v1
+  confirmation: instantaneous_inclusive_measurement
+  time_semantics: first_recorded_sample_with_between_sample_uncertainty
+  future_operating_scenario: continuation_of_observed_regime_assumption
+horizons_s:
+  xjtu_bearings: [300, 600, 1800, 3600]
+  hse_filters: [5, 10, 20, 60]
+  generic_sensor_csv: null
+horizon_defaults_status: exploratory_engineering_defaults
+training:
+  seed: 42
+  seeds: [42, 73]
+  budget_version: bounded_exploratory_training_v1
+  recurrent: {max_epochs: 20, early_stopping_patience: 5, history_length: 16, hidden_size: 32}
+  origin_sampling:
+    group: physical_equipment
+    deterministic: true
+    maximum_origins_per_physical_unit: 64
+    preserve_first_origin: true
+    preserve_short_history_origins: true
+    shared_across_comparison_models: true
+  grouped_development_folds: 2
+  development_fold_assignment: frozen_physical_groups_before_v2_outcome_inspection
+  full_cns_topology: official_all_neurons
+  smoke: {max_epochs: 1, maximum_origins_per_physical_unit: 4}
+  transform_fit_part: train
+  model_selection_part: validation
+  calibration_part: validation
+  alert_policy_selection_part: validation
+  development_reuse_status: shared_validation_exploratory
+  frozen_before_model_comparison: true
+split:
+  grouping: physical_equipment
+  historical_test_outcomes_inspected: true
+  historical_test_status: explored
+  independent_holdout: null
+operational_requirements:
+  minimum_action_lead_s: null
+  max_false_alert_episodes_per_100_operating_hours: null
+  max_alert_time_fraction: null
+  nominal_interval_coverage: null
+  maximum_interval_width_s: null
+  minimum_independent_event_evidence: null
+  required_regime_coverage: null
+  interval_coverage_evidence_requirement: null
+quality_gate_status: requirements_unset
+diagnostic_reference:
+  name: one_third_mean_continuous_train_duration
+  train_duration_fraction: 0.3333333333333333
+  guarantees_action_lead: false

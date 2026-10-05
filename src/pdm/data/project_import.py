@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping
 from pdm.data.generic_csv import read_generic_csv
 from pdm.io_util import atomic_write_json
 from pdm.projects import ProjectStore, project_store
+from pdm.red_entry_context import AGE_SOURCES, validate_context_mapping
 
 MAX_SOURCE_FILES = 100_000
 MAX_SOURCE_BYTES = 100 * 1024**3
@@ -143,7 +144,15 @@ def _signal_schema(source_kind: str, source: Mapping[str, Any]) -> dict[str, Any
     }
     if column.casefold() in reserved:
         raise ValueError(f"{column} is an identity, outcome, or evaluation field, not a sensor signal")
+    mapping = validate_context_mapping(source.get("context_mapping"))
+    age_source = str(source.get("age_source") or "counter")
+    if age_source not in AGE_SOURCES:
+        raise ValueError("Unsupported age source")
+    context_units = dict(source.get("context_units") or {})
+    if set(context_units) - set(mapping):
+        raise ValueError("Context units must refer to mapped context columns")
     return {
+        "context_mapping": mapping, "context_units": context_units, "age_source": age_source,
         "source_kind": source_kind,
         "signal_column": column,
         "signal_label": label,
@@ -240,7 +249,10 @@ def import_project(
                 raise ValueError(f"Generic source contains non-CSV files: {non_csv[:5]}")
             from pdm.data.project_prepare import allocate_project_split
 
-            _, units, _ = read_generic_csv(staged_groups, schema["signal_column"])
+            _, units, _ = read_generic_csv(staged_groups, schema["signal_column"],
+                                           context_mapping=schema.get("context_mapping"),
+                                           context_units=schema.get("context_units"),
+                                           age_source=schema.get("age_source", "counter"))
             allocate_project_split(units, split_request)
         elif kind == "xjtu_bearings":
             from pdm.data.project_prepare import _owned_adapted, allocate_project_split

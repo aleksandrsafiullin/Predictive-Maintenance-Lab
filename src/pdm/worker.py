@@ -265,21 +265,22 @@ def run_job(job: dict) -> None:
             write_status({"status": "completed", "stage": "completed", "progress": 1.0,
                           "snapshot_id": snapshot["snapshot_id"], "message": "Project data ready"})
         elif kind == "project_train":
-            from pdm.signal_training import train_signal_run
+            from pdm.project_tasks import train_project_job, validate_training_job
 
             if stopped():
                 raise InterruptedError("Project training cancelled before start")
+            task = validate_training_job(job)
             write_status({"status": "running", "stage": "training", "progress": 0.0,
-                          "message": "Training numeric signal model"})
+                          "task": task,
+                          "message": "Training first RED entry model" if task == "red_entry" else "Training numeric signal model"})
 
             def project_progress(update: dict) -> None:
                 write_status({"status": "running", **update})
 
-            run = train_signal_run(job["project_id"], job.get("snapshot_id"), job["engine_id"],
-                                   job.get("params") or {}, should_stop=stopped,
-                                   status_cb=project_progress)
+            run = train_project_job(job, should_stop=stopped, status_cb=project_progress)
             write_status({"status": "completed", "stage": "completed", "progress": 1.0,
-                          "run_id": run["run_id"], "message": "Signal model ready"})
+                          "task": task, "run_id": run["run_id"],
+                          "message": "First RED entry model ready" if task == "red_entry" else "Signal model ready"})
         elif kind == "condition_study":
             from pdm.monitoring.study import run_condition_study
 

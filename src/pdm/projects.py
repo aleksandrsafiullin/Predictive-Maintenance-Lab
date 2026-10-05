@@ -211,10 +211,10 @@ class ProjectStore:
                     run.get("project_id") != project_id
                     or run.get("snapshot_id") != updated["active_snapshot_id"]
                     or run.get("run_id") != updated["selected_run_id"]
-                    or run.get("task") != "signal_forecast"
+                    or run.get("task") not in {"signal_forecast", "red_entry"}
                     or run.get("status") != "completed"
                 ):
-                    raise ValueError("Selected run is not a completed signal run for this snapshot")
+                    raise ValueError("Selected run is not a completed project run for this snapshot")
             registry["projects"][project_id] = updated
             self._save(registry)
             return copy.deepcopy(updated)

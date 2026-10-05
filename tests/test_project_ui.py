@@ -225,7 +225,12 @@ def _chart_limit_ys(at: AppTest) -> set[float]:
 
 
 def _zone_column(at: AppTest) -> list:
-    return list(at.table[0].value["Zone"])
+    signal_column = _chart_spec(at)["layout"]["yaxis"]["title"]["text"]
+    expected_columns = ["Time (s)", signal_column, "Record position", "Zone"]
+    sample_tables = [table.value for table in at.table
+                     if list(table.value.columns) == expected_columns]
+    assert len(sample_tables) == 1, f"Expected one sample table with columns {expected_columns}"
+    return list(sample_tables[0]["Zone"])
 
 
 _ZONE_LABELS = {"green": "Green", "yellow": "Yellow", "red": "Red", "unknown": "Not zoned"}
@@ -891,6 +896,7 @@ def test_training_page_mentions_runs_from_previous_snapshot(monkeypatch, tmp_pat
     at = _app()
     at.session_state["project_id"] = project["project_id"]
     at.session_state["project_step"] = "Training"
+    at.session_state[f"training_task:{project['project_id']}"] = "signal_forecast"
     at.run()
     assert not at.exception
     assert ("1 earlier model run(s) were trained on a previous data snapshot and are not shown. "
@@ -905,6 +911,7 @@ def test_saved_snapshot_offers_one_signal_engine_and_horizon_controls(monkeypatc
     at = _app()
     at.session_state["project_id"] = project["project_id"]
     at.session_state["project_step"] = "Training"
+    at.session_state[f"training_task:{project['project_id']}"] = "signal_forecast"
     at.run()
     assert not at.exception
     model = next(widget for widget in at.selectbox if widget.label == "Model")
@@ -1006,12 +1013,14 @@ def test_full_cns_training_dispatch_and_saved_results(monkeypatch, tmp_path, sig
     at = _app()
     at.session_state["project_id"] = project["project_id"]
     at.session_state["project_step"] = "Training"
+    at.session_state[f"training_task:{project['project_id']}"] = "signal_forecast"
     at.run()
     next(widget for widget in at.selectbox if widget.label == "Model").select("full_cns").run()
     next(button for button in at.button if button.label == "Train model").click().run()
     assert not at.exception and len(queued) == 1
     assert queued[0]["engine_id"] == "full_cns"
-    assert set(queued[0]["params"]) == {"history_length", "horizons_s", "seed"}
+    assert {"history_length", "horizons_s", "seed", "forecast_mode", "cv_folds", "path_samples"} <= set(queued[0]["params"])
+    assert queued[0]["params"]["forecast_mode"] == "joint_residual_paths"
     assert queued[0]["snapshot_id"] == snapshot["snapshot_id"]
     assert status_for_project(project["project_id"])["status"] == "queued"
     run_job(queued[0])

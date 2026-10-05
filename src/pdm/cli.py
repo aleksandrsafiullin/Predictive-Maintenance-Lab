@@ -111,10 +111,9 @@ def spawn_worker(job: dict) -> subprocess.Popen:
         if job["kind"] == "project_import" and not isinstance(job.get("source"), dict):
             raise ValueError("Project import requires a source specification")
         if job["kind"] == "project_train":
-            from pdm.signal_training import ENGINES
+            from pdm.project_tasks import validate_training_job
 
-            if job.get("engine_id") not in ENGINES or not isinstance(job.get("params"), dict):
-                raise ValueError("Project training requires one supported engine and parameter mapping")
+            validate_training_job(job)
         job.setdefault("job_id", uuid.uuid4().hex)
         if not isinstance(job["job_id"], str) or not job["job_id"]:
             raise ValueError("Project job requires a job ID")

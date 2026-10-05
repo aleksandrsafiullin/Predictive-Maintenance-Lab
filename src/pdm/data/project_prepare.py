@@ -18,6 +18,7 @@ from pdm.data.generic_csv import read_generic_csv
 from pdm.data.project_import import XJTU_BASELINE_THRESHOLDS, validate_absolute_thresholds
 from pdm.io_util import atomic_write_json, read_json, sha256_file
 from pdm.projects import ProjectStore, _safe_id, project_store
+from pdm.red_entry_context import CONTEXT_FIELDS, add_context, assert_physical_split, context_schema
 from pdm.splits import assert_split_coverage, split_hash
 
 SNAPSHOT_FILES = (
@@ -39,6 +40,21 @@ STALE_SNAPSHOT_ERROR = "The data changed since this page loaded. Reload Data Qua
 
 def allocate_project_split(units: pd.DataFrame, request: Mapping[str, Any]) -> dict[str, Any]:
     """Allocate whole physical units, renormalizing weights over auto groups."""
+    if "physical_unit_id" in units and units["physical_unit_id"].astype(str).duplicated().any():
+        physical = units["physical_unit_id"].astype(str)
+        if units.assign(_physical=physical).groupby("_physical")["source_group"].nunique().gt(1).any():
+            raise ValueError("Physical equipment appears in multiple source folders")
+        grouped = units.assign(_physical=physical).drop_duplicates("_physical").copy()
+        grouped["unit_id"] = grouped["_physical"]
+        grouped["origin_unit_id"] = grouped["unit_id"]
+        allocated = allocate_project_split(grouped, request)
+        for name in SPLIT_NAMES:
+            allocated[name] = sorted(units.loc[physical.isin(allocated[name]), "unit_id"].astype(str))
+        allocated["realized_counts"] = {name: len(allocated[name]) for name in SPLIT_NAMES}
+        allocated["grouping_column"] = "physical_unit_id"
+        assert_split_coverage(units.copy(), allocated)
+        assert_physical_split(units, allocated)
+        return allocated
     modes = {name: request.get(f"{name}_mode", "auto") for name in ("validation", "test")}
     weights = dict(request.get("weights") or {"train": .7, "validation": .15, "test": .15})
     seed = int(request.get("seed", 42))
@@ -155,7 +171,18 @@ def _canonicalize_adapted(
         "timestamp_s": pd.to_numeric(features["timestamp_s"], errors="coerce"),
         "signal": pd.to_numeric(signal, errors="coerce"),
         "gap_before": features["gap_before"].astype(bool) if "gap_before" in features else False,
-    }).sort_values(["unit_id", "timestamp_s"], kind="stable")
+    })
+    for name in CONTEXT_FIELDS & set(features.columns):
+        frame[name] = features[name]
+    if "physical_unit_id" in units:
+        mapping = units.assign(unit_id=units["unit_id"].astype(str)).set_index("unit_id")["physical_unit_id"]
+        supplied = frame["unit_id"].map(mapping)
+        if "physical_unit_id" in frame and not frame["physical_unit_id"].astype(str).eq(supplied.astype(str)).all():
+            raise ValueError("Feature and units physical identities disagree")
+        frame["physical_unit_id"] = supplied
+    if "_quality_errors" in features:
+        frame["context_quality_errors"] = features["_quality_errors"].fillna("").astype(str)
+    frame = frame.sort_values(["unit_id", "timestamp_s"], kind="stable")
     groups = []
     rejected = 0
     rejected_by_unit: dict[str, int] = {}
@@ -181,13 +208,15 @@ def _canonicalize_adapted(
             raise ValueError(f"Duplicate physical history: {unit_id} and {physical_histories[digest]}")
         physical_histories[digest] = str(unit_id)
         groups.append(selected)
-    canonical = pd.concat(groups, ignore_index=True)
+    canonical = add_context(pd.concat(groups, ignore_index=True), age_source="laboratory_proxy")
     if units["unit_id"].astype(str).duplicated().any():
         raise ValueError("Adapter returned duplicate physical units")
     new_units = units.copy()
     new_units["unit_id"] = new_units["unit_id"].astype(str)
     if "origin_unit_id" not in new_units:
         new_units["origin_unit_id"] = new_units["unit_id"]
+    physical = canonical.groupby("unit_id")["physical_unit_id"].first()
+    new_units["physical_unit_id"] = new_units["unit_id"].map(physical)
     new_units["source_group"] = new_units["unit_id"].map(source_groups or {}).fillna("primary")
     counts = canonical.groupby("unit_id").size()
     new_units["n_samples"] = new_units["unit_id"].map(counts).astype(int)
@@ -364,7 +393,10 @@ def prepare_project(
         grouped = _source_files(source_root, manifest)
         schema = dict(manifest["signal_schema"])
         if project["source_kind"] == "generic_sensor_csv":
-            features, units, quality = read_generic_csv(grouped, schema["signal_column"])
+            features, units, quality = read_generic_csv(grouped, schema["signal_column"],
+                                                        context_mapping=schema.get("context_mapping"),
+                                                        context_units=schema.get("context_units"),
+                                                        age_source=schema.get("age_source", "counter"))
         else:
             features, units, quality = _owned_adapted(
                 project, source_root, manifest, should_stop=should_stop
@@ -372,6 +404,8 @@ def prepare_project(
         split = allocate_project_split(units, manifest["split_request"])
         source_digest = manifest["source_digest"]
     assert_split_coverage(units.copy(), split)
+    assert_physical_split(units, split)
+    schema = context_schema(features, schema)
     if should_stop and should_stop():
         raise InterruptedError("Project job cancelled")
 
@@ -392,7 +426,7 @@ def prepare_project(
     base = store.project_path(project_id) / "snapshots"
     staging, snapshot_id, payload = _stage_snapshot(
         base, project_id, write_data=write_data, split=split, report=report,
-        fingerprint={"source_digest": source_digest, "source_manifest_id": source_manifest_id},
+        fingerprint={"source_digest": source_digest, "source_manifest_id": source_manifest_id, "schema_version": 2},
     )
     try:
         if should_stop and should_stop():
@@ -507,6 +541,12 @@ def preview_move(snapshot: Mapping[str, Any], unit_ids, destination: str) -> dic
         return result(f"{already} is already in {SPLIT_LABELS[destination]}.")
     if destination != "test" and set(moved) & set(fixed):
         return result("Official HSE test units stay in Testing Data.")
+    physical = snapshot.get("units")
+    if physical is not None and "physical_unit_id" in physical:
+        selected_physical = set(physical.loc[physical["unit_id"].astype(str).isin(moved), "physical_unit_id"].astype(str))
+        siblings = set(physical.loc[physical["physical_unit_id"].astype(str).isin(selected_physical), "unit_id"].astype(str))
+        if any(current.get(uid) != destination for uid in siblings - set(moved)):
+            return result("Move all cycles of the same physical equipment together.")
     projected = dict(counts)
     for uid in moved:
         projected[current[uid]] -= 1
@@ -598,7 +638,8 @@ def _publish_manual_snapshot(
         base, project_id, write_data=write_data, split=split, report=report,
         fingerprint={"source_digest": old_fingerprint.get("source_digest"),
                      "source_manifest_id": old_fingerprint.get("source_manifest_id"),
-                     "parent_snapshot_id": expected_snapshot_id},
+                     "parent_snapshot_id": expected_snapshot_id,
+                     "schema_version": old_fingerprint.get("schema_version", 1)},
     )
     try:
         new_hashes = payload["fingerprint"]["file_hashes"]
@@ -672,6 +713,7 @@ def move_units(
                        "to": destination, "at": now}],
     )
     assert_split_coverage(parent["units"].copy(), split)
+    assert_physical_split(parent["units"], split)
     report = {
         **parent["report"], "snapshot_id": None, "parent_snapshot_id": expected_snapshot_id,
         "split_counts": split["realized_counts"],
@@ -736,6 +778,7 @@ def swap_units(
         ],
     )
     assert_split_coverage(parent["units"].copy(), split)
+    assert_physical_split(parent["units"], split)
     report = {
         **parent["report"], "snapshot_id": None, "parent_snapshot_id": expected_snapshot_id,
         "split_counts": split["realized_counts"],
@@ -820,9 +863,67 @@ def save_zone_limits(
     return rule
 
 
+def accumulated_red_entry_exposure(project_id, *, store=None):
+    """Recover equipment exposure from retained snapshots and frozen runs.
+
+    Historical Test and development parts are conservatively explored. Retained
+    snapshots prevent a split move from erasing history even before a new run.
+    """
+    store = store or project_store()
+    root = store.project_path(project_id)
+    exposed = set()
+    registry = root / "red_entry_exposure.json"
+    if registry.exists():
+        if registry.is_symlink():
+            raise ValueError("Unsafe equipment exposure registry")
+        exposed.update(read_json(registry).get("exposed_physical_ids", []))
+    from pdm.red_entry_protocol import freeze_split_provenance
+    for directory in sorted((root / "snapshots").glob("*")):
+        fingerprint_path = directory / "processed_fingerprint.json"
+        if directory.is_symlink() or not fingerprint_path.is_file():
+            continue
+        fingerprint = read_json(fingerprint_path)
+        if fingerprint.get("project_id") != project_id:
+            continue
+        for filename in ("units.parquet", "split.json"):
+            artifact = directory / filename
+            if artifact.is_symlink() or sha256_file(artifact) != fingerprint.get("file_hashes", {}).get(filename):
+                raise ValueError("Exposure history snapshot integrity mismatch")
+        history = freeze_split_provenance(pd.read_parquet(directory / "units.parquet"),
+                                         read_json(directory / "split.json"))
+        exposed.update(history["exposed_physical_ids"])
+    for path in (root / "runs").glob("*/training_contract.json"):
+        if not path.is_symlink():
+            exposed.update(read_json(path).get("split_provenance", {}).get("exposed_physical_ids", []))
+    return {"exposed_physical_ids": sorted(exposed)}
+
+
+def freeze_red_entry_exposure(project_id, data, *, store=None):
+    """Persist cumulative exposure before development or historical Test use."""
+    store = store or project_store()
+    from pdm.projects import _file_lock
+    from pdm.red_entry_protocol import freeze_split_provenance
+    root = store.project_path(project_id)
+    root.mkdir(parents=True, exist_ok=True)
+    with _file_lock(root / ".red_entry_exposure.lock"):
+        previous = accumulated_red_entry_exposure(project_id, store=store)
+        provenance = freeze_split_provenance(data["units"], data["split"], previous=previous)
+        atomic_write_json(root / "red_entry_exposure.json", provenance)
+    return provenance
+
+
 def load_snapshot(
-    project_id: str, snapshot_id: str | None = None, *, store: ProjectStore | None = None
+    project_id: str, snapshot_id: str | None = None, *, store: ProjectStore | None = None,
+    feature_partitions: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
+    """Verify the complete snapshot; optionally decode only declared feature partitions."""
+    if feature_partitions is not None and (
+        not isinstance(feature_partitions, (tuple, list))
+        or not feature_partitions
+        or any(not isinstance(role, str) or role not in {"train", "validation", "test"} for role in feature_partitions)
+        or len(set(feature_partitions)) != len(feature_partitions)
+    ):
+        raise ValueError("Feature partitions must be a nonempty unique list of split roles")
     store = store or project_store()
     project = store.get(project_id)
     sid = snapshot_id or project["active_snapshot_id"]
@@ -838,14 +939,19 @@ def load_snapshot(
             raise ValueError(f"Snapshot artifact hash mismatch: {filename}")
     if set(fingerprint.get("file_hashes", {})) != set(SNAPSHOT_FILES):
         raise ValueError("Snapshot is incomplete")
-    features = pd.read_parquet(directory / "features.parquet")
     units = pd.read_parquet(directory / "units.parquet")
     split = read_json(directory / "split.json")
     assert_split_coverage(units.copy(), split)
+    assert_physical_split(units, split)
+    filters = None if feature_partitions is None else [
+        ("unit_id", "in", [uid for role in feature_partitions for uid in split[role]])
+    ]
+    features = pd.read_parquet(directory / "features.parquet", filters=filters)
     schema = read_json(directory / "feature_schema.json")
     report = read_json(directory / "data_report.json")
     if not {"unit_id", "timestamp_s", "signal", "gap_before"}.issubset(features.columns):
         raise ValueError("Snapshot lacks canonical signal columns")
     return {"project_id": project_id, "snapshot_id": sid, "dir": directory,
             "features": features, "units": units, "split": split, "report": report,
-            "schema": schema, "fingerprint": fingerprint}
+            "schema": schema, "fingerprint": fingerprint,
+            "loaded_feature_partitions": list(feature_partitions) if feature_partitions is not None else None}

@@ -533,6 +533,7 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
     saved_limits = load_zone_limits(project_id, snapshot_id)
     zones_schema = zone_schema(schema, project_id, snapshot_id, saved_limits)
     summaries = {part: part_summary(features, split, part) for part, _ in PARTS}
+    _render_event_quality(snapshot, zones_schema)
     drew_limits = False
     if storage_mode != "owned":
         st.info(LINKED_LEGACY_MOVE_ERROR)
@@ -548,8 +549,6 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
             c3.metric("Gaps", summary["gaps"], help=QUALITY_GAPS_HELP)
             if summary["time_start"] is None:
                 st.caption("No admitted measurements in this set.")
-            if report.get("outcome_semantics") == "unlabelled_observations":
-                st.caption("These are sensor histories without failure labels. Signal forecasting uses future measurements within each recorded history.")
             findings = (report.get("by_split") or {}).get(part) or (report.get("sets") or {}).get(part) or {}
             rejected = findings.get("rejected_signal_rows", findings.get("rejected_rows", findings.get("rejected", 0)))
             if rejected or summary["missing_signal"]:
@@ -591,7 +590,10 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
     ready, explanation = training_admission(features, split)
     if ready:
         try:
+            from pdm.red_entry_training import available_red_entry_engines
             engines = available_signal_engines(snapshot["project_id"], snapshot["snapshot_id"])
+            if not any(engine.get("available") for engine in engines) and project_zones.has_valid_rule(zones_schema):
+                engines += available_red_entry_engines(snapshot["project_id"], snapshot["snapshot_id"])
             if not any(engine.get("available") for engine in engines):
                 ready = False
                 explanation = "These sets are present, but their continuous histories are too short for a supported signal model. Add longer histories or adjust the unit split."
@@ -601,3 +603,41 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
     if not ready:
         st.warning(explanation)
     return ready
+
+
+@st.cache_data(show_spinner=False, max_entries=12)
+def _event_quality(snapshot_id: str, rule_hash: str, _snapshot: dict, _schema: dict) -> dict:
+    from pdm.red_entry_targets import build_red_entry_targets
+    targets = build_red_entry_targets(_snapshot, [1.0], schema=_schema)
+    events = targets["events"]
+    rows = []
+    for part, label in PARTS:
+        selected = events.loc[events["split"] == part]
+        rows.append({"Data set": label, "Cycles": len(selected), "Verified first RED": int(selected["first_event_verified"].fillna(False).sum()),
+                     "Censored / unknown": int((~selected["first_event_verified"].fillna(False)).sum()),
+                     "Physical equipment": selected["physical_unit_id"].nunique()})
+    return {"rows": rows}
+
+
+def _render_event_quality(snapshot: dict, schema: dict) -> None:
+    from pdm.red_entry_protocol import red_rule_identity
+    st.subheader("First RED entry data")
+    frame = snapshot["features"]
+    known = frame.get("operating_age_known", pd.Series(False, index=frame.index)).fillna(False)
+    st.metric("Known operating age", f"{int(known.sum())} / {len(frame)}")
+    with st.expander("Operating age and context"):
+        sources = frame.get("operating_age_source", pd.Series("unknown", index=frame.index)).fillna("unknown").value_counts()
+        st.table(sources.rename_axis("Age source").reset_index(name="Measurements"), hide_index=True, border="horizontal")
+        context = [(name, int(frame[name].notna().sum())) for name in
+                   ("rpm", "load_kn", "flow_rate", "dust_feed", "dust", "temperature", "is_running")
+                   if name in frame and frame[name].notna().any()]
+        if context:
+            st.table(pd.DataFrame(context, columns=["Context", "Measurements"]), hide_index=True, border="horizontal")
+    if not project_zones.has_valid_rule(schema):
+        return
+    try:
+        identity = red_rule_identity(schema)
+        report = _event_quality(str(snapshot["snapshot_id"]), identity["red_rule_hash"], snapshot, schema)
+        st.table(pd.DataFrame(report["rows"]), hide_index=True, border="horizontal")
+    except (ValueError, KeyError, TypeError) as exc:
+        st.warning(f"Event diagnostics unavailable: {exc}")

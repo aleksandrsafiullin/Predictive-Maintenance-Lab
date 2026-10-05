@@ -22,6 +22,7 @@ from pdm.project_quality_ui import PARTS, part_summary, render_quality
 from pdm.project_results_ui import cancel_replay_forecast, render_results
 from pdm.project_training_ui import render_training
 from pdm.projects import project_store
+from pdm.red_entry_training import list_red_entry_runs
 from pdm.signal_training import list_project_runs
 from pdm.ui_copy import (
     CREATE_PROJECT_HELP,
@@ -349,6 +350,28 @@ def _render_import(store, project: dict) -> None:
             signal_unit = s3.text_input("Signal unit", value=str(saved.get("signal_unit") or "unit"),
                                         help=IMPORT_SIGNAL_UNIT_HELP)
             st.caption("Yellow and red limits are set on Data Quality after import.")
+        with st.expander("Operating age and context (optional)"):
+            age_source = st.selectbox("Age source", ["unknown", "counter", "laboratory_proxy", "running_clock"],
+                                     index=["unknown", "counter", "laboratory_proxy", "running_clock"].index(saved.get("age_source", "unknown")),
+                                     format_func=lambda x: {"unknown":"Unknown", "counter":"Counter", "laboratory_proxy":"Laboratory proxy", "running_clock":"Running clock"}[x])
+            context_mapping, context_units = {}, {}
+            roles = {"operating_age_s":"Operating age", "operating_age_known":"Age known (true/false)", "operating_age_source":"Age source per row", "physical_unit_id":"Physical equipment ID", "component_cycle_id":"Component cycle ID", "component_replaced":"Component replaced (true/false)", "is_running":"Running (true/false)", "operating_time_since_component_install_s":"Operating time since installation", "operating_time_since_service_s":"Operating time since service", "rpm":"Speed", "load_kn":"Load", "flow_rate":"Flow rate", "dust_feed":"Dust feed", "dust":"Dust type", "temperature":"Temperature"}
+            for role, label in roles.items():
+                col, units_col = st.columns(2)
+                source_column = col.text_input(label + " column", value=str((saved.get("context_mapping") or {}).get(role, "")), key=f"import_context:{pid}:{role}")
+                if source_column.strip():
+                    context_mapping[role] = source_column.strip()
+                if role in {"operating_age_s", "operating_time_since_component_install_s", "operating_time_since_service_s", "rpm", "load_kn", "flow_rate", "dust_feed", "temperature"}:
+                    default_unit = {"operating_age_s":"s", "operating_time_since_component_install_s":"s", "operating_time_since_service_s":"s", "rpm":"rpm", "load_kn":"kN"}.get(role, "")
+                    context_units[role] = units_col.text_input(label + " unit", value=str((saved.get("context_units") or {}).get(role, default_unit)), key=f"import_context_unit:{pid}:{role}")
+        with st.expander("Maintenance events (optional)"):
+            endpoint_roles = {"confirmed_failure": "Confirmed failure (true/false)", "confirmed_failure_timestamp_s": "Confirmed failure time (s)", "emergency_stop": "Emergency stop (true/false)", "emergency_stop_timestamp_s": "Emergency stop time (s)", "planned_maintenance": "Planned maintenance (true/false)", "maintenance_timestamp_s": "Maintenance time (s)", "replacement_timestamp_s": "Replacement time (s)"}
+            for role, label in endpoint_roles.items():
+                source_column = st.text_input(label + " column", value=str((saved.get("context_mapping") or {}).get(role, "")), key=f"import_context:{pid}:{role}")
+                if source_column.strip():
+                    context_mapping[role] = source_column.strip()
+                    if role.endswith("_timestamp_s"):
+                        context_units[role] = "s"
     elif kind == "xjtu_bearings":
         signal_column, signal_label, signal_unit = "combined_rms", "Combined max-axis RMS", "g"
     else:
@@ -386,6 +409,8 @@ def _render_import(store, project: dict) -> None:
                                   "test": float(test_pct) / 100},
                       "signal_column": signal_column.strip(), "signal_label": signal_label.strip(),
                       "signal_unit": signal_unit.strip(), "thresholds": thresholds}
+            if kind == "generic_sensor_csv":
+                source.update(context_mapping=context_mapping, context_units={role: unit for role, unit in context_units.items() if role in context_mapping}, age_source=age_source)
             job_id = uuid.uuid4().hex
             spawn_worker({"kind": "project_import", "job_id": job_id, "project_id": pid, "source": source})
             launched = True
@@ -514,9 +539,9 @@ def main() -> None:
                 runs_ready = any(row.get("run_id") == selected.get("selected_run_id")
                                  and row.get("project_id") == selected_id
                                  and row.get("snapshot_id") == selected["active_snapshot_id"]
-                                 and row.get("task") == "signal_forecast"
+                                 and row.get("task") in {"signal_forecast", "red_entry"}
                                  and row.get("status") == "completed"
-                                 for row in list_project_runs(selected_id))
+                                 for row in list_project_runs(selected_id) + list_red_entry_runs(selected_id))
             except (OSError, ValueError, KeyError, RuntimeError):
                 runs_ready = False
         with st.container(key="pdm-workflow-rail"):

@@ -1,15 +1,17 @@
 # Hyperparameter Sweep Report
 
-_Generated: 2026-10-01 (cloud agent run)_
+_Generated: 2026-10-01 (cloud agent run); interpretation corrected: 2026-10-02._
+
+These results concern the historical RUL/Weibull training task. They do not measure first-RED v2 warning quality or establish architecture defaults for that separate task.
 
 ## Summary
 
 Systematic training-v2 sweep across **GRU / LSTM** × **feature recipes** × **learning rates** × **sampling strategies** on real data (both XJTU-SY bearings and HSE filters datasets).
 
 - **20 configurations** run on real data (11 bearings, 9 filters).
-- **Abbreviated protocol**: `max_epochs=30`, `patience=10`, `min_epochs=8` per run (vs 100/20/20 in production).
+- **Abbreviated protocol**: `max_epochs=30`, `patience=10`, `min_epochs=8` per run (vs the longer configured research budget of 100/20/20).
 - All runs completed; no failures.
-- Results are **exploratory** — epoch budget is a binding constraint for bearings (winner still improving at epoch 29). Use `python3 -m pdm training-study` for a full benchmark.
+- Results are **exploratory** — the best bearings checkpoints were near the 30-epoch cap, so longer-budget behavior remains unmeasured. Use `python3 -m pdm training-study` for a full benchmark.
 
 ---
 
@@ -53,7 +55,7 @@ Split: instances 1–3 train, 4 val, 5 test (per regime). 9 train units, 3 val u
 | 10 | `gru/multiscale_no_age_v2/lr0.001/unit_repl` | GRU | multiscale_no_age_v2 | 0.001 | unit_replacement | 0.0 | 1/30 | 7 748 s (129.1 min) | 15 s |
 | 11 | `gru/multiscale_trend_v2/lr0.001/unit_repl` | GRU | multiscale_trend_v2 | 0.001 | unit_replacement | 0.0 | 2/30 | 10 553 s (175.9 min) | 17 s |
 
-⚠️ `best_epoch = max_epochs` means the epoch budget was **binding**; true performance with 100 epochs likely much better.
+⚠️ A best checkpoint near the epoch cap warrants a longer-budget experiment. It does not guarantee improvement at 100 epochs; later training can plateau or worsen validation performance.
 
 ### Bearings validation evaluation (winner run)
 
@@ -68,15 +70,15 @@ Measured on `--split validation` (3 validation bearings, one per regime):
 | Bearing2_4 (37.5 Hz 11 kN) MAE | **4 242 s (70.7 min)** |
 | Bearing3_4 (40 Hz 10 kN) MAE | 40 213 s (11.2 h) ⚠️ |
 
-Bearing3_4 is a strong outlier (11× the median). The 40 Hz regime has inherently different failure dynamics; with only 3 training units per regime and 30 epochs, regime-specific convergence varies widely.
+Bearing3_4 has the largest reported all-points error. This sweep alone cannot attribute that difference to regime dynamics, convergence or feature quality.
 
 ### Bearings — key findings
 
-1. **`unit_replacement` sampling wins over `full_pass`** on bearings (opposite of filters). With only ~6 852 training windows spread across 9 units × 3 regimes, `full_pass` provides no sampling diversity benefit.
-2. **`base_v1` beats `degradation_v1`** at the 30-epoch budget. The degradation recipe adds 10 slope features whose rolling-window estimates need several epochs to stabilize; at 30 epochs they appear to hurt convergence.
-3. **Multiscale recipes perform worst** (best_epoch=1–2). These recipes add 40–60 measurement slope windows; with short bearing series they are mostly zero during training and provide no signal.
-4. **GRU > LSTM** consistently: LSTM ranks 8–9 vs GRU at 1–7.
-5. **Epoch budget is binding for the top 2 configs** (winner at epoch 29, runner-up at epoch 30). Near-event MAE of ~3 949 s at epoch 29 is still declining; a 100-epoch run is expected to improve materially.
+1. The measured `gru/base_v1/lr0.001/unit_replacement` configuration had the lowest validation score among the tested candidates. Its sampling advantage is specific to this sweep; no variance mechanism was measured.
+2. `base_v1` scored better than the tested `degradation_v1` recipes under this budget. Rolling slopes are calculated from the observed prefix and do **not** stabilize through training epochs. Their usefulness depends on causal history, scaling and model fit; the sweep does not identify the cause of the ranking.
+3. The two tested multiscale candidates ranked last. No feature sparsity analysis was reported here to explain that outcome.
+4. Tested GRU candidates scored better than tested LSTM candidates. A general architectural advantage requires matched budgets, additional seeds and physical-unit folds.
+5. Top checkpoints occurred at epochs 29 and 30. A 100-epoch run is an untested comparison, not a promised improvement.
 
 ---
 
@@ -106,16 +108,15 @@ Split: 39 train / 10 val (author_train 80/20 seed 42, stratified on events). 50 
 | Val MAE on observed 600 Pa events | 8.8 s (1 event unit) |
 | Val coverage (n observed event units) | 1 / 10 |
 
-The large gap between best NLL (0.266 at epoch 1) and last NLL (0.638 at epoch 18) is expected: with only **5 observed 600 Pa events in 39 training units** (13% event rate), the Weibull NLL landscape is flat and volatile. The model quickly finds a good survival function shape in epoch 1, then the optimizer drifts on the noisy censored gradient.
+The later validation NLL was worse than the selected early checkpoint. Sparse observed events limit interpretation; this table does not establish a particular optimizer or censoring-gradient mechanism. Event counts in this historical report must not be substituted for the RED-rule audit in the v2 report.
 
 ### Filters — key findings
 
-1. **`full_pass` sampling wins over `unit_replacement`** (ranks 1–2 both use full_pass). Each filter unit has ~790 measurements; `full_pass` ensures every window contributes equally per epoch, which reduces variance in the NLL gradient from the sparse event signal.
-2. **`base_v1` + full_pass is the winner**, beating `degradation_v1` + full_pass (0.266 vs 0.273). The pressure-slope features added by `degradation_v1` do not reliably improve over the raw pressure + dust features on this short epoch budget.
-3. **`multiscale_no_age_v2` is 3rd** for unit_replacement — adding long-window slopes gives richer degradation signal even on unit_replacement. Likely competitive with full_pass for longer runs.
-4. **GRU dominates**: all top-7 spots are GRU. LSTM ranks 8–9 with NLL 0.318–0.336 vs GRU's 0.266–0.315.
-5. **Lower LR (0.0003) hurts** (rank 7, NLL 0.315 vs 0.304 for lr=0.001 unit_replacement). The default 0.001 converges better under the 30-epoch limit.
-6. **best_epoch=1 for 8/9 configs** reflects the fragility of Weibull NLL on a small censored dataset. The checkpoint saved at epoch 1 is the true best; later epochs overfit.
+1. `gru/base_v1/lr0.001/full_pass` had the lowest measured NLL in this sweep; `degradation_v1/full_pass` was next. The small difference needs replication.
+2. Tested multiscale candidates did not beat that configuration. Longer budgets or alternate sampling remain untested here.
+3. Tested GRU candidates ranked above tested LSTM candidates. Seed and grouped-fold replication are required before generalizing the ranking.
+4. The tested lower learning rate scored worse in its sampled comparison; this does not establish a universal learning-rate preference.
+5. The table shows best epoch 1 for **7/9** configurations and epoch 2 for the other two. It supports selecting the recorded best checkpoint, not requiring more epochs to improve quality.
 
 ---
 
@@ -127,7 +128,7 @@ The large gap between best NLL (0.266 at epoch 1) and last NLL (0.638 at epoch 1
 | Winning recipe | `base_v1` | `base_v1` |
 | Winning LR | 0.001 | 0.001 |
 | Winning arch | GRU | GRU |
-| Epoch budget binding? | **Yes** (29–30 of 30) | No (1–2 of 30) |
+| Best checkpoint vs cap | Near cap (29–30 of 30) | Early (1–2 of 30) |
 | Multiscale recipes | ❌ Worst (best_epoch=1) | ↑ Middle-rank |
 | LSTM vs GRU gap | ~2× MAE worse | ~25% NLL worse |
 
@@ -151,38 +152,23 @@ python3 -m pdm train --dataset bearings --arch fly_connectome_reservoir \
 
 ---
 
-## Recommendations
+## Follow-up experiments
 
-### For bearings
+Treat the recorded winners as candidates for this historical task. Compare longer budgets using Validation checkpoint selection, repeat multiple seeds, and use physical-unit development folds to assess ranking stability. Match input recipes and compute budgets when comparing GRU and LSTM. Preserve Test from model and threshold selection. More epochs, more features or forcing a minimum epoch count do not guarantee better forecasts.
 
-1. **Wire default**: keep `gru / base_v1 / lr=0.001 / unit_replacement` — it won the sweep.
-2. **Extend epochs**: re-run winner with `--epochs 100` (or default `--protocol adaptive`); best_epoch=29 strongly suggests the model would improve further.
-3. **Confirm**: run seeds 43 and 44 to check ranking stability across 3 validation bearings.
-4. **Cautious about `near_weight`**: near-event weighting (`full_pass_near0.5`) ranked 4th at 30 epochs — the near-event signal is strongest when the model has had time to converge globally first.
-
-### For filters
-
-1. **Wire default**: `gru / base_v1 / lr=0.001 / full_pass` — it won cleanly (NLL 0.266 vs 0.273 for runner-up).
-2. **Note the best_epoch=1 instability**: this run's winner was determined in the first epoch. Consider adding `--sampling full_pass --min-epochs 20` in production to force longer training and observe whether NLL keeps improving.
-3. **Consider `multiscale_no_age_v2`** as a secondary candidate: it ranked 3rd on unit_replacement; with full_pass and more epochs it may be competitive.
-
-### General
-
-- Both datasets consistently favor **GRU over LSTM** for this data size and epoch budget.
-- The default `lr=0.001` is clearly better than `lr=0.0003` for both datasets at 30 epochs.
-- Reservoir architectures were excluded — they are interesting candidates for both datasets but require either the MaleCNS feather or `--graph-mode synthetic_fixture`.
+Reservoir architectures were excluded on the cloud VM. A synthetic fixture can test software contracts; it cannot establish official MaleCNS performance or substitute for the real graph in the v2 comparison.
 
 ---
 
 ## Limitations and Honest Caveats
 
-1. **30-epoch budget is binding for bearings**: the winner improved until epoch 29/30. All bearings rankings above are preliminary and likely to change with 100 epochs.
-2. **Bearings: only 3 validation units** (one per regime). Any single-config ranking difference under ~500 s may not be statistically meaningful. Rankings 1–5 should be treated as a cluster, not a strict ordering.
-3. **Filters: only 1 observed event in validation** (out of 10). The val MAE is on that 1 unit only; NLL is the only robust selection metric.
+1. **30-epoch budget is binding for bearings**: the winner improved until epoch 29/30. All bearings rankings above are preliminary; their stability under 100 epochs is unknown.
+2. **Bearings: only 3 validation units** (one per regime). No confidence interval or significance analysis establishes a reliable separation between candidates.
+3. **Filters: only 1 observed event in validation** (out of 10). The val MAE is on that 1 unit only; NLL includes censored follow-up, but one event does not establish robust event-time quality.
 4. **Single seed (42)**: all runs use seed=42. Rankings may shift with seeds 43–44, especially for bearings where 3 training units per regime create high variance.
 5. **No test evaluation**: all metrics are from validation split only. Test evaluation requires `python3 -m pdm evaluate --split test` with a frozen alert policy.
 6. **Reservoir architectures excluded**: `fly_connectome_reservoir`, `random_reservoir`, and `full_cns` were not swept due to missing MaleCNS feather on this VM.
-7. **CPU-only training**: `train_v2` sets `torch.set_num_threads(1)` for reproducibility. GPU runs would be faster but produce the same values.
+7. **CPU-only training**: `train_v2` sets `torch.set_num_threads(1)` for reproducibility. GPU speed and numerical agreement were not checked.
 
 ---
 

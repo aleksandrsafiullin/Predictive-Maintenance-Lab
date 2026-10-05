@@ -1,6 +1,8 @@
 # Predictive Maintenance Lab
 
-A local laboratory for **sensor-signal forecasting**, with independent projects and a Create ML-style workflow: **Projects → Import data → Data Quality → Training → Results**. Import sensor CSV folders or the supported XJTU-SY/HSE formats, choose one model, and replay its saved forecast beside the measurements received so far. Yellow and red are signal limits; crossing one is not automatically an equipment failure.
+A local predictive-maintenance laboratory with independent projects and a Create ML-style workflow: **Projects → Import data → Data Quality → Training → Results**. The primary RED-entry v2 task predicts the **first recorded entry into the saved RED rule** in the current component risk episode from known operating age, operating context and sensor history. This is a threshold event, not a confirmed equipment failure. Numerical sensor forecasting remains an auxiliary, separate task; historical remaining-useful-life (RUL) research uses a different endpoint.
+
+Новый прогноз первого RED использует три режима: «Наработка и условия», «Сигнал и условия», «Сигнал, наработка и условия». Наработка поступает из явно известного счётчика/источника; неизвестный возраст не заменяется временем от начала записи. Возраст в XJTU-SY/HSE помечается `laboratory_proxy` и не означает подтверждённую промышленную наработку компонента. RED, версия снимка и порядок признаков фиксируются вместе с моделью. Вероятности, квантиль времени до RED, калиброванный коридор и предупреждение имеют отдельные статусы доступности; signal-band не становится коридором события. Текущие результаты исследовательские: требования эксплуатации не заданы, независимого Holdout нет. См. [русский отчёт реализации](docs/red_entry_v2_implementation_report_ru.md) и [протокол сравнения](docs/red_entry_v2_experiment_protocol_ru.md).
 
 See the [project workflow guide](docs/create_ml_workflow.md) for folder formats, automatic/manual splits, model settings, playback and recoverable deletion. The public datasets and earlier research below remain available without copying their raw files into each project.
 
@@ -15,7 +17,7 @@ The bundled HSE source document at `data/raw/filters/Preventive to Predictive Ma
 
 ## Current sensor zones
 
-The existing sensor-zone research utilities describe both datasets without an RUL model or monitoring bundle. The new primary app has one signal Results screen; it does not expose the former report selector.
+The existing sensor-zone research utilities describe both datasets without an RUL model or monitoring bundle. The primary project workflow separates first-RED event Results from auxiliary signal Results; the former research report selector is not the event workflow.
 
 - **Bearings:** green is vibration near that bearing's initial baseline; yellow is a persistent rise; red is measured RMS at least 2× that baseline. These are provisional signal rules, not expert fault diagnoses. [Rule and limitations](docs/health_zones.md).
 - **Filters:** green is usable pressure below a provisional 300 Pa band, yellow is 300–<600 Pa, red is at least 600 Pa, and gray means an unusable or incomplete measurement. Green means only “below this provisional band.” The source's observed-event convention is strictly >600 Pa, whereas the display boundary is ≥600 Pa. [Rule and limitations](docs/filter_sensor_zones.md).
@@ -210,7 +212,7 @@ Open **http://127.0.0.1:8501**. In **Projects**, enter a name and source format,
 
 **Data Quality** shows the three sets, their units, measurements, gaps and signal zones. **Move units** changes the allocation of whole histories and creates a new snapshot requiring new training. Yellow/red limits are edited here after import: edits preview the zones, **Save** persists them for Results, and **Cancel** restores the saved rule. Saving limits preserves the trained model; a first Sensor CSV import has no zone rule until one is provided.
 
-**Training** launches one GRU, LSTM or quantile boosting signal model with editable settings. **Results** shows a gray observed line, saved yellow/red limits, and the saved model's future signal points. Play advances through a held-out Test unit; Pause, Reset and the observation slider control the cursor. Light and dark appearance are available. The [workflow guide](docs/create_ml_workflow.md) explains model and threshold limits; the [latest review and fixes](docs/create_ml_review_20260929_ru.md) record verification results.
+**Training** separates the first-RED event task from auxiliary numerical signal forecasting. Event engines are GRU, LSTM, hazard boosting, Full MaleCNS and three baselines (Kaplan–Meier by known age, no entry, trend to RED); input modes and probability horizons are explicit. **Results** separates horizon probabilities, raw time-to-RED quantiles, calibrated event corridor and warning status. Event prediction can use the first real sample when the context is sufficient. Play/Pause/Reset and the observation slider control the replay cursor; future measurements are review-only. The auxiliary signal task retains its saved future signal points and limits. Browser acceptance and the final integrated checks are tracked in the [RED-entry implementation report](docs/red_entry_v2_implementation_report_ru.md); older signal behavior is described in the [workflow guide](docs/create_ml_workflow.md).
 
 To check the repository:
 
@@ -241,6 +243,8 @@ scripts/          setup.sh / run.sh (and Windows .ps1)
 
 ## More documentation
 
+- [RED-entry v2 implementation report (Russian)](docs/red_entry_v2_implementation_report_ru.md) — source audit, implementation, real smoke evidence and pending acceptance
+- [RED-entry v2 experiment protocol (Russian)](docs/red_entry_v2_experiment_protocol_ru.md) — isolated frozen comparisons, seeds, physical folds, resume and limits
 - [Project workflow guide](docs/create_ml_workflow.md) — folder import, split rules, training, playback and storage
 - [Implementation plan (Russian)](docs/create_ml_implementation_plan_ru.md) — scope, architecture and acceptance criteria
 - [Sensor-zone benchmark review](docs/sensor_zone_benchmark_review.md) — weak-label score, baselines and filter threshold sensitivity
