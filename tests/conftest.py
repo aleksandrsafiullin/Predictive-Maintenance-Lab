@@ -26,6 +26,7 @@ def signal_cns_fixture(monkeypatch):
         return SignalFullCNS(body)
 
     monkeypatch.setattr("pdm.signal_training.build_signal_full_cns", build)
+    monkeypatch.setattr("pdm.trend_corridor.build_signal_full_cns", build)
     monkeypatch.setattr("pdm.signal_training.source_unavailable_reason", lambda: None)
     return build
 

@@ -73,7 +73,7 @@ def first_recorded_red_after_now(observed: list[dict], future: list[dict],
 def _red_entry_corridor(result: dict) -> tuple[float, float] | None:
     """Accept only an explicit model-issued interval, never infer one from Test data."""
     entry = result.get("red_entry_corridor") or {}
-    empirical = entry.get("status") in {"empirical_conditional", "learned"}
+    empirical = entry.get("status") in {"empirical_conditional", "learned", "derived"}
     if entry.get("status") != "available" and not empirical:
         return None
     try:
@@ -115,7 +115,7 @@ def replay_figure(result: dict, schema: dict, theme: str = "dark", *,
     if points:
         direct = anchor + [r for r in all_points if r.get("kind") not in {"recursive", "anchor"}]
         recursive = [r for r in all_points if r.get("kind") == "recursive"]
-        if (result.get("funnel") or {}).get("mode") != "learned_joint_trajectories":
+        if (result.get("funnel") or {}).get("mode") not in {"learned_joint_trajectories", "bounded_trend_corridor"}:
             fig.add_trace(go.Scatter(x=[r["target_time_s"] for r in direct], y=[r.get("value") for r in direct],
                                  mode="lines+markers", name="Forecast horizon", line={"color": forecast_color, "width": 2},
                                  marker={"size": 6}, connectgaps=False))
@@ -127,15 +127,16 @@ def replay_figure(result: dict, schema: dict, theme: str = "dark", *,
                                      marker={"size": 4}, connectgaps=False))
         if any(row.get("lower") is not None and row.get("upper") is not None for row in points):
             joint = bool(result.get("funnel"))
+            bounded = (result.get("funnel") or {}).get("mode") == "bounded_trend_corridor"
             fig.add_trace(go.Scatter(x=[r["target_time_s"] for r in direct],
                                      y=[r.get("upper") for r in direct], mode="lines",
                                      line={"color": t["series_band_line"], "width": 1},
-                                     name="Forecast band upper" if joint else "Pointwise upper quantile", connectgaps=False))
+                                     name="Trend corridor upper" if bounded else "Forecast band upper" if joint else "Pointwise upper quantile", connectgaps=False))
             fig.add_trace(go.Scatter(x=[r["target_time_s"] for r in direct],
                                      y=[r.get("lower") for r in direct], mode="lines", fill="tonexty",
                                      fillcolor=t["series_band"],
                                      line={"color": t["series_band_line"], "width": 1},
-                                     name="Forecast band" if joint else "Pointwise lower quantile", connectgaps=False))
+                                     name="Trend corridor" if bounded else "Forecast band" if joint else "Pointwise lower quantile", connectgaps=False))
     future = sorted([r for r in _records(future_actual)
                      if as_of is not None and float(r["timestamp_s"]) > float(as_of)],
                     key=lambda r: float(r["timestamp_s"]))
@@ -159,7 +160,7 @@ def replay_figure(result: dict, schema: dict, theme: str = "dark", *,
     corridor = _red_entry_corridor(result)
     if corridor:
         fig.add_vrect(x0=corridor[0], x1=corridor[1], fillcolor=t["series_band"],
-                      line_width=0, annotation_text="RED window" if (result.get("funnel") or {}).get("mode") == "learned_joint_trajectories" else "Conditional RED window" if result.get("funnel") else "Predicted RED-entry window",
+                      line_width=0, annotation_text="RED window" if (result.get("funnel") or {}).get("mode") in {"learned_joint_trajectories", "bounded_trend_corridor"} else "Conditional RED window" if result.get("funnel") else "Predicted RED-entry window",
                       annotation_position="top left")
     actual_red = first_recorded_red_after_now(observed, future, thresholds, as_of) if future else None
     if actual_red is not None:
@@ -197,7 +198,9 @@ def _run_label(row: dict) -> str:
         date = datetime.fromisoformat(created.replace("Z", "+00:00")).strftime("%b %d, %H:%M")
     except ValueError:
         date = "Saved run"
-    return f"{'First RED entry · ' if row.get('task') == 'red_entry' else 'Signal · '}{engine} · {date}"
+    task = ("First RED entry" if row.get("task") == "red_entry" else
+            "Trend corridor" if (row.get("params") or {}).get("forecast_mode") == "bounded_trend_corridor" else "Signal")
+    return f"{task} · {engine} · {date}"
 
 
 def advance_play_state(state: dict, length: int) -> dict:
@@ -212,9 +215,36 @@ def advance_play_state(state: dict, length: int) -> dict:
 
 
 def _show_forecast_context(result: dict, schema: dict, interval_status: str | None = None) -> None:
+    if result.get("corridor_contract") and result.get("status") != "available":
+        st.info(result.get("reason") or "The trend corridor is unavailable at this observation time.")
+        return
+    if (result.get("funnel") or {}).get("mode") == "bounded_trend_corridor":
+        bounds = result.get("corridor_contract") or result["funnel"]
+        target = bounds.get("target_relative_width", .20)
+        maximum = bounds.get("maximum_relative_width", .30)
+        st.caption(f"Trend corridor · ±{50*target:g}% of the predicted level, up to ±{50*maximum:g}%. "
+                   "Containment is uncalibrated; misses remain forecast errors.")
+        entry = result.get("red_entry_corridor") or {}
+        window = _red_entry_corridor(result)
+        if window:
+            st.metric("First RED entry · from corridor",
+                      f"{_time_label(window[0]-result['as_of_s'], schema)} – "
+                      f"{_time_label(window[1]-result['as_of_s'], schema)} ahead")
+            st.caption("This window follows from the two boundary crossings, conditional on the signal staying inside the corridor.")
+        elif entry.get("status") == "open":
+            st.info(f"RED entry is possible from {_time_label(entry['earliest_s']-result['as_of_s'], schema)} ahead. "
+                    "The lower-risk boundary does not cross within this span; the end of the window is open.")
+        elif entry.get("status") == "already_red":
+            st.warning("The latest measurement is already in the red zone.")
+        elif entry.get("status") == "previously_red":
+            st.caption("A RED entry has already been recorded in the received history.")
+        else:
+            st.info("No RED entry is predicted within the shown corridor horizon.")
+        return
     if result.get("funnel"):
         funnel = result["funnel"]
-        status = str(funnel.get("calibration_status") or funnel.get("status") or "unavailable")
+        status = str(funnel.get("calibration_status") or result.get("calibration_status")
+                     or funnel.get("status") or "unavailable")
         st.caption(f"Band: {status.replace('_', ' ')}")
         entry = result.get("red_entry_corridor") or {}
         probability = entry.get("probability_within_horizon")
@@ -463,25 +493,49 @@ def render_results(project_id: str, snapshot: dict, selected_run_id: str | None 
         with st.expander("Connectome source"):
             st.markdown("[Original MaleCNS data · HHMI Janelia / Cambridge / MRC LMB / Google Research](https://male-cns.janelia.org/download/)")
             st.caption(f"Graph SHA-256: {provenance['graph_hash']}")
+    corridor = manifest.get("params", {}).get("forecast_mode") == "bounded_trend_corridor"
     learned = manifest.get("params", {}).get("forecast_mode") == "learned_joint_trajectories"
+    if not corridor:
+        st.warning("This saved model uses the previous wide-band objective. Train a new Trend corridor model "
+                   "to obtain the ±10% to ±15% corridor; its saved predictions are preserved.")
     replay_limits = (manifest["schema"].get("thresholds") if learned else
                      load_zone_limits(project_id, snapshot["snapshot_id"]))
     _play_fragment(project_id, run_id, unit_id, snapshot, manifest.get("interval_status"), theme,
                    replay_limits, background=manifest.get("engine_id") == "full_cns",
-                   learned_horizons_s=manifest["params"]["horizons_s"] if learned else None)
+                   learned_horizons_s=manifest["params"]["horizons_s"] if learned or corridor else None)
     metrics = (manifest.get("metrics") or {}).get("test") or {}
+    metric_partition = "Test"
+    if (learned or corridor) and not metrics:
+        metrics = (manifest.get("metrics") or {}).get("validation") or {}
+        metric_partition = "Validation"
     if metrics:
-        st.subheader("Test summary" if manifest.get("funnel") else "Held-out Test summary")
-        if manifest.get("params",{}).get("forecast_mode") == "learned_joint_trajectories":
+        st.subheader("Validation summary" if metric_partition == "Validation" else "Test summary · exploratory" if corridor else
+                     "Test summary" if manifest.get("funnel") else "Held-out Test summary")
+        if corridor:
+            c1, c2 = st.columns(2)
+            coverage, width = metrics.get("point_coverage"), metrics.get("mean_relative_width")
+            c1.metric("Measured containment", "—" if coverage is None else f"{coverage:.1%}")
+            c2.metric("Mean corridor half-width", "—" if width is None else f"±{width/2:.1%}")
+            st.table(pd.DataFrame([{"Horizon (s)": row["horizon_s"],
+                         "Whole-path containment": "Unknown" if row["whole_path_coverage"] is None else f"{row['whole_path_coverage']:.1%}",
+                         "Equipment with complete follow-up": row["complete_physical_groups"],
+                         "Complete paths": row["complete_origins"]} for row in metrics.get("horizons", [])]))
+            st.caption("Whole-path containment uses complete recorded follow-up only. "
+                       "Historical splits have been reused; prediction quality remains exploratory.")
+            if coverage is not None and coverage < manifest["params"]["nominal_coverage"]:
+                st.warning("This model misses the containment target. Its bounds remain narrow; "
+                           "the run has not demonstrated reliable corridor prediction.")
+            return
+        if learned:
             c1,c2=st.columns(2)
-            c1.metric("Test equipment",metrics.get("physical_group_count",0))
+            c1.metric(f"{metric_partition} equipment",metrics.get("physical_group_count",0))
             c2.metric("Replay origins",metrics.get("origins",0))
-            st.dataframe(pd.DataFrame([{"Horizon (min)":row["horizon_s"]/60,
+            st.table(pd.DataFrame([{"Horizon (min)":row["horizon_s"]/60,
                           "Whole-path coverage":row["whole_path_coverage"],
                           "Mean band width (g)":row["mean_width_g"],
                           "Complete equipment":row["complete_physical_groups"],
                           "Useful RED warnings":row["events_with_useful_warning"]}
-                          for row in metrics.get("horizons",[])]),hide_index=True)
+                          for row in metrics.get("horizons",[])]))
             return
         c1, c2 = st.columns(2)
         c1.metric("Known future measurements", metrics.get("known_targets", "—"))

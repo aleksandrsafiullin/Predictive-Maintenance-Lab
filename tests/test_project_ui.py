@@ -916,13 +916,14 @@ def test_saved_snapshot_offers_one_signal_engine_and_horizon_controls(monkeypatc
     assert not at.exception
     model = next(widget for widget in at.selectbox if widget.label == "Model")
     assert list(model.options) == ["GRU", "LSTM", "Quantile boosting", "Fly brain · Full MaleCNS"]
-    assert any(widget.label == "Forecast horizons (seconds)" for widget in at.text_input)
+    assert any(widget.label == "Forecast span (minutes)" for widget in at.number_input)
     assert any(button.label == "Train model" for button in at.button)
     assert not any(widget.label == "Report view" for widget in at.radio)
     model.select("full_cns").run()
     assert not at.exception
-    assert any("original directed connections" in block.value for block in at.info)
-    assert not any(widget.label in {"Hidden units", "Training epochs", "Boosting iterations"}
+    assert any("MaleCNS" in block.value for block in at.markdown)
+    assert any(widget.label == "Training epochs" for widget in at.number_input)
+    assert not any(widget.label in {"Hidden units", "Boosting iterations"}
                    for widget in at.number_input)
 
 
@@ -1019,8 +1020,8 @@ def test_full_cns_training_dispatch_and_saved_results(monkeypatch, tmp_path, sig
     next(button for button in at.button if button.label == "Train model").click().run()
     assert not at.exception and len(queued) == 1
     assert queued[0]["engine_id"] == "full_cns"
-    assert {"history_length", "horizons_s", "seed", "forecast_mode", "cv_folds", "path_samples"} <= set(queued[0]["params"])
-    assert queued[0]["params"]["forecast_mode"] == "joint_residual_paths"
+    assert {"history_length", "horizons_s", "seed", "forecast_mode"} <= set(queued[0]["params"])
+    assert queued[0]["params"]["forecast_mode"] == "bounded_trend_corridor"
     assert queued[0]["snapshot_id"] == snapshot["snapshot_id"]
     assert status_for_project(project["project_id"])["status"] == "queued"
     run_job(queued[0])

@@ -166,7 +166,7 @@ def forecast_prefix(project_id: str, run_id: str, unit_id: str, as_of_s: float,
         raise ValueError("Recursive search requires 1–960 steps")
     run = load_signal_run(project_id, run_id)
     if prediction_horizon_s is not None:
-        if run["params"].get("forecast_mode") != "learned_joint_trajectories":
+        if run["params"].get("forecast_mode") not in {"learned_joint_trajectories", "bounded_trend_corridor"}:
             raise ValueError("Forecast span requires a saved learned joint trajectory run")
         if isinstance(prediction_horizon_s, bool) or not np.isfinite(float(prediction_horizon_s)) or float(prediction_horizon_s) <= 0:
             raise ValueError("Forecast span must be a finite positive duration")
@@ -175,6 +175,10 @@ def forecast_prefix(project_id: str, run_id: str, unit_id: str, as_of_s: float,
     if str(unit_id) not in set(map(str, data["split"].get("test", []))):
         raise ValueError("Replay is available only for this run's held-out test units")
     prefix = unit[unit.timestamp_s.astype(float) <= float(as_of_s)].copy()
+    if run["params"].get("forecast_mode") == "bounded_trend_corridor":
+        from pdm.trend_corridor import forecast_corridor_prefix
+        return forecast_corridor_prefix(run, data, prefix, unit_id, should_stop,
+                                        prediction_horizon_s, thresholds)
     if run["params"].get("forecast_mode") == "learned_joint_trajectories":
         from pdm.learned_trajectory import forecast_learned_prefix
         if thresholds and thresholds != run["schema"].get("thresholds"):

@@ -8,6 +8,20 @@ import numpy as np
 from pdm.signal_training import ENGINES, _segments, average_training_duration_s
 
 
+def corridor_training_profile(snapshot: dict, engine_id: str) -> dict:
+    """One bounded corridor task for every signal engine, with Train-only clocks."""
+    from pdm.trend_corridor import MODE, corridor_params
+
+    profile = funnel_training_profile(snapshot, engine_id)
+    features = snapshot["features"][snapshot["features"].unit_id.astype(str).isin(
+        map(str, snapshot["split"]["train"]))]
+    cadence = profile["horizons_s"][0]
+    steps = min(4096, int(round(profile["horizons_s"][-1]/cadence)))
+    return corridor_params(engine_id, dict(forecast_mode=MODE,
+                           history_length=profile["history_length"],
+                           horizons_s=[cadence*i for i in range(1, steps+1)]), features)
+
+
 def funnel_training_profile(snapshot: dict, engine_id: str) -> dict:
     if engine_id not in ENGINES:
         raise ValueError(f"Unsupported numeric signal engine: {engine_id}")

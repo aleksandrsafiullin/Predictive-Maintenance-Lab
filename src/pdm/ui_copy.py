@@ -148,8 +148,8 @@ LEGACY_OPEN_PROJECT_HELP = "Pick an imported dataset to continue with. Opening i
 
 # Training
 TRAIN_MODEL_HELP = (
-    "GRU and LSTM learn sequences. Quantile boosting fits trees. Full MaleCNS fits a signal readout "
-    "on the public connectome. Forecast bands use grouped out-of-fold Training errors."
+    "GRU/LSTM learn sequences; boosting uses trees; Full MaleCNS uses the public connectome. "
+    "All learn a trend corridor at ±10%, expanding up to ±15%. RED entry follows from its boundaries."
 )
 TRAIN_FULL_CNS_CAPTION = (
     "Uses all classified MaleCNS v1.0 neurons and original directed connections. Synapse counts are scaled "
@@ -180,14 +180,14 @@ TRAIN_BATCH_HELP = (
     "larger is smoother and faster on big data."
 )
 TRAIN_BOOSTING_ITER_HELP = (
-    "Fixed number of boosting iterations. The model fits Training units; Validation calibrates the forecast band."
+    "Fixed number of tree iterations on Training units. A learned corridor readout is then selected on Validation."
 )
 TRAIN_BOOSTING_NO_EPOCHS_CAPTION = (
     "Quantile boosting uses a fixed iteration count."
 )
 TRAIN_SUBMIT_HELP = (
-    "Fits these settings on Training, estimates uncertainty from grouped Training folds, "
-    "calibrates on Validation, then evaluates the frozen model on Test."
+    "Fits a bounded trend corridor on Training, selects its weights on Validation, "
+    "then measures containment and width on Test. Half-width stays within ±10–15%; misses count as errors."
 )
 TRAIN_STOP_HELP = (
     "Asks the job to stop after its current safe step. No model is saved from a stopped run; earlier saved runs "

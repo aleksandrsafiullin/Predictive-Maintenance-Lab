@@ -164,7 +164,7 @@ def test_unsupported_probabilities_are_not_joined():
     assert fig.data[0].connectgaps is False
 
 
-def test_training_task_defaults_to_first_red_and_signal_remains_available():
+def test_training_exposes_only_the_corridor_task():
     def app():
         from unittest.mock import patch
 
@@ -192,12 +192,9 @@ def test_training_task_defaults_to_first_red_and_signal_remains_available():
 
     app_test = AppTest.from_function(app).run()
     assert not app_test.exception
-    assert app_test.selectbox[0].value == "red_entry"
-    assert any(row.value == "event branch" for row in app_test.markdown)
-    app_test.selectbox[0].select("signal_forecast").run()
+    assert not app_test.selectbox
+    assert not any(row.value == "event branch" for row in app_test.markdown)
     assert any(row.value == "signal branch" for row in app_test.markdown)
-    app_test.selectbox[0].select("legacy_rul").run()
-    assert "unavailable" in app_test.info[0].value.lower()
 
 
 def test_saved_evaluation_preserves_unknowns_and_keeps_raw_manifest_collapsed():

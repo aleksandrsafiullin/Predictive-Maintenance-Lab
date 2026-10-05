@@ -11,7 +11,7 @@ import streamlit as st
 from pdm import ui_copy
 from pdm.cli import spawn_worker
 from pdm.models.signal_full_cns import ENGINE_LABEL
-from pdm.signal_profiles import funnel_training_profile, learned_bearings_training_profile
+from pdm.signal_profiles import corridor_training_profile
 from pdm.signal_training import (
     _segments,
     available_signal_engines,
@@ -165,11 +165,10 @@ def _render_signal_training(project_id: str, snapshot: dict) -> None:
                             help=ui_copy.TRAIN_MODEL_HELP)
     recurrent = selected in {"gru", "lstm"}
     full_cns = selected == "full_cns"
-    learned_defaults = learned_bearings_training_profile(snapshot, selected)
-    defaults = learned_defaults or funnel_training_profile(snapshot, selected)
-    learned = learned_defaults is not None
+    defaults = corridor_training_profile(snapshot, selected)
+    learned = True
     coverage = []
-    profile_key = f"{selected}:{snapshot['snapshot_id']}"
+    profile_key = f"corridor:{selected}:{snapshot['snapshot_id']}"
     mean_duration = average_training_duration_s(snapshot)
     step = _training_step(snapshot)
     required_horizon = max(1, math.ceil(mean_duration / step - 1e-9)) * step
@@ -179,6 +178,9 @@ def _render_signal_training(project_id: str, snapshot: dict) -> None:
                    "are available in both splits.")
     if full_cns:
         st.markdown("[MaleCNS v1.0 · public connection map and annotations](https://male-cns.janelia.org/download/)")
+    st.caption("Train the trend corridor at ±10% of the predicted level, with learned expansion up to ±15% (20–30% total width). "
+               "First RED entry is derived from the corridor boundaries. "
+               "Measurements outside the corridor count as forecast errors.")
     with st.form("signal_train_form"):
         with st.container(border=True, key="pdm-train-window"):
             st.subheader("Data window", anchor=False)
@@ -189,7 +191,8 @@ def _render_signal_training(project_id: str, snapshot: dict) -> None:
             if learned:
                 span = c2.number_input("Forecast span (minutes)", min_value=step/60,
                                       max_value=4096*step/60, value=defaults["horizons_s"][-1]/60,
-                                      step=step/60, key=f"span:{profile_key}")
+                                      step=step/60, key=f"span:{profile_key}",
+                                      help="Duration covered by directly trained corridor boundaries, at the saved sampling interval.")
                 horizons = None
             else:
                 horizons = c2.text_input("Forecast horizons (seconds)",
@@ -281,7 +284,14 @@ def _render_signal_training(project_id: str, snapshot: dict) -> None:
         metrics = latest.get("metrics") or {}
         validation = metrics.get("validation") or {}
         test = metrics.get("test") or {}
-        if (latest.get("params") or {}).get("forecast_mode") == "learned_joint_trajectories":
+        if (latest.get("params") or {}).get("forecast_mode") == "bounded_trend_corridor":
+            score = validation.get("point_coverage")
+            width = validation.get("mean_relative_width")
+            c1, c2 = st.columns(2)
+            c1.metric("Validation containment", "—" if score is None else f"{score:.1%}")
+            c2.metric("Mean corridor half-width", "—" if width is None else f"±{width/2:.1%}")
+            st.caption("Containment is measured on reused Validation data; narrow bounds alone do not establish prediction quality.")
+        elif (latest.get("params") or {}).get("forecast_mode") == "learned_joint_trajectories":
             rows = []
             for partition, scores in (("Validation", validation), ("Test", test)):
                 for row in scores.get("horizons") or []:
@@ -322,19 +332,5 @@ def _render_signal_training(project_id: str, snapshot: dict) -> None:
 
 
 def render_training(project_id: str, snapshot: dict) -> None:
-    task = st.selectbox("Training task", ["signal_forecast", "red_entry", "legacy_rul"],
-                        format_func=lambda value: {"red_entry": "First RED entry", "signal_forecast": "Signal forecast", "legacy_rul": "Legacy RUL (research CLI)"}[value],
-                        key=f"training_task:{project_id}")
-    if task == "signal_forecast":
-        _render_signal_training(project_id, snapshot)
-    elif task == "red_entry":
-        from pdm.red_entry_ui import render_event_training
-        page_header("First RED entry", "")
-        _job_status(project_id)
-        from pdm.red_entry_training import list_red_entry_runs
-        stale = sum(row.get("snapshot_id") != snapshot["snapshot_id"] for row in list_project_runs(project_id) + list_red_entry_runs(project_id))
-        if stale:
-            st.caption(ui_copy.TRAIN_STALE_RUNS_CAPTION.format(n=stale))
-        render_event_training(project_id, snapshot)
-    else:
-        st.info("Legacy RUL training is unavailable here; use the research interface or CLI.")
+    st.caption("Training task · Trend corridor")
+    _render_signal_training(project_id, snapshot)

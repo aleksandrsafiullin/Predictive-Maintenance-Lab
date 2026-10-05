@@ -36,6 +36,9 @@ def _digest(value: Any) -> str:
 
 
 def _params(engine_id: str, params: dict | None, features: pd.DataFrame) -> dict:
+    if (params or {}).get("forecast_mode") == "bounded_trend_corridor":
+        from pdm.trend_corridor import corridor_params
+        return corridor_params(engine_id, params, features)
     if (params or {}).get("forecast_mode") == "learned_joint_trajectories":
         from pdm.learned_trajectory import learned_params
         return learned_params(engine_id, params, features)
@@ -661,6 +664,9 @@ def train_signal_run(project_id: str, snapshot_id: str | None, engine_id: str, p
     _validate_snapshot(data)
     if engine_id not in ENGINES:
         raise ValueError(f"Engine {engine_id} does not forecast numeric signals")
+    if (params or {}).get("forecast_mode") == "bounded_trend_corridor":
+        from pdm.trend_corridor import train_corridor_run
+        return train_corridor_run(project_id, data, engine_id, params, stop, report)
     if (params or {}).get("forecast_mode") == "learned_joint_trajectories":
         from pdm.learned_trajectory import train_learned_run
         return train_learned_run(project_id, data, engine_id, params, stop, report)
@@ -835,6 +841,11 @@ def list_project_runs(project_id: str) -> list[dict]:
 def load_signal_run(project_id: str, run_id: str) -> dict:
     store = project_store()
     directory = store.run_path(project_id, run_id)
+    return _load_signal_run_directory(project_id, run_id, directory)
+
+
+def _load_signal_run_directory(project_id: str, run_id: str, directory: Path) -> dict:
+    """Apply the standard run validations to an owned run or trusted import stage."""
     if directory.is_symlink():
         raise ValueError("Signal run directory cannot be a symlink")
     for name in ("manifest.json", "training_contract.json"):
@@ -874,6 +885,18 @@ def load_signal_run(project_id: str, run_id: str) -> dict:
         if any(name not in manifest["artifacts"] for name in
                ("checkpoint.pt", "learned_model.json", "objective_trace.json", "model_input_contract.json", "training_contract.json")):
             raise ValueError("Learned distribution artifacts missing")
+    if manifest.get("params", {}).get("forecast_mode") == "bounded_trend_corridor":
+        from pdm.trend_corridor import corridor_params, corridor_widths
+        corridor_widths(manifest.get("corridor_contract"))
+        if (manifest.get("corridor_contract") != contract.get("corridor_contract")
+                or not manifest.get("reload_verified")):
+            raise ValueError("Saved bounded corridor contract mismatch")
+        corridor_params(manifest["engine_id"], manifest["params"], None)
+        if any(name not in manifest["artifacts"] for name in
+               ("corridor.pt", "corridor_model.json", "objective_trace.json", "training_contract.json")):
+            raise ValueError("Bounded corridor artifacts missing")
+        if manifest["engine_id"] in {"quantile_boosting", "full_cns"} and "corridor_encoder.joblib" not in manifest["artifacts"]:
+            raise ValueError("Bounded corridor encoder missing")
     if manifest.get("engine_id") == "full_cns":
         provenance = contract.get("connectome")
         if not provenance or provenance != manifest.get("connectome"):

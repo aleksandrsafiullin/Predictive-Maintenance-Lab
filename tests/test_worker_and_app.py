@@ -487,7 +487,7 @@ def test_product_titles_match_default_task(monkeypatch, tmp_path):
             assert has_desc, title
 
 
-def test_training_form_boosting_has_no_epochs(monkeypatch, tmp_path):
+def test_training_form_boosting_has_tree_iterations_and_corridor_epochs(monkeypatch, tmp_path):
     from pdm import ui_copy
     from tests.project_contract import make_contract_snapshot
 
@@ -497,18 +497,14 @@ def test_training_form_boosting_has_no_epochs(monkeypatch, tmp_path):
     at.session_state["project_step"] = "Training"
     at.run()
     assert not at.exception
-    next(w for w in at.selectbox if w.label == "Training task").set_value("signal_forecast")
-    at.run()
-    assert not at.exception
     assert [s.value for s in at.subheader][:3] == ["Data window", "Model size", "Repeatability"]
     model = next(w for w in at.selectbox if w.label == "Model")
     model.set_value("quantile_boosting")
     at.run()
     assert not at.exception
     labels = {w.label for w in at.number_input}
-    assert "Training epochs" not in labels
+    assert "Training epochs" in labels
     assert {"Random seed", "Boosting iterations"} <= labels
-    assert ui_copy.TRAIN_BOOSTING_NO_EPOCHS_CAPTION in [c.value for c in at.caption]
     assert ui_copy.TRAIN_BOOSTING_NO_EPOCHS_CAPTION == (
         "Quantile boosting uses a fixed iteration count."
     )
@@ -1009,25 +1005,9 @@ def test_training_controls_expose_help(monkeypatch, tmp_path):
     at.session_state["project_step"] = "Training"
     at.run()
     assert not at.exception
-    task = next(w for w in at.selectbox if w.label == "Training task")
-    assert task.value == "signal_forecast"
-    assert list(task.options) == ["Signal forecast", "First RED entry",
-                                  "Legacy RUL (research CLI)"]
-    assert not _help_of(task)
-    task.set_value("red_entry")
-    at.run()
-    assert not at.exception
+    assert all(w.label != "Training task" for w in at.selectbox)
     widgets = [*at.selectbox, *at.number_input, *at.text_input]
-    for label in ("Event model", "Inputs", "Probability horizons (s, comma-separated)",
-                  "History length", "Max GRU/LSTM epochs", "Random seed"):
-        assert not _help_of(next(w for w in widgets if w.label == label)), label
-    assert not _help_of(next(b for b in at.button if b.label == "Train first RED model"))
-
-    next(w for w in at.selectbox if w.label == "Training task").set_value("signal_forecast")
-    at.run()
-    assert not at.exception
-    widgets = [*at.selectbox, *at.number_input, *at.text_input]
-    for label in ("Model", "History samples", "Forecast horizons (seconds)", "Random seed",
+    for label in ("Model", "History samples", "Forecast span (minutes)", "Random seed",
                   "Training epochs", "Hidden units", "Batch size"):
         assert _help_of(next(w for w in widgets if w.label == label)), label
     assert _help_of(next(b for b in at.button if b.label == "Train model"))
@@ -1036,7 +1016,7 @@ def test_training_controls_expose_help(monkeypatch, tmp_path):
     at.run()
     assert not at.exception
     assert _help_of(next(w for w in at.number_input if w.label == "Boosting iterations"))
-    assert "out-of-fold Training errors" in _help_of(next(w for w in at.selectbox if w.label == "Model"))
+    assert "trend corridor" in _help_of(next(w for w in at.selectbox if w.label == "Model"))
 
 
 def test_training_stop_help_copy():
@@ -1055,7 +1035,7 @@ def test_training_mae_help_mentions_equal_units():
 
     assert "each unit counts equally" in ui_copy.TRAIN_VALIDATION_MAE_HELP
     assert "each unit counts equally" in ui_copy.TRAIN_TEST_MAE_HELP
-    assert "out-of-fold Training errors" in ui_copy.TRAIN_MODEL_HELP
+    assert "trend corridor" in ui_copy.TRAIN_MODEL_HELP
     assert "likely range" not in ui_copy.TRAIN_MODEL_HELP
 
 

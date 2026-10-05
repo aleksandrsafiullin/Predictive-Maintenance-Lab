@@ -536,8 +536,7 @@ def main() -> None:
         runs_ready = False
         if snapshot_ready:
             try:
-                runs_ready = any(row.get("run_id") == selected.get("selected_run_id")
-                                 and row.get("project_id") == selected_id
+                runs_ready = any(row.get("project_id") == selected_id
                                  and row.get("snapshot_id") == selected["active_snapshot_id"]
                                  and row.get("task") in {"signal_forecast", "red_entry"}
                                  and row.get("status") == "completed"

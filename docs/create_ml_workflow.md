@@ -63,15 +63,31 @@ First imports of HSE use provisional 300/600 Pa limits. XJTU-SY uses its initial
 
 Choose one engine and its parameters, then **Train model**. Heavy work runs in a background process with project-specific status and a Stop control. One heavy job runs at a time.
 
-- **GRU / LSTM:** numeric multi-horizon signal heads, configurable history, horizon times, seed, epochs, hidden size and batch size. The retained checkpoint is selected using unit-equal Validation mean absolute error.
-- **Quantile boosting:** independent horizon models with pointwise quantiles. The iteration budget is configurable; candidate iteration counts are selected on Validation, then the frozen model is tested.
-- **Fly brain · Full MaleCNS:** all classified neurons and their original directed connections from the public MaleCNS v1.0 files. Configure history, horizons and seed; Train fits numeric ridge readouts, Validation selects regularization, then Test evaluates the frozen model. No hidden-size or epoch control: the recurrent graph is fixed. Full graph computation can be substantially slower. [Source and computational boundaries](full_cns_signal.md).
+- **GRU / LSTM:** recurrent encoder and two learned corridor boundaries; configure history, span, seed, epochs, hidden size and batch size.
+- **Quantile boosting:** Train-only quantile tree features followed by a learned bounded corridor readout; configure tree iterations and readout epochs.
+- **Fly brain · Full MaleCNS:** all classified neurons and original directed connections, with fixed graph dynamics and a learned bounded corridor readout. Epochs train the readout. Full graph computation can be substantially slower. [Source and computational boundaries](full_cns_signal.md).
+
+The current Training page has one task, **Trend corridor**. Choose GRU, LSTM,
+Quantile boosting or Full MaleCNS, then set the history and forecast span. Each
+model learns two boundaries at ±10% of its predicted level, expanding up to ±15%
+(20–30% total width). Saved first-contract models retain their original ±5–7.5% bounds.
+First RED entry follows from their crossings; its upper time bound stays open
+when the second boundary does not cross. The percentage is a width constraint,
+not a confidence level. Results reports actual containment and flags failed
+models. See [the current corridor contract and observed quality](trend_corridor_20261005_ru.md).
 
 Scaling and cadence are derived from Training only. Missing future targets beyond recorded history or across gaps are masked. Model artifacts, parameters, preprocessing, snapshot fingerprints and bindings are checked when a saved run is opened.
 
 The sampled Fly and Random research engines remain in their existing APIs/CLI. Full MaleCNS now has a separate numeric signal adapter for this workflow. An old future-red classifier or RUL checkpoint does not unlock this Results screen; train a signal readout on the current project snapshot.
 
-## Read Results
+## Historical saved signal runs
+
+The behavior and starting settings below describe older point/quantile models.
+Their predictions remain available with a previous-objective notice. New
+corridor runs show the two learned boundaries and derived RED window, with
+no separate center-line prediction drawn on the chart.
+
+### Read Results
 
 There is one Results view. Select a saved model and a held-out Test unit.
 
