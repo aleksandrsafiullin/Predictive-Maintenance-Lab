@@ -22,7 +22,7 @@ from pdm.long_forecast_run import (
     request_stop,
 )
 from pdm.projects import project_store
-from pdm.ui_theme import style_figure
+from pdm.ui_theme import style_figure, tokens
 
 LABELS = {
     "robust_trend": "Robust trend",
@@ -239,6 +239,7 @@ def results(project, source, theme="dark"):
         f"Measurements used: {forecast['history_observations']} · future actual is hidden from the model. Forecast quality remains exploratory."
     )
     fig = go.Figure()
+    chart_tokens = tokens(theme)
     for _, segment in segments(unit_frame, source["cadence_s"]):
         past = segment[segment.timestamp_s.le(origin)]
         future = segment[segment.timestamp_s.gt(origin)]
@@ -249,7 +250,7 @@ def results(project, source, theme="dark"):
                     y=past.signal,
                     mode="lines+markers",
                     marker_size=3,
-                    line=dict(color="#999999", width=1),
+                    line=dict(color=chart_tokens["series_reference"], width=1),
                     name="Measurements received",
                     showlegend=not any(t.name == "Measurements received" for t in fig.data),
                 )
@@ -260,7 +261,7 @@ def results(project, source, theme="dark"):
                     x=future.timestamp_s,
                     y=future.signal,
                     mode="lines",
-                    line=dict(color="#777777", width=1),
+                    line=dict(color=chart_tokens["series_future_actual"], width=1),
                     name="Future actual · hidden from model",
                     showlegend=not any(t.name.startswith("Future actual") for t in fig.data),
                 )

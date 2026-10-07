@@ -90,7 +90,7 @@ def replay_figure(result: dict, schema: dict, theme: str = "dark", *,
     label = str(schema.get("signal_label") or schema.get("signal_column") or "Signal")
     unit = str(schema.get("signal_unit") or "")
     t = tokens(theme)
-    actual_color, forecast_color = t["series_observed"], t["series_forecast"]
+    actual_color, forecast_color = t["series_reference"], t["series_forecast"]
     red_color = t["zone_red"]
     observed = _records(result.get("observed_prefix"))
     as_of = result.get("as_of_s")
@@ -150,8 +150,8 @@ def replay_figure(result: dict, schema: dict, theme: str = "dark", *,
             future_x.append(row["timestamp_s"])
             future_y.append(row["signal"])
         fig.add_trace(go.Scatter(x=future_x, y=future_y, mode="lines",
-                                 name="Future actual · hidden from model", opacity=0.55,
-                                 line={"color": actual_color, "width": 2}, connectgaps=False))
+                                 name="Future actual · hidden from model",
+                                 line={"color": t["series_future_actual"], "width": 2}, connectgaps=False))
     thresholds = result.get("thresholds") or schema.get("thresholds") or {}
     values = ([float(v) for v in observed_y if v is not None] + [float(row["value"]) for row in points]
               + [float(row[key]) for row in points for key in ("lower", "upper") if row.get(key) is not None]

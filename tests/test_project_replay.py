@@ -53,7 +53,7 @@ def test_visible_actual_stops_at_cursor_and_gap_breaks_line():
     assert light.layout.xaxis.title.font.color == tokens["chart_text"]
     assert light.layout.yaxis.title.font.color == tokens["chart_text"]
     assert light.layout.shapes[-1].line.color == tokens["series_reference"]
-    assert light.data[0].line.color == tokens["series_observed"]
+    assert light.data[0].line.color == tokens["series_reference"]
     assert light.data[1].line.color == tokens["series_forecast"]
 
 
