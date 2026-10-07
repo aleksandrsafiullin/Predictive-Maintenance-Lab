@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from streamlit.proto.WidgetStates_pb2 import WidgetStates
 
 from pdm import corridor_calibration as cal
 from pdm import live_monitor as lm
@@ -34,6 +35,16 @@ def train(sensor, engine="gru"):
     return runs.train(
         sensor.project["project_id"], engine, overrides=dict(epochs=1, hidden_size=8, threads=1)
     )
+
+
+def select_machine_row(page, index, *, cell=False):
+    """Send the dataframe selection event emitted by a browser row click."""
+    state = WidgetStates()
+    widget = state.widgets.add()
+    widget.id = page.dataframe[0].proto.id
+    selection = {"cells": [[index, "Machine"]]} if cell else {"rows": [index]}
+    widget.string_value = json.dumps({"selection": selection})
+    return page._run(widget_state=state)
 
 
 def test_csv_reader_aliases_dates_dedup_and_declared_gaps(tmp_path):
@@ -167,19 +178,29 @@ def test_main_navigation_sensor_page_and_stable_machine_selection(sensor, tmp_pa
     assert not next(b for b in page.button if b.label == "Live monitor").disabled
     assert next(s for s in page.selectbox if s.label == "Saved model").value == record["run_id"]
     assert {m.label: m.value for m in page.metric}["Machines"] == "2"
-    page.selectbox(key=f"live_pick:{pid}").set_value("green").run()
+    assert not any(s.label == "Machine detail" for s in page.selectbox)
+    select_machine_row(page, page.dataframe[0].value.Machine.tolist().index("green"), cell=True)
+    assert page.session_state[f"live_pick:{pid}"] == "green"
+    assert any("Machine detail · 🟢 green" in s.value for s in page.subheader)
+    figure = json.loads(page.get("plotly_chart")[0].proto.spec)
+    received = next(t for t in figure["data"] if t["name"] == "Measurements received")
+    assert set(received["y"]) == {0.3}
     rows = pd.concat(
         [rows, pd.DataFrame(dict(unit_id="new-red", timestamp_s=np.arange(100) * 60, signal=1.1))]
     )
     rows.to_csv(folder / "machines.csv", index=False)
     page.run()
-    assert page.selectbox(key=f"live_pick:{pid}").value == "green"
+    assert page.session_state[f"live_pick:{pid}"] == "green"
     assert page.dataframe[0].value.Machine.tolist()[-1] == "green"
-    page.selectbox(key=f"live_pick:{pid}").set_value("red").run()
+    assert page.session_state[f"live_table:{pid}"]["selection"]["rows"] == [2]
+    select_machine_row(page, page.dataframe[0].value.Machine.tolist().index("red"))
     rows.loc[rows.unit_id.eq("red"), "signal"] = .25
     rows.to_csv(folder / "machines.csv", index=False)
     page.run()
-    assert page.selectbox(key=f"live_pick:{pid}").value == "red"
+    assert page.session_state[f"live_pick:{pid}"] == "red"
+    order = page.dataframe[0].value.Machine.tolist()
+    assert page.session_state[f"live_table:{pid}"]["selection"]["rows"] == [order.index("red")]
+    assert any("Machine detail · 🟢 red" in s.value for s in page.subheader)
     # Calibration saved after opening the screen invalidates cached interval predictions.
     before = json.loads(page.get("plotly_chart")[0].proto.spec)
     cal.save_settings(

@@ -25,7 +25,8 @@ keep the last value in sorted file order. Optional `gap_before` and
 
 The table shows the newest received measurement, current zone, forecasted first
 center crossing of the red limit, total received measurements and history used.
-Machines are ordered by zone and forecasted red time. The selected machine stays
+Machines are ordered by zone and forecasted red time. Click a machine's row to
+show its forecast below the table. The selected machine and row highlight stay
 selected when table order changes. Red is a saved signal limit, not an automatic
 equipment failure diagnosis. A predicted center crossing is not a calibrated
 RED event-time interval.

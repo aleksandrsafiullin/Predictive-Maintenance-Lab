@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from functools import partial
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -57,6 +58,15 @@ def _forecast_text(result):
     if result["crossing"]["status"] == "none_within_horizon":
         return "No red within forecast range"
     return "No saved red limit"
+
+
+def _select_machine(project_id, table_key, unit_ids):
+    """Map a click using the row order shown when its callback was registered."""
+    selection = st.session_state[table_key]["selection"]
+    # A cell click selects its machine; the row marker also remains usable.
+    rows = [selection["cells"][0][0]] if selection.get("cells") else selection["rows"]
+    if rows:
+        st.session_state[f"live_pick:{project_id}"] = unit_ids[rows[0]]
 
 
 def live_figure(result, schema, theme):
@@ -318,6 +328,17 @@ def _fleet(project_id, run_id, config, mode, theme, use_calibration, run_every):
             columns[i].metric(
                 f"{ZONE_ICON[zone]} {ZONE_TEXT[zone]}", sum(r["zone"] == zone for r in results)
             )
+        by_id = {r["unit_id"]: r for r in results}
+        unit_ids = tuple(by_id)
+        key = f"live_pick:{project_id}"
+        if st.session_state.get(key) not in by_id:
+            st.session_state[key] = unit_ids[0]
+        table_key = f"live_table:{project_id}"
+        # Keep the highlighted row with the machine when status sorting changes.
+        st.session_state[table_key] = {
+            "selection": {"rows": [unit_ids.index(st.session_state[key])]}
+        }
+        st.caption("Click a machine row to show its forecast.")
         st.dataframe(
             pd.DataFrame(
                 [
@@ -338,18 +359,13 @@ def _fleet(project_id, run_id, config, mode, theme, use_calibration, run_every):
             ),
             hide_index=True,
             width="stretch",
+            key=table_key,
+            on_select=partial(_select_machine, project_id, table_key, unit_ids),
+            selection_mode=["single-row-required", "single-cell"],
         )
-        by_id = {r["unit_id"]: r for r in results}
-        key = f"live_pick:{project_id}"
-        if st.session_state.get(key) not in by_id:
-            st.session_state[key] = results[0]["unit_id"]
-        picked = st.selectbox(
-            "Machine detail",
-            sorted(by_id),
-            key=key,
-            format_func=lambda uid: f"{ZONE_ICON[by_id[uid]['zone']]} {uid}",
-        )
+        picked = st.session_state[key]
         result = by_id[picked]
+        st.subheader(f"Machine detail · {ZONE_ICON[result['zone']]} {picked}")
         st.plotly_chart(
             live_figure(result, model.schema, theme),
             width="stretch",
