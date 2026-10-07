@@ -12,6 +12,12 @@ See the [project workflow guide](docs/create_ml_workflow.md) for folder formats,
 
 **Fly brain · Full MaleCNS** is available in Training alongside GRU, LSTM and Quantile boosting when the official local connection and annotation files are present. It computes every classified neuron using the public directed graph; only the numeric signal readout is trained. See [source, computation and restoration](docs/full_cns_signal.md).
 
+MaleCNS connectome data © FlyEM / HHMI Janelia, University of Cambridge,
+MRC Laboratory of Molecular Biology and Google Research; licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+See the [original source](https://male-cns.janelia.org/download/) and
+[third-party notices](THIRD_PARTY_NOTICES.md).
+
 | Dataset | Public source | Signal and sampling | Split |
 |---|---|---|---|
 | Bearings / XJTU-SY | [Dataset authors](https://biaowang.tech/xjtu-sy-bearing-datasets/) | Horizontal and vertical acceleration RMS from a 1.28-second vibration fragment recorded once per minute | 9 train / 3 validation / 3 test units |
@@ -287,3 +293,15 @@ scripts/          setup.sh / run.sh (and Windows .ps1)
 Wang et al., IEEE Transactions on Reliability, 2020 (XJTU-SY).  
 Hagmeyer, Mauthe, Zeiler, IJPHM 2021 (HSE filters), CC BY 4.0.  
 MaleCNS / FlyEM Male CNS connectome — see [male-cns.janelia.org](https://male-cns.janelia.org/) when using `real_connectome`.
+
+## License
+
+Source code in this repository is licensed under the Apache License 2.0,
+except for third-party components identified in the notices below.
+
+Third-party datasets, connectome data and other external resources
+are not covered by this license and remain subject to their respective
+licenses.
+
+See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+for details.
