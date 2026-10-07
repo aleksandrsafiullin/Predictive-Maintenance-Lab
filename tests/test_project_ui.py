@@ -315,7 +315,7 @@ def test_import_page_has_no_limit_widgets(monkeypatch, tmp_path):
     assert not any(n.label.startswith(("Yellow limit", "Red limit")) for n in at.number_input)
     assert "Yellow and red limits are set on Data Quality after import." not in _captions(at)
     assert not any("max-axis RMS" in c for c in _captions(at))
-    assert not any(header.value == "Signal" for header in at.subheader)
+    assert any(header.value == "Signal" for header in at.subheader)
 
 
 def _capture_import(monkeypatch, project_id: str, signal_column: str | None = None) -> dict:

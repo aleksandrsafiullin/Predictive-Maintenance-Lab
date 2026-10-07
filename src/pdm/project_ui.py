@@ -37,10 +37,7 @@ from pdm.ui_copy import (
     IMPORT_SPLIT_WEIGHTS_CAPTION,
     IMPORT_SUBMIT_HELP,
     IMPORT_TEST_FROM_HELP,
-    IMPORT_TEST_WEIGHT_HELP,
-    IMPORT_TRAIN_WEIGHT_HELP,
     IMPORT_VALIDATION_FROM_HELP,
-    IMPORT_VALIDATION_WEIGHT_HELP,
     IMPORT_VIEW_HELP,
     PROJECT_NAME_HELP,
     PROJECT_SOURCE_FORMAT_HELP,
@@ -57,6 +54,8 @@ SOURCE_KINDS = {
     "generic_sensor_csv": "Sensor CSV",
     "xjtu_bearings": "XJTU-SY bearings",
     "hse_filters": "HSE filters",
+    "synthetic_sanity": "Synthetic sanity",
+    "synthetic_benchmark": "Synthetic benchmark",
 }
 HOLDOUT_SOURCES = {"Split from training": "auto", "Separate folder": "folder"}
 SPLIT_DEFAULTS = {"import_weight_train": 70, "import_weight_validation": 15, "import_weight_test": 15,
@@ -73,7 +72,7 @@ def _reset_project_session() -> None:
     for key in list(st.session_state):
         if str(key).startswith(("project_play:", "play_slider:", "play_toggle:", "play_reset:",
                                  "result_run:", "result_unit:", "quality_unit_", "folder:", "path:",
-                                 "source_mode:", "validation_mode", "test_mode", "quality_tab",
+                                 "source_mode:", "validation_mode", "calibration_mode", "test_mode", "quality_tab",
                                  "import_weight_", "import_seed", "import_split_settings", "import_view:",
                                  "quality_move_to:", "quality_move:", "quality_replace_with:",
                                  "quality_replace:", "quality_membership_notice",
@@ -143,14 +142,14 @@ def _stage_uploads(store, project_id: str, files, group: str,
     return {"mode": "files", "files": staged}
 
 
-def _source_input(store, project_id: str, label: str, key: str) -> dict | None:
+def _source_input(store, project_id: str, label: str, key: str, default=None) -> dict | None:
     mode = st.radio(f"{label} source", ["Choose folder", "Server folder path"], horizontal=True, key=f"source_mode:{key}",
                     help=IMPORT_SOURCE_MODE_HELP)
     if mode == "Choose folder":
         files = st.file_uploader(f"{label} folder", accept_multiple_files="directory", key=f"folder:{key}",
                                  help=IMPORT_FOLDER_HELP)
         return {"mode": "uploads", "files": files, "group": key} if files else None
-    path = st.text_input(f"{label} server folder path", key=f"path:{key}",
+    path = st.text_input(f"{label} server folder path", value=str((default or {}).get("path", "")), key=f"path:{key}",
                          help="This path must be visible to the computer running the app.").strip()
     return {"mode": "folder", "path": path} if path else None
 
@@ -170,12 +169,25 @@ def _auto_shares(weights: dict, val_mode: str, test_mode: str) -> dict[str, floa
 
 @st.cache_data(show_spinner=False)
 def _snapshot_summaries(project_id: str, snapshot_id: str) -> dict:
+    from pdm.project_sensor_ui import registered, summaries
+    if registered(project_store().get(project_id)):
+        return summaries(project_id, snapshot_id)
     snapshot = load_snapshot(project_id, snapshot_id)
     parts = {}
     for part, _ in PARTS:
         summary = part_summary(snapshot["features"], snapshot["split"], part)
         parts[part] = {"units": summary["units"], "rows": summary["rows"], "gaps": summary["gaps"]}
     return {"parts": parts, "protocol": str(snapshot["split"].get("protocol") or "")}
+
+
+def _import_profile(project, summaries=None):
+    """One form; snapshot/source contracts determine its available roles."""
+    calibrated = ((summaries or {}).get("format") == "sensor"
+                  or (project.get("source_manifest") or {}).get("task") == "probabilistic_signal_forecast"
+                  or project["source_kind"] in {"synthetic_sanity", "synthetic_benchmark"})
+    parts = PARTS[:2] + (("calibration", "Calibration Data"),) + PARTS[2:] if calibrated else PARTS
+    defaults = dict(train=55, validation=15, calibration=15, test=15) if calibrated else dict(train=70, validation=15, test=15)
+    return dict(parts=parts, defaults=defaults, calibrated=calibrated)
 
 
 def _open_quality_tab(name: str) -> None:
@@ -192,6 +204,9 @@ def _card_counts(part: str, name: str, summaries: dict | None) -> None:
                       on_click=_open_quality_tab, args=(name,), width="content")
     with st.container(key=f"pdm-card-body-{part}"):
         if not counts:
+            if (summaries or {}).get("unavailable"):
+                st.markdown("**Saved data unavailable**")
+                return
             st.markdown("**No data yet**")
             st.caption(IMPORT_CARD_EMPTY)
             return
@@ -207,65 +222,61 @@ def _holdout_source(label: str, key: str, help_text: str) -> str:
     return HOLDOUT_SOURCES[st.selectbox(f"{label} data from", list(HOLDOUT_SOURCES), key=key, help=help_text)]
 
 
-def _import_cards(store, project: dict, summaries: dict | None
-                  ) -> tuple[dict | None, dict | None, dict | None, str, str]:
-    pid = project["project_id"]
-    kind = project["source_kind"]
-    names = dict(PARTS)
-    weights = {part: st.session_state.get(f"import_weight_{part}", SPLIT_DEFAULTS[f"import_weight_{part}"])
-               for part in names}
-    columns = st.columns(3, gap="medium")
-    with columns[0], st.container(border=True, key="pdm-import-card-train"):
-        _card_counts("train", names["train"], summaries)
-        with st.container(key="pdm-card-source-train"):
-            st.caption(f"Source: {SOURCE_KINDS.get(kind, kind)}")
-            primary = _source_input(store, pid, "Training", f"{pid}:primary")
-    with columns[1], st.container(border=True, key="pdm-import-card-validation"):
-        _card_counts("validation", names["validation"], summaries)
-        with st.container(key="pdm-card-source-validation"):
-            val_mode = _holdout_source("Validation", "validation_mode", IMPORT_VALIDATION_FROM_HELP)
-            validation_slot = st.container()
-    with columns[2], st.container(border=True, key="pdm-import-card-test"):
-        _card_counts("test", names["test"], summaries)
-        with st.container(key="pdm-card-source-test"):
-            test_mode = _holdout_source("Testing", "test_mode", IMPORT_TEST_FROM_HELP)
-            hse_test_auto = kind == "hse_filters" and test_mode == "auto"
-            shares = _auto_shares(weights, val_mode, "folder" if hse_test_auto else test_mode)
-            if hse_test_auto:
+def _import_cards(store, project: dict, summaries: dict | None):
+    pid, kind = project["project_id"], project["source_kind"]
+    profile = _import_profile(project, summaries)
+    parts = profile["parts"]
+    from pdm.project_data_profile import source_defaults
+    defaults = source_defaults(project) if profile["calibrated"] else {}
+    weights = {part: st.session_state.get(f"import_weight_{part}", profile["defaults"][part]) for part, _ in parts}
+    sources, modes, slots = {}, {}, {}
+    for column, (part, name) in zip(st.columns(len(parts), gap="medium"), parts, strict=True):
+        with column, st.container(border=True, key=f"pdm-import-card-{part}"):
+            _card_counts(part, name, summaries)
+            with st.container(key=f"pdm-card-source-{part}"):
+                label = name.removesuffix(" Data")
+                if part == "train":
+                    st.caption(f"Source: {SOURCE_KINDS.get(kind, kind)}")
+                    sources[part] = _source_input(store, pid, label, f"{pid}:primary", defaults.get("primary"))
+                else:
+                    key = f"{part}_mode"
+                    if key not in st.session_state and defaults.get(key) == "folder":
+                        st.session_state[key] = "Separate folder"
+                    modes[part] = _holdout_source(label, key, IMPORT_TEST_FROM_HELP if part == "test" else IMPORT_VALIDATION_FROM_HELP)
+                    slots[part] = st.container()
+    author_test = kind == "hse_filters" and modes.get("test") == "auto"
+    automatic = ["train"] + [part for part, mode in modes.items() if mode == "auto" and not (part == "test" and author_test)]
+    total = sum(weights[part] for part in automatic)
+    for part, slot in slots.items():
+        with slot:
+            label = dict(parts)[part].removesuffix(" Data")
+            if part == "test" and author_test:
                 st.caption("Official HSE test units (Test_Data_CSV.csv) in the Training folder stay in Testing.")
-            elif test_mode == "auto":
+            elif modes[part] == "auto":
                 st.caption("Automatically split from training data")
-                st.caption(f"{round(100 * shares['test'])}% of the training pool")
-            test = _source_input(store, pid, "Testing", f"{pid}:testing") if test_mode == "folder" else None
-    with validation_slot:
-        if val_mode == "auto":
-            st.caption("Automatically split from training data")
-            st.caption(f"{round(100 * shares['validation'])}% of the training pool")
-            validation = None
-        else:
-            validation = _source_input(store, pid, "Validation", f"{pid}:validation")
-    return primary, validation, test, val_mode, test_mode
+                st.caption(f"{round(100 * weights[part] / total)}% of the training pool")
+            sources[part] = _source_input(store, pid, label, f"{pid}:{label.lower()}", defaults.get(part)) if modes[part] == "folder" else None
+    if profile["calibrated"]:
+        return dict(primary=sources["train"], sources={part: value for part, value in sources.items() if part != "train"}, modes=modes)
+    return sources["train"], sources["validation"], sources["test"], modes["validation"], modes["test"]
 
 
-def _split_settings(any_auto: bool) -> tuple[int, int, int, int]:
-    values = {key: st.session_state.get(key, default) for key, default in SPLIT_DEFAULTS.items()}
+def _split_settings(any_auto: bool, parts=PARTS, defaults=None):
+    defaults = defaults or dict(train=70, validation=15, test=15)
+    values = {part: st.session_state.get(f"import_weight_{part}", defaults[part]) for part, _ in parts}
+    seed_value = st.session_state.get("import_seed", 42)
     disabled = not any_auto
     c1, c2 = st.columns([1, 4], vertical_alignment="center")
-    c2.caption(f"{values['import_weight_train']} / {values['import_weight_validation']} / "
-               f"{values['import_weight_test']} · seed {values['import_seed']}")
+    c2.caption(" / ".join(str(values[part]) for part, _ in parts) + f" · seed {seed_value}")
     if disabled:
-        st.caption("Both holdouts use separate folders; split settings do not apply.")
+        st.caption("Both holdouts use separate folders; split settings do not apply." if len(parts) == 3 else "All holdouts use separate folders; split settings do not apply.")
     with c1.popover("Split settings", key="import_split_settings", help=IMPORT_SPLIT_SETTINGS_HELP):
         st.caption(IMPORT_SPLIT_WEIGHTS_CAPTION)
-        train_pct = st.number_input("Train weight (%)", min_value=1, max_value=98, value=70, disabled=disabled,
-                                    key="import_weight_train", help=IMPORT_TRAIN_WEIGHT_HELP)
-        val_pct = st.number_input("Validation weight (%)", min_value=1, max_value=98, value=15, disabled=disabled,
-                                  key="import_weight_validation", help=IMPORT_VALIDATION_WEIGHT_HELP)
-        test_pct = st.number_input("Test weight (%)", min_value=1, max_value=98, value=15, disabled=disabled,
-                                   key="import_weight_test", help=IMPORT_TEST_WEIGHT_HELP)
+        weights = [st.number_input(f"{'Train' if part == 'train' else 'Test' if part == 'test' else name.removesuffix(' Data')} weight (%)",
+                   min_value=1, max_value=98, value=defaults[part], disabled=disabled, key=f"import_weight_{part}") for part, name in parts]
         seed = st.number_input("Split seed", min_value=0, max_value=2**31 - 1, value=42, disabled=disabled,
                                key="import_seed", help=IMPORT_SPLIT_SEED_HELP)
-    return train_pct, val_pct, test_pct, seed
+    return (*weights, seed)
 
 
 def _saved_schema(store, project: dict) -> dict:
@@ -277,7 +288,12 @@ def _saved_schema(store, project: dict) -> dict:
     if project.get("state") != "ready" or not sid:
         return {}
     try:
-        directory = store.snapshot_path(project["project_id"], str(sid))
+        from pdm.project_snapshot import project_snapshot, snapshot_directory
+        directory = snapshot_directory(project["project_id"], str(sid), store=store)
+        if (directory / "snapshot.json").is_file():
+            schema = project_snapshot(project["project_id"], str(sid), store=store)["schema"]
+            limits = read_zone_limits(directory)
+            return {**schema, "thresholds": limits} if limits else schema
         path = directory / "feature_schema.json"
         schema = {} if path.is_symlink() else read_json(path)
     except (OSError, ValueError, KeyError):
@@ -331,51 +347,55 @@ def _render_import(store, project: dict) -> None:
             summaries = _snapshot_summaries(pid, str(project["active_snapshot_id"]))
         except Exception as exc:
             load_error = str(exc)
-    primary, validation, test, val_mode, test_mode = _import_cards(store, project, summaries)
     if load_error:
-        st.caption(f"Saved data could not be read: {load_error}")
+        st.error(f"Saved data could not be read: {load_error}")
+        summaries = {"parts": {}, "unavailable": True}
+    profile = _import_profile(project, summaries)
+    cards = _import_cards(store, project, summaries)
+    if isinstance(cards, dict):
+        primary, sources, modes = cards["primary"], cards["sources"], cards["modes"]
+    else:
+        primary, validation, test, val_mode, test_mode = cards
+        sources, modes = dict(validation=validation, test=test), dict(validation=val_mode, test=test_mode)
     if summaries and summaries.get("protocol") == MANUAL_SPLIT_PROTOCOL:
         st.caption("Current sets include manual moves from Data Quality. Importing again creates a fresh split.")
-    train_pct, val_pct, test_pct, seed = _split_settings("auto" in {val_mode, test_mode})
+    split_values = _split_settings("auto" in modes.values(), profile["parts"], profile["defaults"])
+    weights, seed = dict(zip((part for part, _ in profile["parts"]), split_values[:-1], strict=True)), split_values[-1]
     saved = _saved_schema(store, project)
-    if kind == "generic_sensor_csv":
-        with st.container(border=True, key="pdm-import-signal"):
-            st.subheader("Signal", anchor=False)
-            st.caption("Each CSV needs unit_id, timestamp_s, and the selected numeric signal column. Time is in seconds.")
-            s1, s2, s3 = st.columns(3)
-            signal_column = s1.text_input("Signal column", value=str(saved.get("signal_column") or "signal"),
-                                          help=IMPORT_SIGNAL_COLUMN_HELP)
-            signal_label = s2.text_input("Signal name", value=str(saved.get("signal_label") or "Signal"),
-                                         help=IMPORT_SIGNAL_NAME_HELP)
-            signal_unit = s3.text_input("Signal unit", value=str(saved.get("signal_unit") or "unit"),
-                                        help=IMPORT_SIGNAL_UNIT_HELP)
-            st.caption("Yellow and red limits are set on Data Quality after import.")
-        with st.expander("Operating age and context (optional)"):
-            age_source = st.selectbox("Age source", ["unknown", "counter", "laboratory_proxy", "running_clock"],
-                                     index=["unknown", "counter", "laboratory_proxy", "running_clock"].index(saved.get("age_source", "unknown")),
-                                     format_func=lambda x: {"unknown":"Unknown", "counter":"Counter", "laboratory_proxy":"Laboratory proxy", "running_clock":"Running clock"}[x])
-            context_mapping, context_units = {}, {}
-            roles = {"operating_age_s":"Operating age", "operating_age_known":"Age known (true/false)", "operating_age_source":"Age source per row", "physical_unit_id":"Physical equipment ID", "component_cycle_id":"Component cycle ID", "component_replaced":"Component replaced (true/false)", "is_running":"Running (true/false)", "operating_time_since_component_install_s":"Operating time since installation", "operating_time_since_service_s":"Operating time since service", "rpm":"Speed", "load_kn":"Load", "flow_rate":"Flow rate", "dust_feed":"Dust feed", "dust":"Dust type", "temperature":"Temperature"}
-            for role, label in roles.items():
-                col, units_col = st.columns(2)
-                source_column = col.text_input(label + " column", value=str((saved.get("context_mapping") or {}).get(role, "")), key=f"import_context:{pid}:{role}")
-                if source_column.strip():
-                    context_mapping[role] = source_column.strip()
-                if role in {"operating_age_s", "operating_time_since_component_install_s", "operating_time_since_service_s", "rpm", "load_kn", "flow_rate", "dust_feed", "temperature"}:
-                    default_unit = {"operating_age_s":"s", "operating_time_since_component_install_s":"s", "operating_time_since_service_s":"s", "rpm":"rpm", "load_kn":"kN"}.get(role, "")
-                    context_units[role] = units_col.text_input(label + " unit", value=str((saved.get("context_units") or {}).get(role, default_unit)), key=f"import_context_unit:{pid}:{role}")
-        with st.expander("Maintenance events (optional)"):
-            endpoint_roles = {"confirmed_failure": "Confirmed failure (true/false)", "confirmed_failure_timestamp_s": "Confirmed failure time (s)", "emergency_stop": "Emergency stop (true/false)", "emergency_stop_timestamp_s": "Emergency stop time (s)", "planned_maintenance": "Planned maintenance (true/false)", "maintenance_timestamp_s": "Maintenance time (s)", "replacement_timestamp_s": "Replacement time (s)"}
-            for role, label in endpoint_roles.items():
-                source_column = st.text_input(label + " column", value=str((saved.get("context_mapping") or {}).get(role, "")), key=f"import_context:{pid}:{role}")
-                if source_column.strip():
-                    context_mapping[role] = source_column.strip()
-                    if role.endswith("_timestamp_s"):
-                        context_units[role] = "s"
-    elif kind == "xjtu_bearings":
-        signal_column, signal_label, signal_unit = "combined_rms", "Combined max-axis RMS", "g"
-    else:
-        signal_column, signal_label, signal_unit = "differential_pressure", "Differential pressure", "Pa"
+    from pdm.project_data_profile import signal_defaults
+    defaults = saved or signal_defaults({**project, "active_snapshot_id": None} if load_error else project)
+    with st.container(border=True, key="pdm-import-signal"):
+        st.subheader("Signal", anchor=False)
+        st.caption("Each CSV needs unit_id, timestamp_s, and the selected numeric signal column. Time is in seconds.")
+        s1, s2, s3 = st.columns(3)
+        signal_column = s1.text_input("Signal column", value=str(defaults.get("signal_column") or "signal"),
+                                      help=IMPORT_SIGNAL_COLUMN_HELP)
+        signal_label = s2.text_input("Signal name", value=str(defaults.get("signal_label") or "Signal"),
+                                     help=IMPORT_SIGNAL_NAME_HELP)
+        signal_unit = s3.text_input("Signal unit", value=str(defaults.get("signal_unit") or "unit"),
+                                    help=IMPORT_SIGNAL_UNIT_HELP)
+    with st.expander("Operating age and context (optional)"):
+        age_source = st.selectbox("Age source", ["unknown", "counter", "laboratory_proxy", "running_clock"],
+                                 index=["unknown", "counter", "laboratory_proxy", "running_clock"].index(saved.get("age_source", "unknown")),
+                                 format_func=lambda x: {"unknown":"Unknown", "counter":"Counter", "laboratory_proxy":"Laboratory proxy", "running_clock":"Running clock"}[x])
+        context_mapping, context_units = {}, {}
+        roles = {"operating_age_s":"Operating age", "operating_age_known":"Age known (true/false)", "operating_age_source":"Age source per row", "physical_unit_id":"Physical equipment ID", "component_cycle_id":"Component cycle ID", "component_replaced":"Component replaced (true/false)", "is_running":"Running (true/false)", "operating_time_since_component_install_s":"Operating time since installation", "operating_time_since_service_s":"Operating time since service", "rpm":"Speed", "load_kn":"Load", "flow_rate":"Flow rate", "dust_feed":"Dust feed", "dust":"Dust type", "temperature":"Temperature"}
+        for role, label in roles.items():
+            col, units_col = st.columns(2)
+            source_column = col.text_input(label + " column", value=str((saved.get("context_mapping") or {}).get(role, "")), key=f"import_context:{pid}:{role}")
+            if source_column.strip():
+                context_mapping[role] = source_column.strip()
+            if role in {"operating_age_s", "operating_time_since_component_install_s", "operating_time_since_service_s", "rpm", "load_kn", "flow_rate", "dust_feed", "temperature"}:
+                default_unit = {"operating_age_s":"s", "operating_time_since_component_install_s":"s", "operating_time_since_service_s":"s", "rpm":"rpm", "load_kn":"kN"}.get(role, "")
+                context_units[role] = units_col.text_input(label + " unit", value=str((saved.get("context_units") or {}).get(role, default_unit)), key=f"import_context_unit:{pid}:{role}")
+    with st.expander("Maintenance events (optional)"):
+        endpoint_roles = {"confirmed_failure": "Confirmed failure (true/false)", "confirmed_failure_timestamp_s": "Confirmed failure time (s)", "emergency_stop": "Emergency stop (true/false)", "emergency_stop_timestamp_s": "Emergency stop time (s)", "planned_maintenance": "Planned maintenance (true/false)", "maintenance_timestamp_s": "Maintenance time (s)", "replacement_timestamp_s": "Replacement time (s)"}
+        for role, label in endpoint_roles.items():
+            source_column = st.text_input(label + " column", value=str((saved.get("context_mapping") or {}).get(role, "")), key=f"import_context:{pid}:{role}")
+            if source_column.strip():
+                context_mapping[role] = source_column.strip()
+                if role.endswith("_timestamp_s"):
+                    context_units[role] = "s"
     status = status_for_project(pid)
     running = worker_alive() or status.get("status") in {"queued", "running", "training", "preparing", "stopping"}
     if running:
@@ -389,11 +409,10 @@ def _render_import(store, project: dict) -> None:
         try:
             if not primary:
                 raise ValueError("Choose a Training folder or provide its server path.")
-            if val_mode == "folder" and not validation:
-                raise ValueError("Choose the separate Validation folder.")
-            if test_mode == "folder" and not test:
-                raise ValueError("Choose the separate Testing folder.")
-            if int(train_pct + val_pct + test_pct) != 100:
+            for part, mode in modes.items():
+                if mode == "folder" and not sources.get(part):
+                    raise ValueError(f"Choose the separate {dict(profile['parts'])[part].removesuffix(' Data')} folder.")
+            if sum(weights.values()) != 100:
                 raise ValueError("Split weights must add to 100%.")
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", signal_column.strip()):
                 raise ValueError("Enter a valid signal column name.")
@@ -401,16 +420,16 @@ def _render_import(store, project: dict) -> None:
                 raise ValueError("Signal name and unit are required.")
             thresholds = _import_thresholds(kind, saved, signal_column.strip(), signal_unit.strip())
             primary = _materialize_source(store, pid, primary, created_roots)
-            validation = _materialize_source(store, pid, validation, created_roots)
-            test = _materialize_source(store, pid, test, created_roots)
-            source = {"primary": primary, "validation_mode": val_mode, "validation": validation,
-                      "test_mode": test_mode, "test": test, "seed": int(seed),
-                      "weights": {"train": float(train_pct) / 100, "validation": float(val_pct) / 100,
-                                  "test": float(test_pct) / 100},
+            sources = {part: _materialize_source(store, pid, value, created_roots) for part, value in sources.items()}
+            source = {"primary": primary, **sources, **{f"{part}_mode": mode for part, mode in modes.items()}, "seed": int(seed),
+                      "weights": {part: float(value) / 100 for part, value in weights.items()},
                       "signal_column": signal_column.strip(), "signal_label": signal_label.strip(),
                       "signal_unit": signal_unit.strip(), "thresholds": thresholds}
-            if kind == "generic_sensor_csv":
-                source.update(context_mapping=context_mapping, context_units={role: unit for role, unit in context_units.items() if role in context_mapping}, age_source=age_source)
+            source.update(context_mapping=context_mapping, context_units={role: unit for role, unit in context_units.items() if role in context_mapping}, age_source=age_source)
+            if profile["calibrated"]:
+                source.update(task="probabilistic_signal_forecast", cadence_s=float(defaults.get("cadence_s") or 60.),
+                              manifest_path=(project.get("source_manifest") or {}).get("manifest_path"),
+                              import_protocol="verified_sensor_release")
             job_id = uuid.uuid4().hex
             spawn_worker({"kind": "project_import", "job_id": job_id, "project_id": pid, "source": source})
             launched = True
@@ -569,9 +588,18 @@ def main() -> None:
                     _import_status(selected_id)
                     if importing_current:
                         st.caption("Showing the previous saved data while the replacement import is checked.")
-                snapshot = load_snapshot(selected_id)
+                from pdm import project_sensor_ui
+                provider = None
+                if project_sensor_ui.registered(selected):
+                    from pdm.project_data_profile import quality_provider
+
+                    provider = quality_provider(selected)
+                    snapshot = provider.view
+                else:
+                    snapshot = load_snapshot(selected_id)
                 ready = render_quality(
                     snapshot, theme, storage_mode=str(selected.get("storage_mode") or "owned"),
+                    **({"provider": provider} if provider else {}),
                 )
                 if ready and st.button("Continue to Training", type="primary", disabled=importing_current,
                                        help=QUALITY_CONTINUE_HELP):
@@ -588,11 +616,19 @@ def main() -> None:
                 empty_state("No data yet", "Import data to inspect Train, Validation, and Test.")
     elif step == "Training" and selected.get("state") == "ready" and not importing_current:
         try:
+            from pdm import long_forecast_ui
+            if long_forecast_ui.enabled(selected):
+                long_forecast_ui.render_step(selected, "Training", theme)
+                return
             render_training(selected_id, load_snapshot(selected_id))
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
             st.error(f"Training data could not be opened: {exc}")
     elif step == "Results" and selected.get("state") == "ready" and not importing_current:
         try:
+            from pdm import long_forecast_ui
+            if long_forecast_ui.enabled(selected):
+                long_forecast_ui.render_step(selected, "Results", theme)
+                return
             render_results(selected_id, load_snapshot(selected_id), selected.get("selected_run_id"), theme)
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
             st.error(f"Results could not be opened: {exc}")

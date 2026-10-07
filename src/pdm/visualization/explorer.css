@@ -12,8 +12,7 @@ body:has(.brain-lab-shell) .stApp * {color-scheme:inherit;}
 body:has(.brain-lab-shell) [data-testid="stSidebarCollapsedControl"] {background:var(--pdm-control); border:1px solid var(--pdm-border); border-radius:8px;}
 body:has(.brain-lab-shell) [data-testid="stSidebarCollapsedControl"] * {color:var(--pdm-text-secondary) !important;}
 body:has(.brain-lab-shell) [data-testid="stMainBlockContainer"] {max-width: 1900px; padding: 32px 48px 64px;}
-body:has(.pdm-project-workflow) [data-testid="stMainBlockContainer"] {max-width: 1200px;}
-body:has(.pdm-project-workflow):has(.st-key-project_nav-Results button[kind="primary"]) [data-testid="stMainBlockContainer"] {max-width: 1600px;}
+body:has(.pdm-project-workflow) [data-testid="stMainBlockContainer"] {max-width: 1600px;}
 body:has(.brain-lab-shell) [data-testid="stSidebar"] {background: var(--lab-sidebar); border-right: 1px solid var(--lab-line-soft); color: var(--lab-text);}
 body:has(.brain-lab-shell) [data-testid="stSidebarUserContent"] {padding: 24px 16px;}
 body:has(.brain-lab-shell) [data-testid="stSidebar"] * {color: inherit;}
@@ -69,6 +68,10 @@ body:has(.brain-lab-shell) [class*="st-key-pdm-card-head-"] [data-testid="stButt
 body:has(.brain-lab-shell) [class*="st-key-pdm-card-body-"] {padding: 12px 14px 2px;}
 body:has(.brain-lab-shell) [class*="st-key-pdm-import-card-"] > [data-testid="stLayoutWrapper"]:has([class*="st-key-pdm-card-source-"]) {margin-top: auto;}
 body:has(.brain-lab-shell) [class*="st-key-pdm-card-source-"] {margin-top: auto; padding: 10px 14px 0; border-top: 1px solid var(--pdm-border);}
+@media (min-width:769px) and (max-width:1450px) {
+  body:has(.brain-lab-shell) [data-testid="stHorizontalBlock"]:has(.st-key-pdm-import-card-calibration) {flex-wrap:wrap;}
+  body:has(.brain-lab-shell) [data-testid="stHorizontalBlock"]:has(.st-key-pdm-import-card-calibration) > [data-testid="stColumn"] {flex:1 1 calc(50% - 1rem); width:calc(50% - 1rem);}
+}
 body:has(.brain-lab-shell) [data-testid="stLayoutWrapper"]:has(> [class*="st-key-pdm-project-row-"]) + [data-testid="stLayoutWrapper"] > [class*="st-key-pdm-project-row-"] {border-top: 1px solid var(--pdm-border-soft); padding-top: 12px;}
 
 /* Sidebar group labels (captions outside expanders) and nav rows. */

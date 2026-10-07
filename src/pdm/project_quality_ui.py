@@ -13,7 +13,6 @@ from pdm.data.project_prepare import (
     JOB_ACTIVE_MOVE_ERROR,
     LINKED_LEGACY_MOVE_ERROR,
     SPLIT_LABELS,
-    load_snapshot,
     load_zone_limits,
     move_units,
     preview_move,
@@ -179,9 +178,12 @@ def _on_limits_suggest(project_id: str, snapshot_id: str, committed: dict | None
     state = st.session_state
     try:
         direction = _current_direction(project_id, snapshot_id)
-        snapshot = load_snapshot(project_id, snapshot_id)
+        from pdm.project_snapshot import limits_features, project_snapshot
+
+        snapshot = project_snapshot(project_id, snapshot_id)
         proposal = propose_absolute_limits(
-            snapshot["features"], snapshot["split"]["train"], direction,
+            snapshot.get("features") if "features" in snapshot else limits_features(project_id, snapshot_id),
+            snapshot["split"]["train"], direction,
         )
     except (KeyError, ValueError, RuntimeError, OSError) as exc:
         st.warning(str(exc))
@@ -234,7 +236,8 @@ def _render_limits(schema: dict, project_id: str, snapshot_id: str,
                         help=IMPORT_YELLOW_LIMIT_HELP, on_change=_on_limits_change, args=args)
         st.number_input(f"Red{suffix}", format="%.2f", step=0.01, key=keys["red"],
                         help=IMPORT_RED_LIMIT_HELP, on_change=_on_limits_change, args=args)
-        proposal = _suggest_proposal(features, train_unit_ids, project_id, snapshot_id)
+        proposal = (_suggest_proposal(features, train_unit_ids, project_id, snapshot_id)
+                    if features is not None else {"ok": True})
         st.button(
             "Suggest from Training Data",
             key=_state_key("suggest", project_id, snapshot_id),
@@ -520,8 +523,8 @@ def training_admission(features: pd.DataFrame, split: dict) -> tuple[bool, str]:
     return True, "Train, Validation, and Test have admitted measurements. Training uses Train units; Validation selects the model; Test is held out until evaluation."
 
 
-def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "owned") -> bool:
-    features = snapshot["features"]
+def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "owned", provider=None) -> bool:
+    features = snapshot.get("features")
     split = snapshot["split"]
     schema = snapshot["schema"]
     report = snapshot.get("report") or {}
@@ -532,14 +535,18 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
     job_running = heavy_job_active()
     saved_limits = load_zone_limits(project_id, snapshot_id)
     zones_schema = zone_schema(schema, project_id, snapshot_id, saved_limits)
-    summaries = {part: part_summary(features, split, part) for part, _ in PARTS}
-    _render_event_quality(snapshot, zones_schema)
+    parts = (PARTS[:2] + (("calibration", "Calibration Data"),) + PARTS[2:]
+             if "sensor_snapshot" in snapshot or split.get("calibration") else PARTS)
+    summaries = {part: provider.metadata(part) if provider else part_summary(features, split, part)
+                 for part, _ in parts}
+    if features is not None:
+        _render_event_quality(snapshot, zones_schema)
     drew_limits = False
     if storage_mode != "owned":
         st.info(LINKED_LEGACY_MOVE_ERROR)
     _flash_membership_notice()
-    tabs = st.tabs([name for _, name in PARTS], key="quality_tab", on_change="rerun")
-    for tab, (part, name) in zip(tabs, PARTS, strict=True):
+    tabs = st.tabs([name for _, name in parts], key="quality_tab", on_change="rerun")
+    for tab, (part, name) in zip(tabs, parts, strict=True):
         summary = summaries[part]
         is_open = tab.open is not False
         with tab:
@@ -547,7 +554,7 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
             c1.metric("Units", summary["units"], help=QUALITY_UNITS_HELP)
             c2.metric("Admitted rows", summary["rows"], help=QUALITY_ADMITTED_ROWS_HELP)
             c3.metric("Gaps", summary["gaps"], help=QUALITY_GAPS_HELP)
-            if summary["time_start"] is None:
+            if not summary["rows"]:
                 st.caption("No admitted measurements in this set.")
             findings = (report.get("by_split") or {}).get(part) or (report.get("sets") or {}).get(part) or {}
             rejected = findings.get("rejected_signal_rows", findings.get("rejected_rows", findings.get("rejected", 0)))
@@ -555,15 +562,19 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
                 st.write(f"Rejected or missing signal rows: {rejected}; remaining missing signal values: {summary['missing_signal']}.")
             if summary["gaps"]:
                 st.caption("Gaps split the history. Training and forecasts do not cross them.")
+            if part == "calibration" and is_open:
+                from pdm.corridor_calibration_ui import render_controls
+                render_controls(snapshot)
             ids = sorted(str(uid) for uid in split.get(part) or [])
             if ids:
                 selected = st.selectbox(f"Inspect {name} unit", ids, key=f"quality_unit_{part}",
                                         help=QUALITY_INSPECT_UNIT_HELP)
                 if not is_open:
                     continue
-                if storage_mode == "owned":
+                if storage_mode == "owned" and provider is None:
                     _render_membership(snapshot, part, str(selected), job_running)
-                frame = summary["frame"].loc[summary["frame"]["unit_id"].astype(str) == selected]
+                frame = (provider.frame(part, str(selected)) if provider else
+                         summary["frame"].loc[summary["frame"]["unit_id"].astype(str) == selected])
                 labelled = project_zones.label_unit(frame, zones_schema)
                 chart_col, limits_col = st.columns([4, 1], gap="small", vertical_alignment="top", wrap=True)
                 with chart_col:
@@ -587,8 +598,8 @@ def render_quality(snapshot: dict, theme: str = "dark", *, storage_mode: str = "
                 drew_limits = True
                 _render_limits(schema, project_id, snapshot_id, saved_limits, job_running,
                                features, split.get("train") or [])
-    ready, explanation = training_admission(features, split)
-    if ready:
+    ready, explanation = provider.ready() if provider else training_admission(features, split)
+    if ready and provider is None:
         try:
             from pdm.red_entry_training import available_red_entry_engines
             engines = available_signal_engines(snapshot["project_id"], snapshot["snapshot_id"])

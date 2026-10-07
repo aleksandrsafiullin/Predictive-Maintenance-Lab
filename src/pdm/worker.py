@@ -253,15 +253,21 @@ def run_job(job: dict) -> None:
                 raise InterruptedError("Project import cancelled before start")
             write_status({"status": "running", "stage": "import", "progress": 0.0,
                           "message": "Importing project source"})
-            source = import_project(job["project_id"], job["source"], should_stop=stopped)
-            if stopped():
-                raise InterruptedError("Project import cancelled")
-            source_id = source.get("manifest_id")
-            if not source_id:
-                raise ValueError("Import did not return a source manifest ID")
-            write_status({"status": "running", "stage": "prepare", "progress": 0.5,
-                          "message": "Preparing project snapshot"})
-            snapshot = prepare_project(job["project_id"], source_id, should_stop=stopped)
+            if job["source"].get("import_protocol") == "verified_sensor_release":
+                from pdm.probabilistic.workflow import import_source_plan
+
+                snapshot = import_source_plan(job["project_id"], job["source"], should_stop=stopped,
+                    status_cb=lambda update: write_status({"status": "running", **update}))
+            else:
+                source = import_project(job["project_id"], job["source"], should_stop=stopped)
+                if stopped():
+                    raise InterruptedError("Project import cancelled")
+                source_id = source.get("manifest_id")
+                if not source_id:
+                    raise ValueError("Import did not return a source manifest ID")
+                write_status({"status": "running", "stage": "prepare", "progress": 0.5,
+                              "message": "Preparing project snapshot"})
+                snapshot = prepare_project(job["project_id"], source_id, should_stop=stopped)
             write_status({"status": "completed", "stage": "completed", "progress": 1.0,
                           "snapshot_id": snapshot["snapshot_id"], "message": "Project data ready"})
         elif kind == "project_train":

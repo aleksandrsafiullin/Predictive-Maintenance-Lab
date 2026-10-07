@@ -21,7 +21,8 @@ from pdm.io_util import atomic_write_json, read_json
 from pdm.paths import data_processed, data_raw, project_root, runs_root
 
 SCHEMA_VERSION = 1
-SOURCE_KINDS = frozenset({"xjtu_bearings", "hse_filters", "generic_sensor_csv"})
+SOURCE_KINDS = frozenset({"xjtu_bearings", "hse_filters", "generic_sensor_csv",
+                          "synthetic_sanity", "synthetic_benchmark"})
 STORAGE_MODES = frozenset({"owned", "linked_legacy"})
 _ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}\Z")
 _EDITABLE = frozenset({"name", "state", "source_manifest", "active_snapshot_id", "selected_run_id"})

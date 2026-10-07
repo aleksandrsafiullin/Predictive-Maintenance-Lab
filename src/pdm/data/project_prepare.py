@@ -826,7 +826,9 @@ def load_zone_limits(
 ) -> dict[str, Any] | None:
     store = store or project_store()
     try:
-        directory = store.snapshot_path(project_id, snapshot_id)
+        from pdm.project_snapshot import snapshot_directory
+
+        directory = snapshot_directory(project_id, snapshot_id, store=store)
     except (OSError, ValueError, KeyError):
         return None
     return read_zone_limits(directory)
@@ -847,7 +849,9 @@ def save_zone_limits(
     project = store.get(project_id)
     if project["active_snapshot_id"] != expected_snapshot_id:
         raise ValueError(STALE_SNAPSHOT_ERROR)
-    directory = store.snapshot_path(project_id, expected_snapshot_id)
+    from pdm.project_snapshot import snapshot_directory
+
+    directory = snapshot_directory(project_id, expected_snapshot_id, store=store)
     if not directory.is_dir():
         raise ValueError("Snapshot is missing")
     if heavy_job_active():
