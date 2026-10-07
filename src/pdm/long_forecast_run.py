@@ -70,14 +70,26 @@ def load_run(project_id, run_id):
     return manifest, model
 
 
-def replay(project_id, run_id, unit_id, origin, part="test", horizon=None, frozen=None, *, use_calibration=True):
-    source = source_for(project_id)
+def forecast_observations(project_id, run_id, observations, *, origin=None, source=None,
+                          horizon=None, frozen=None, use_calibration=True):
+    """Forecast one received prefix, shared by saved replay and the live monitor.
+
+    Observations after ``origin`` are cut off before extracting model inputs.
+    This accepts external machine IDs without requiring membership in a saved split.
+    """
+    source = source if source is not None else source_for(project_id)
     manifest, model = frozen if frozen is not None else load_run(project_id, run_id)
     if manifest.get("project_id") != project_id or manifest.get("run_id") != run_id:
         raise ValueError("Frozen run identity mismatch")
     if manifest["snapshot_id"] != source["snapshot_id"]:
         raise ValueError("This run belongs to a previous data snapshot")
-    frame = read_part(source, part)
+    if observations.empty or observations.unit_id.nunique() != 1:
+        raise ValueError("Provide observations for exactly one machine")
+    unit_id = str(observations.unit_id.iloc[0])
+    origin = float(observations.timestamp_s.max()) if origin is None else float(origin)
+    if not np.isfinite(origin):
+        raise ValueError("Now must be a finite observation time")
+    frame = observations.loc[observations.timestamp_s.le(origin)].copy()
     if manifest.get("protocol") in stable.PROTOCOLS:
         x, n = stable.full_at_origin(frame, unit_id, origin, source["cadence_s"])
         outputs = stable.predict(model, [x], [n], horizon)[0]
@@ -114,6 +126,14 @@ def replay(project_id, run_id, unit_id, origin, part="test", horizon=None, froze
         coverage_guarantee=False,
         calibration=calibration,
     )
+
+
+def replay(project_id, run_id, unit_id, origin, part="test", horizon=None, frozen=None, *, use_calibration=True):
+    source = source_for(project_id)
+    frame = read_part(source, part)
+    observations = frame.loc[frame.unit_id.eq(unit_id) & frame.timestamp_s.le(origin)]
+    return forecast_observations(project_id, run_id, observations, origin=origin, source=source,
+                                 horizon=horizon, frozen=frozen, use_calibration=use_calibration)
 
 
 def train(project_id, engine="gru", seed=21, overrides=None, report=None, stop=None, select=True):
