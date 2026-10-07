@@ -1522,7 +1522,8 @@ def test_quality_suggest_fills_inputs_without_saving(monkeypatch, tmp_path):
     button = at.button(key=_key("suggest", pid, sid))
     assert not button.disabled and button.proto.type != "primary"
     assert (button.help or button.proto.help) == ui_copy.QUALITY_SUGGEST_LIMITS_HELP
-    assert ui_copy.QUALITY_SUGGEST_LIMITS_CAPTION in _captions(at)
+    assert button.label == "Suggest limits"
+    assert not any("From Training Data only" in text for text in _captions(at))
     assert at.radio(key=_key("direction", pid, sid)).value == "above"
     seen = _watch_proposal(monkeypatch)
     button.click()
@@ -1590,7 +1591,8 @@ def test_quality_suggest_disabled_when_early_pool_is_short(monkeypatch, tmp_path
     button = at.button(key=_key("suggest", pid, "snapshot1"))
     assert button.disabled and button.proto.type != "primary"
     assert (button.help or button.proto.help) == ui_copy.QUALITY_SUGGEST_LIMITS_HELP
-    assert ui_copy.QUALITY_SUGGEST_LIMITS_CAPTION in _captions(at)
+    assert button.label == "Suggest limits"
+    assert not any("From Training Data only" in text for text in _captions(at))
     assert proposal["reason"] in _captions(at)
     with pytest.raises(AppTestError):
         button.click()

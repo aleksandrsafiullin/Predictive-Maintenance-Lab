@@ -38,7 +38,6 @@ from pdm.ui_copy import (
     QUALITY_REPLACE_SUBMIT_HELP,
     QUALITY_REPLACE_WITH_HELP,
     QUALITY_SUGGEST_DONE,
-    QUALITY_SUGGEST_LIMITS_CAPTION,
     QUALITY_SUGGEST_LIMITS_HELP,
     QUALITY_UNITS_HELP,
 )
@@ -239,14 +238,13 @@ def _render_limits(schema: dict, project_id: str, snapshot_id: str,
         proposal = (_suggest_proposal(features, train_unit_ids, project_id, snapshot_id)
                     if features is not None else {"ok": True})
         st.button(
-            "Suggest from Training Data",
+            "Suggest limits",
             key=_state_key("suggest", project_id, snapshot_id),
             help=QUALITY_SUGGEST_LIMITS_HELP,
             disabled=not proposal.get("ok"),
             on_click=_on_limits_suggest,
             args=args,
         )
-        st.caption(QUALITY_SUGGEST_LIMITS_CAPTION)
         if not proposal.get("ok") and proposal.get("reason"):
             st.caption(str(proposal["reason"]))
         note = state.get(_state_key("suggest_note", project_id, snapshot_id))

@@ -124,11 +124,6 @@ QUALITY_SUGGEST_LIMITS_HELP = (
     "Fills yellow and red from Training Data for the selected direction. Zones only label the chart. "
     "Nothing is saved until you press Save."
 )
-QUALITY_SUGGEST_LIMITS_CAPTION = (
-    "From Training Data only, yellow is the early 90th percentile if the signal rises, or the 10th "
-    "if it falls. Red is the more extreme of the 99th or 1st percentile and a minimum gap from yellow "
-    "set by that early spread."
-)
 QUALITY_SUGGEST_DONE = (
     "Suggested yellow {yellow:g} and red {red:g} from Training Data. Press Save to keep them."
 )

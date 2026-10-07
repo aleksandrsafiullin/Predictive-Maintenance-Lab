@@ -382,11 +382,11 @@ def test_import_and_quality_controls_expose_help(monkeypatch, tmp_path):
     assert _help_of(replace_unit) == ui_copy.QUALITY_REPLACE_SUBMIT_HELP
     assert move_unit.proto.type != "primary" and replace_unit.proto.type != "primary"
     proposal = propose_absolute_limits(features, snapshot["split"]["train"], "above")
-    suggest = next(b for b in at.button if b.label == "Suggest from Training Data")
+    suggest = next(b for b in at.button if b.label == "Suggest limits")
     assert suggest.disabled
     assert _help_of(suggest) == ui_copy.QUALITY_SUGGEST_LIMITS_HELP
     assert suggest.proto.type != "primary"
-    assert ui_copy.QUALITY_SUGGEST_LIMITS_CAPTION in [str(item.value) for item in at.caption]
+    assert not any("From Training Data only" in str(item.value) for item in at.caption)
     assert proposal["reason"] in [str(item.value) for item in at.caption]
     assert not at.exception
     assert len(at.metric) and all(_help_of(m) for m in at.metric if m.label != "Known operating age")
