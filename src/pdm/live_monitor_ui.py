@@ -19,6 +19,7 @@ from pdm.long_forecast_ui import _label
 from pdm.project_chart_style import add_threshold_layers, style_signal_chart
 from pdm.project_results_ui import _run_label
 from pdm.project_snapshot import project_snapshot
+from pdm.project_view_preferences import load_preferences, save_preferences
 from pdm.projects import project_store
 from pdm.ui_theme import empty_state, page_header, tokens
 
@@ -60,13 +61,15 @@ def _forecast_text(result):
     return "No saved red limit"
 
 
-def _select_machine(project_id, table_key, unit_ids):
+def _select_machine(project_id, table_key, unit_ids, snapshot_id):
     """Map a click using the row order shown when its callback was registered."""
     selection = st.session_state[table_key]["selection"]
     # A cell click selects its machine; the row marker also remains usable.
     rows = [selection["cells"][0][0]] if selection.get("cells") else selection["rows"]
     if rows:
-        st.session_state[f"live_pick:{project_id}"] = unit_ids[rows[0]]
+        picked = unit_ids[rows[0]]
+        st.session_state[f"live_pick:{project_id}"] = picked
+        save_preferences(project_id, snapshot_id, "live_monitor", {"machine": picked})
 
 
 def live_figure(result, schema, theme):
@@ -147,19 +150,31 @@ def live_figure(result, schema, theme):
     return style_signal_chart(fig, theme)
 
 
-def _demo_controls(project_id):
+def _demo_controls(project_id, snapshot_id):
     state = demo.demo_status(project_id)
     running = state["state"] == "running"
     with st.expander("Demo feed · recorded measurements", expanded=True):
         options = demo.demo_units(project_id)
+        preferences = load_preferences(project_id, snapshot_id, "live_monitor")
+        saved_units = list(state.get("units", {})) if running else preferences.get("demo_units")
+        default_units = options[:3]
+        if isinstance(saved_units, list):
+            allowed = [unit for unit in saved_units if unit in options]
+            if allowed or not saved_units:
+                default_units = allowed
+        units_key = f"live_demo_units:{project_id}"
+        if running or units_key not in st.session_state or any(
+            unit not in options for unit in st.session_state[units_key]
+        ):
+            st.session_state[units_key] = default_units
         c1, c2 = st.columns([3, 1])
         units = c1.multiselect(
             "Machines to replay",
             options,
-            default=options[:3],
             disabled=running,
-            key=f"live_demo_units:{project_id}",
+            key=units_key,
         )
+        save_preferences(project_id, snapshot_id, "live_monitor", {"demo_units": units})
         speed = c2.select_slider(
             "Measurements per refresh",
             [1, 5, 10, 30, 60],
@@ -228,12 +243,19 @@ def render_live_monitor(project_id, project_name, snapshot=None, theme="dark"):
         format_func=lambda s: f"{s} s" if s < 60 else f"{s // 60} min",
         key=f"live_refresh:{project_id}",
     )
+    preferences = load_preferences(project_id, snapshot["snapshot_id"], "live_monitor")
+    modes = ["Live folder", "Demo feed"]
+    mode_key = f"live_source:{project_id}"
+    if st.session_state.get(mode_key) not in modes:
+        saved_source = preferences.get("source")
+        st.session_state[mode_key] = saved_source if saved_source in modes else "Live folder"
     mode = st.radio(
         "Measurements from",
-        ["Live folder", "Demo feed"],
+        modes,
         horizontal=True,
-        key=f"live_source:{project_id}",
+        key=mode_key,
     )
+    save_preferences(project_id, snapshot["snapshot_id"], "live_monitor", {"source": mode})
     folder = config["folder"]
     if mode == "Live folder":
         folder = st.text_input("Watched folder", value=folder, key=f"live_folder:{project_id}")
@@ -295,7 +317,7 @@ def _fleet(project_id, run_id, config, mode, theme, use_calibration, run_every):
                 else None
             )
             calibration_key = json.dumps(calibration, sort_keys=True)
-            folder = _demo_controls(project_id) if mode == "Demo feed" else config["folder"]
+            folder = _demo_controls(project_id, snapshot["snapshot_id"]) if mode == "Demo feed" else config["folder"]
             if not folder:
                 empty_state(
                     "No measurements yet", "Start the demo feed to receive recorded measurements."
@@ -332,7 +354,9 @@ def _fleet(project_id, run_id, config, mode, theme, use_calibration, run_every):
         unit_ids = tuple(by_id)
         key = f"live_pick:{project_id}"
         if st.session_state.get(key) not in by_id:
-            st.session_state[key] = unit_ids[0]
+            preferences = load_preferences(project_id, snapshot["snapshot_id"], "live_monitor")
+            saved_machine = preferences.get("machine")
+            st.session_state[key] = saved_machine if saved_machine in by_id else unit_ids[0]
         table_key = f"live_table:{project_id}"
         # Keep the highlighted row with the machine when status sorting changes.
         st.session_state[table_key] = {
@@ -360,7 +384,7 @@ def _fleet(project_id, run_id, config, mode, theme, use_calibration, run_every):
             hide_index=True,
             width="stretch",
             key=table_key,
-            on_select=partial(_select_machine, project_id, table_key, unit_ids),
+            on_select=partial(_select_machine, project_id, table_key, unit_ids, snapshot["snapshot_id"]),
             selection_mode=["single-row-required", "single-cell"],
         )
         picked = st.session_state[key]

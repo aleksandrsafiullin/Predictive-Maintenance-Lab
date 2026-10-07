@@ -63,6 +63,12 @@ delivery, and **Clear demo data** removes only the current demo session folder.
 The watched sensor folder is separate. Changing the active data snapshot stops
 the old demo. Feed writes are serialized across browser sessions.
 
+The selected source, demo machines and machine detail survive a browser refresh.
+Results also remembers the selected data set and its unit. These display choices
+are stored in `data/projects/<project_id>/view_preferences.json`, separately from
+data and models, and apply only to their saved snapshot. An active demo keeps
+showing the machines it is actually delivering.
+
 Monitor settings and demo data live under ignored `data/live/<project_id>/`;
 `PDM_LIVE_ROOT` can override that root. This integration supplies the monitor
 screen and local demonstration feed. It does not run a Teams notification worker.
@@ -74,3 +80,5 @@ received-prefix equality with Results, full history, causal future exclusion,
 gap recovery, Calibration refresh, stable machine selection and progressive
 isolated demo delivery. Existing Calibration and project UI regressions also
 run against the shared predictor.
+`tests/test_project_view_preferences.py` verifies fresh-session restoration,
+project isolation, stale-snapshot protection and unchanged data/model artifacts.

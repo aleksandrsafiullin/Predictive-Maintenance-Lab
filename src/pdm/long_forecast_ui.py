@@ -21,6 +21,7 @@ from pdm.long_forecast_run import (
     replay,
     request_stop,
 )
+from pdm.project_view_preferences import load_preferences, save_preferences
 from pdm.projects import project_store
 from pdm.ui_theme import style_figure, tokens
 
@@ -195,18 +196,32 @@ def results(project, source, theme="dark"):
             if manifest.get("protocol") not in stable.PROTOCOLS
             else "Earlier forecast version: uses its saved parameters and formula. Current GRU, LSTM and MaleCNS are available in Training."
         )
+    preferences = load_preferences(project["project_id"], source["snapshot_id"], "results")
+    parts = ["test", "validation", "train"]
+    part_key = "long_part:" + project["project_id"]
+    if st.session_state.get(part_key) not in parts:
+        saved_part = preferences.get("part")
+        st.session_state[part_key] = saved_part if saved_part in parts else "test"
     part = st.selectbox(
         "Data set",
-        ["test", "validation", "train"],
+        parts,
         format_func=str.title,
-        key="long_part:" + project["project_id"],
+        key=part_key,
     )
     frame = read_part(source, part)
     options = sorted(frame.unit_id.unique())
     if not options:
         st.info("This role has no observations.")
         return
-    uid = st.selectbox("Unit", options, key="long_unit:" + project["project_id"])
+    saved_units = preferences.get("units")
+    saved_units = saved_units if isinstance(saved_units, dict) else {}
+    unit_key = "long_unit:" + project["project_id"]
+    if st.session_state.get(unit_key) not in options:
+        saved_unit = saved_units.get(part)
+        st.session_state[unit_key] = saved_unit if saved_unit in options else options[0]
+    uid = st.selectbox("Unit", options, key=unit_key)
+    save_preferences(project["project_id"], source["snapshot_id"], "results",
+                     {"part": part, "units": {**saved_units, part: uid}})
     unit_frame = frame[frame.unit_id.eq(uid)]
     origins = [
         float(t)
